@@ -1,0 +1,71 @@
+{
+  "name": "@noesis-brain/mcp-server",
+  "version": "2.0.0",
+  "description": "Official MCP server for Noesis — bring your personal knowledge base into Claude Code. Search, sync, and manage your notes via 19 AI-powered tools.",
+  "type": "module",
+  "main": "dist/index.js",
+  "bin": {
+    "noesis-mcp": "dist/index.js"
+  },
+  "files": [
+    "dist",
+    "scripts",
+    "skill-templates",
+    "templates",
+    "LICENSE",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "dev": "tsx watch src/index.ts"
+  },
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "claude",
+    "claude-code",
+    "noesis",
+    "markdown",
+    "notes",
+    "knowledge-base",
+    "personal-knowledge-management",
+    "pkm",
+    "second-brain",
+    "ai",
+    "semantic-search"
+  ],
+  "author": "Noesis",
+  "license": "MIT",
+  "homepage": "https://noesisbrain.com",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/noesis-brain/mcp-server.git"
+  },
+  "bugs": {
+    "url": "https://github.com/noesis-brain/mcp-server/issues"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "@google/genai": "^1.0.0",
+    "@google/generative-ai": "^0.21.0",
+    "@modelcontextprotocol/sdk": "^1.0.0",
+    "dotenv": "^16.3.0",
+    "js-yaml": "^4.1.1",
+    "node-diff3": "^3.2.0",
+    "pg": "^8.11.0",
+    "zod": "^3.23.0"
+  },
+  "devDependencies": {
+    "@types/js-yaml": "^4.0.9",
+    "@types/node": "^22.0.0",
+    "@types/pg": "^8.10.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.6.0"
+  }
+}
