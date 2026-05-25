@@ -1,10 +1,10 @@
-# Noesis MCP Server
+# Noesis — Markdown Notes Manager for Claude Code (MCP Server)
 
 [![npm version](https://img.shields.io/npm/v/@noesis-brain/mcp-server.svg)](https://www.npmjs.com/package/@noesis-brain/mcp-server)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![MCP](https://img.shields.io/badge/MCP-Model%20Context%20Protocol-blue)](https://modelcontextprotocol.io/)
 
-Official [Model Context Protocol](https://modelcontextprotocol.io/) server for [Noesis](https://noesisbrain.com) — bring your personal knowledge base into Claude Code. Search, sync, and manage your markdown notes via 19 AI-powered tools.
+Official [Model Context Protocol](https://modelcontextprotocol.io/) server for [Noesis](https://noesisbrain.com), the markdown notes manager for Claude Code. Search, sync, and manage your `.md` knowledge base via 19 AI-powered tools — turn your notes into a first-class context source for every prompt.
 
 ## What This Is
 
