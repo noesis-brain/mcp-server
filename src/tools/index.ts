@@ -434,7 +434,7 @@ export function registerTools(server: McpServer, services: ToolServices): void {
   // Register get_chat_session tool
   server.tool(
     'get_chat_session',
-    'Get a chat session (conversation) and its main-thread messages by ID. URL pattern: noesisbrain.com/<id>. Scoped to the authenticated user.',
+    'Get a chat session (conversation) and its messages by ID. URL pattern: noesisbrain.com/<id>. Includes main-thread messages and Navi Discussion turns (each turn is labeled with the speaker Navi). Scoped to the authenticated user.',
     {
       id: z.number().describe('Chat session ID'),
       limit: z.number().optional().describe('Max messages to return (default 200, max 500). Returns the latest N messages in chronological order.')
@@ -464,8 +464,14 @@ export function registerTools(server: McpServer, services: ToolServices): void {
         out += '\n_No messages in this session yet._\n';
       } else {
         for (const m of messages) {
-          const speaker = m.role === 'user' ? 'user' : (navi?.name || 'assistant');
-          out += `\n**${speaker}** · ${m.created_at}\n${m.content}\n`;
+          // Navi Discussion turns carry their own navi_id/navi_name (each
+          // participant speaks under their own persona). Fall back to the
+          // session-level Navi for regular assistant turns.
+          const perTurnName = (m as any).navi_name as string | undefined;
+          const speakerNavi = perTurnName || navi?.name || 'assistant';
+          const speaker = m.role === 'user' ? 'user' : speakerNavi;
+          const tag = (m as any).message_type === 'discussion' ? ' _(discussion)_' : '';
+          out += `\n**${speaker}**${tag} · ${m.created_at}\n${m.content}\n`;
         }
       }
 
