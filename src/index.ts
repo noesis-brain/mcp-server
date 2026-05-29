@@ -110,6 +110,13 @@ async function main(): Promise<void> {
   // Initialize API client (replaces direct database access)
   const client = new NoesisClient(apiBaseUrl, apiToken);
 
+  // Phase 50: fire-and-forget device-home report. Lets the web UI resolve
+  // stored `~/Noesis/...` paths to this machine's absolute form for display.
+  // Failures (offline, server down) just leave the cache as-is; next startup retries.
+  client.reportDeviceHomeDir().catch((err) => {
+    console.error(`[noesis-mcp] reportDeviceHomeDir failed (non-fatal): ${err?.message || err}`);
+  });
+
   // Create MCP server
   const server = new McpServer({
     name: 'noesis',

@@ -314,6 +314,23 @@ export class NoesisClient {
     return result.roots.map(r => ({ ...r, path: getActivePathFromMap(r.local_paths) }));
   }
 
+  /**
+   * Phase 50: Report this device's home directory so the web UI can resolve
+   * stored `~/Noesis/...` paths to the user's actual absolute path
+   * (e.g. `C:\Users\ccheng\Noesis\...`) for display + clipboard.
+   *
+   * Idempotent: re-sending the same value is a no-op on the server. Callers
+   * should fire-and-forget at startup — failures don't block any tool call,
+   * the next process will retry.
+   */
+  async reportDeviceHomeDir(): Promise<void> {
+    await this.request<{ deviceHomeDirs: Record<string, string> }>(
+      'PATCH',
+      '/api/mcp/device-home',
+      { osKey: CLIENT_OS, homeDir: os.homedir() }
+    );
+  }
+
   async getRootsForSync(): Promise<Array<{
     id: number;
     name: string;
