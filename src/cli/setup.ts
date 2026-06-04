@@ -8,6 +8,7 @@
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
+import * as readline from 'node:readline/promises';
 import { fileURLToPath } from 'url';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -23,16 +24,46 @@ const CLAUDE_DIR = path.join(os.homedir(), '.claude');
 const CLAUDE_MD_PATH = path.join(CLAUDE_DIR, 'CLAUDE.md');
 const COMMANDS_DIR = path.join(CLAUDE_DIR, 'commands');
 
-const BLOCK_VERSION = 'v1';
-const BLOCK_START = `<!-- noesis-mcp-server:start ${BLOCK_VERSION} -->`;
-const BLOCK_END = `<!-- noesis-mcp-server:end -->`;
-// Loose start marker (any version) used to find existing blocks during upgrade.
-const BLOCK_START_RE = /<!-- noesis-mcp-server:start [^>]*-->/;
+/**
+ * A versioned block injected into ~/.claude/CLAUDE.md, delimited by HTML-comment
+ * markers so re-runs can upgrade or remove it in place without touching the user's
+ * own content. Each block owns an independent version.
+ */
+interface BlockSpec {
+  /** Template filename under templates/. */
+  templateFile: string;
+  /** Exact start marker (carries the current version). */
+  startMarker: string;
+  /** Exact end marker. */
+  endMarker: string;
+  /** Loose start marker (any version) — used to find an existing block during upgrade/removal. */
+  startRe: RegExp;
+}
+
+// Core conventions — always installed (unless --skills-only).
+const CORE_BLOCK_VERSION = 'v1';
+const CORE_BLOCK: BlockSpec = {
+  templateFile: 'claude-md-block.md',
+  startMarker: `<!-- noesis-mcp-server:start ${CORE_BLOCK_VERSION} -->`,
+  endMarker: `<!-- noesis-mcp-server:end -->`,
+  startRe: /<!-- noesis-mcp-server:start [^>]*-->/,
+};
+
+// Optional "restructure notes on sync" rule — opt-in (off by default).
+const RESTRUCTURE_BLOCK_VERSION = 'v1';
+const RESTRUCTURE_BLOCK: BlockSpec = {
+  templateFile: 'claude-md-restructure-on-sync.md',
+  startMarker: `<!-- noesis-mcp-server:restructure-on-sync:start ${RESTRUCTURE_BLOCK_VERSION} -->`,
+  endMarker: `<!-- noesis-mcp-server:restructure-on-sync:end -->`,
+  startRe: /<!-- noesis-mcp-server:restructure-on-sync:start [^>]*-->/,
+};
 
 interface SetupOptions {
   claudeMdOnly: boolean;
   skillsOnly: boolean;
   dryRun: boolean;
+  withRestructure: boolean;
+  noRestructure: boolean;
 }
 
 function parseArgs(argv: string[]): SetupOptions {
@@ -40,47 +71,121 @@ function parseArgs(argv: string[]): SetupOptions {
     claudeMdOnly: argv.includes('--claude-md-only'),
     skillsOnly: argv.includes('--skills-only'),
     dryRun: argv.includes('--dry-run'),
+    withRestructure: argv.includes('--with-restructure-rule'),
+    noRestructure: argv.includes('--no-restructure-rule'),
   };
 }
 
-function installClaudeMd(dryRun: boolean): { action: 'created' | 'inserted' | 'upgraded' | 'unchanged'; path: string } {
-  const blockContent = fs.readFileSync(path.join(TEMPLATES_DIR, 'claude-md-block.md'), 'utf-8').trimEnd();
-  const wrappedBlock = `${BLOCK_START}\n${blockContent}\n${BLOCK_END}`;
+type BlockAction = 'created' | 'inserted' | 'upgraded' | 'unchanged' | 'removed' | 'absent';
 
-  if (!fs.existsSync(CLAUDE_DIR)) {
-    if (!dryRun) fs.mkdirSync(CLAUDE_DIR, { recursive: true });
+function readClaudeMd(): string | null {
+  return fs.existsSync(CLAUDE_MD_PATH) ? fs.readFileSync(CLAUDE_MD_PATH, 'utf-8') : null;
+}
+
+/** Whether the given block is currently present in CLAUDE.md. */
+function blockExists(spec: BlockSpec): boolean {
+  const current = readClaudeMd();
+  return current !== null && spec.startRe.test(current);
+}
+
+function buildWrappedBlock(spec: BlockSpec): string {
+  const blockContent = fs.readFileSync(path.join(TEMPLATES_DIR, spec.templateFile), 'utf-8').trimEnd();
+  return `${spec.startMarker}\n${blockContent}\n${spec.endMarker}`;
+}
+
+/** Find an existing block's [start, end) byte range, or null. Throws if the start marker has no matching end. */
+function locateBlock(current: string, spec: BlockSpec): { start: number; end: number } | null {
+  const startMatch = current.match(spec.startRe);
+  if (!startMatch) return null;
+  const startIdx = current.indexOf(startMatch[0]);
+  const endIdx = current.indexOf(spec.endMarker, startIdx);
+  if (endIdx === -1) {
+    throw new Error(`Found ${startMatch[0]} but no matching ${spec.endMarker} in ${CLAUDE_MD_PATH}. Fix manually or remove the start marker and re-run.`);
+  }
+  return { start: startIdx, end: endIdx + spec.endMarker.length };
+}
+
+/**
+ * Install (install=true) or remove (install=false) a block in CLAUDE.md, idempotently.
+ * User content outside the markers is preserved.
+ */
+function applyBlock(spec: BlockSpec, install: boolean, dryRun: boolean): BlockAction {
+  const current = readClaudeMd();
+
+  // Removal path — strip the marker pair and its content, collapsing the surrounding blank lines.
+  if (!install) {
+    if (current === null) return 'absent';
+    const loc = locateBlock(current, spec);
+    if (!loc) return 'absent';
+    const before = current.slice(0, loc.start).replace(/\n+$/, '\n');
+    const after = current.slice(loc.end).replace(/^\n+/, '');
+    let next = before + after;
+    if (next.length > 0 && !next.endsWith('\n')) next += '\n';
+    if (!dryRun) fs.writeFileSync(CLAUDE_MD_PATH, next, 'utf-8');
+    return 'removed';
   }
 
-  if (!fs.existsSync(CLAUDE_MD_PATH)) {
-    if (!dryRun) fs.writeFileSync(CLAUDE_MD_PATH, wrappedBlock + '\n', 'utf-8');
-    return { action: 'created', path: CLAUDE_MD_PATH };
+  // Install path.
+  const wrappedBlock = buildWrappedBlock(spec);
+
+  if (current === null) {
+    if (!dryRun) {
+      if (!fs.existsSync(CLAUDE_DIR)) fs.mkdirSync(CLAUDE_DIR, { recursive: true });
+      fs.writeFileSync(CLAUDE_MD_PATH, wrappedBlock + '\n', 'utf-8');
+    }
+    return 'created';
   }
 
-  const current = fs.readFileSync(CLAUDE_MD_PATH, 'utf-8');
-  const startMatch = current.match(BLOCK_START_RE);
-
-  if (!startMatch) {
+  const loc = locateBlock(current, spec);
+  if (!loc) {
     // No existing block — append.
     const sep = current.endsWith('\n') ? '\n' : '\n\n';
     const next = current + sep + wrappedBlock + '\n';
     if (!dryRun) fs.writeFileSync(CLAUDE_MD_PATH, next, 'utf-8');
-    return { action: 'inserted', path: CLAUDE_MD_PATH };
+    return 'inserted';
   }
 
-  const startIdx = current.indexOf(startMatch[0]);
-  const endIdx = current.indexOf(BLOCK_END, startIdx);
-  if (endIdx === -1) {
-    throw new Error(`Found ${startMatch[0]} but no matching ${BLOCK_END} in ${CLAUDE_MD_PATH}. Fix manually or remove the start marker and re-run.`);
-  }
-
-  const existingBlock = current.substring(startIdx, endIdx + BLOCK_END.length);
+  const existingBlock = current.substring(loc.start, loc.end);
   if (existingBlock === wrappedBlock) {
-    return { action: 'unchanged', path: CLAUDE_MD_PATH };
+    return 'unchanged';
   }
-
-  const next = current.substring(0, startIdx) + wrappedBlock + current.substring(endIdx + BLOCK_END.length);
+  const next = current.substring(0, loc.start) + wrappedBlock + current.substring(loc.end);
   if (!dryRun) fs.writeFileSync(CLAUDE_MD_PATH, next, 'utf-8');
-  return { action: 'upgraded', path: CLAUDE_MD_PATH };
+  return 'upgraded';
+}
+
+async function promptYesNo(question: string, defaultYes: boolean): Promise<boolean> {
+  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+  try {
+    const answer = (await rl.question(question)).trim().toLowerCase();
+    if (answer === '') return defaultYes;
+    return answer === 'y' || answer === 'yes';
+  } finally {
+    rl.close();
+  }
+}
+
+/**
+ * Decide what to do with the optional restructure-on-sync rule.
+ * Returns true (install), false (remove/skip), or undefined (leave current state untouched).
+ *
+ * Precedence: explicit flags > interactive prompt > leave-as-is (non-TTY / dry-run).
+ */
+async function resolveRestructureChoice(options: SetupOptions, alreadyInstalled: boolean): Promise<boolean | undefined> {
+  if (options.noRestructure) return false;
+  if (options.withRestructure) return true;
+  if (options.dryRun) return undefined;
+  if (!process.stdin.isTTY) return undefined;
+
+  console.log('');
+  console.log('Optional rule — "Restructure notes on sync":');
+  console.log('  When you sync a note that grew by accretion (bolt-on sections, duplicated');
+  console.log('  passages, a chronological patch-log), Claude first restructures it into one');
+  console.log('  coherent narrative led by the root cause — preserving diagrams, inventories,');
+  console.log('  and snippets — instead of pushing the sprawl as-is.');
+  console.log('  This rewrites note *body* text on sync (broader than /noesis-refine-note).');
+  const suffix = alreadyInstalled ? ' [Y/n] ' : ' [y/N] ';
+  return promptYesNo(`Install this optional rule?${suffix}`, alreadyInstalled);
 }
 
 interface SkillResult {
@@ -153,8 +258,19 @@ export async function runSetup(argv: string[]): Promise<void> {
   console.log('');
 
   if (!options.skillsOnly) {
-    const result = installClaudeMd(options.dryRun);
-    console.log(`  CLAUDE.md: ${result.action}`);
+    const coreAction = applyBlock(CORE_BLOCK, true, options.dryRun);
+    console.log(`  CLAUDE.md: ${coreAction}`);
+
+    // Optional opt-in rule. State is persisted as the block's presence in CLAUDE.md,
+    // so re-runs default the prompt to the current state and never lose the user's choice.
+    const alreadyInstalled = blockExists(RESTRUCTURE_BLOCK);
+    const choice = await resolveRestructureChoice(options, alreadyInstalled);
+    if (choice === undefined) {
+      console.log(`  Restructure-on-sync rule: ${alreadyInstalled ? 'kept (installed)' : 'not installed'}`);
+    } else {
+      const action = applyBlock(RESTRUCTURE_BLOCK, choice, options.dryRun);
+      console.log(`  Restructure-on-sync rule: ${action}`);
+    }
   } else {
     console.log('  CLAUDE.md: skipped (--skills-only)');
   }

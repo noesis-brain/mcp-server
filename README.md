@@ -67,6 +67,37 @@ The MCP server loads at session start, so restart the Claude Code CLI (`Ctrl+C` 
 
 You're done. Try `"List my recent Noesis notes"` in Claude Code to verify.
 
+## Optional: CLAUDE.md conventions & skills
+
+`noesis-mcp setup` installs Noesis's CLAUDE.md conventions (how Claude reads, writes, and
+syncs your notes) plus the `/noesis-sync` and `/noesis-refine-note` skills into `~/.claude/`.
+It's idempotent — re-run any time to upgrade in place; your own content outside the markers is
+preserved.
+
+```bash
+noesis-mcp setup            # install/upgrade conventions + skills (prompts for opt-in rules)
+noesis-mcp setup --dry-run  # preview only; writes nothing
+```
+
+### Opt-in rule: "Restructure notes on sync"
+
+During `setup`, you're asked whether to install one **optional, off-by-default** rule. When
+enabled, syncing a note that has grown by accretion — bolt-on sections, duplicated passages, a
+chronological patch-log — makes Claude first restructure it into one coherent narrative led by
+the root cause (preserving diagrams, inventories, and snippets) instead of pushing the sprawl
+as-is. Because it rewrites note **body** text on sync (broader than `/noesis-refine-note`, which
+only touches metadata and headings), it stays opt-in.
+
+Answer `y` at the prompt to enable it, or drive it non-interactively:
+
+```bash
+noesis-mcp setup --with-restructure-rule   # install the optional rule (no prompt)
+noesis-mcp setup --no-restructure-rule     # remove / skip it (no prompt)
+```
+
+In non-interactive shells (CI, piped input) the prompt is skipped and your current choice is
+left untouched unless one of the flags above is passed.
+
 ## Configuration
 
 | Environment variable | Required | Description |
