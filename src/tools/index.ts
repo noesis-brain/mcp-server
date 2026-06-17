@@ -139,6 +139,39 @@ function detectProjectForFile(filePath: string, rootPath: string): string {
 }
 
 /**
+ * Resolve a user-supplied file path to a registered root + relative path,
+ * mirroring the sync resolver (see sync_notes): expand `~` / `%USERPROFILE%`
+ * against this machine's home, resolve to absolute, then prefix-match the input
+ * against each root's active path, preferring the longest (most specific) match.
+ * Returns null if the path isn't inside any known root.
+ *
+ * This is what lets get_note resolve an absolute clipboard path
+ * (e.g. C:\Users\me\Noesis\foo.md) against a tilde-stored cloud root (~/Noesis):
+ * the backend /notes/by-path route does a literal prefix compare and never
+ * expands `~`, so absolute paths can't match cloud roots there — resolving
+ * client-side and calling /notes/by-relative instead sidesteps that.
+ */
+export function resolvePathToRoot(
+  filePath: string,
+  roots: Array<{ id: number; path?: string }>
+): { rootId: number; relativePath: string } | null {
+  const normalizedInput = normalizePath(path.resolve(expandHome(filePath)));
+  let best: { id: number; rootPath: string } | null = null;
+  for (const r of roots) {
+    const rawPath = expandHome(r.path || '');
+    if (!rawPath) continue;
+    const rootPath = normalizePath(path.resolve(rawPath));
+    if (normalizedInput === rootPath || normalizedInput.startsWith(rootPath + '/')) {
+      if (!best || rootPath.length > best.rootPath.length) {
+        best = { id: r.id, rootPath };
+      }
+    }
+  }
+  if (!best) return null;
+  return { rootId: best.id, relativePath: normalizePath(path.relative(best.rootPath, normalizedInput)) };
+}
+
+/**
  * Get a unique file path by appending -1, -2, etc. if file already exists
  */
 function getUniqueFilePath(filePath: string): string {
@@ -277,7 +310,7 @@ export function registerTools(server: McpServer, services: ToolServices): void {
   // Register get_note tool
   server.tool(
     'get_note',
-    'PRIMARY READ TOOL FOR NOESIS NOTES — USE THIS INSTEAD OF the `Read` filesystem tool for ANY path inside a registered Noesis root (paths containing `/.noesis/`, or any path under a directory returned by `list_roots`). The path is a Noesis identifier, not just a filesystem coordinate; the file may not exist on this machine\'s disk but the content always exists in the Noesis cloud and works across machines. This tool is READ-ONLY (no disk write) and is SAFE TO CALL IN PLAN MODE. RECOVERY RULE: if you already called `Read` on a path inside a Noesis-watched root and got "File does not exist", YOUR IMMEDIATE NEXT ACTION IS THIS TOOL with the same path — DO NOT use Glob or Grep to hunt for similar filenames, DO NOT ask the user to disambiguate the path, DO NOT suggest the user typed it wrong. Trigger phrases: "read this note", "summarize this file", "what does X say", "open this", "check this bug report", "review this doc" — when the referenced path is Noesis-tracked, use THIS tool. For a writable local copy (e.g., `Edit`/`Write` operations, git diffs, or any task that needs the file on local disk), use `sync_notes(files: [path])` instead, which materializes the file onto disk at the canonical path. Accepts either a Note ID (`id`) or a file path (`path`).',
+    'PRIMARY READ TOOL FOR NOESIS NOTES — USE THIS INSTEAD OF the `Read` filesystem tool for ANY path inside a registered Noesis root. A path is Noesis-tracked if it contains `/.noesis/`, OR sits under a folder named `Noesis` (the cloud root — e.g. `~/Noesis/…`, `%USERPROFILE%\\Noesis\\…`, or `C:\\Users\\<you>\\Noesis\\…`), OR is under any directory returned by `list_roots`. The path is a Noesis identifier, not just a filesystem coordinate; the file may not exist on this machine\'s disk but the content always exists in the Noesis cloud and works across machines — and an ABSOLUTE path resolves here even when the cloud stored the root in tilde form. This tool is READ-ONLY (no disk write) and is SAFE TO CALL IN PLAN MODE. RECOVERY RULE: if `Read` returned "File does not exist" for a `.md` path that looks like a note — especially one under a `.noesis`/`Noesis` folder — YOUR IMMEDIATE NEXT ACTION IS THIS TOOL with the same path. DO NOT use Glob or Grep to hunt for similar filenames, DO NOT ask the user to disambiguate the path, DO NOT suggest the user typed it wrong, and DO NOT conclude the note is missing or on another machine until THIS lookup also fails. Trigger phrases: "read this note", "summarize this file", "what does X say", "open this", "check this bug report", "review this doc" — when the referenced path is Noesis-tracked, use THIS tool. For a writable local copy (e.g., `Edit`/`Write` operations, git diffs, or any task that needs the file on local disk), use `sync_notes(files: [path])` instead, which materializes the file onto disk at the canonical path. Accepts either a Note ID (`id`) or a file path (`path`).',
     {
       id: z.number().optional().describe('Note ID'),
       path: z.string().optional().describe('File path of the note')
@@ -295,7 +328,24 @@ export function registerTools(server: McpServer, services: ToolServices): void {
         };
       }
 
-      const note = id ? await client.getNote(id) : await client.getNoteByPath(path!);
+      let note;
+      if (id) {
+        note = await client.getNote(id);
+      } else {
+        // Resolve the path against registered roots locally first. This handles
+        // absolute clipboard paths (C:\Users\me\Noesis\...) against tilde-stored
+        // cloud roots (~/Noesis), which the server-side by-path route can't match
+        // because it never expands `~`. Fall back to by-path for any path that
+        // isn't inside a known root.
+        const roots = await client.getRoots();
+        const resolved = resolvePathToRoot(path!, roots);
+        note = resolved
+          ? await client.getNoteByRelativePath(resolved.rootId, resolved.relativePath)
+          : undefined;
+        if (!note) {
+          note = await client.getNoteByPath(path!);
+        }
+      }
 
       if (!note) {
         return {
@@ -967,7 +1017,7 @@ export function registerTools(server: McpServer, services: ToolServices): void {
   // Register sync_notes tool (bidirectional sync)
   server.tool(
     'sync_notes',
-    'Bidirectional sync for the listed files. If a `files` path is MISSING LOCALLY but present in the cloud, this materializes the cloud content onto local disk at that path — creating any missing parent directories — and sets a sync baseline so future edits diff correctly. Use this whenever the user references a path inside a registered Noesis root (`list_roots`) and the file is not yet on this machine (e.g., the note was created by Claude Code on another laptop and pushed to Noesis); after the call the file will exist on disk at the canonical path and can be read, edited, and re-pushed normally. If both sides have content and differ, conflicts are detected and reported. Calling without `root` or `files` performs a FULL root scan, which is slow and should only be used for intentional bulk syncs. PLAN-MODE GUIDANCE: This tool writes to disk so plan mode forbids the actual call, but you SHOULD propose calling it as Step 1 of any plan that needs a local file for a Noesis-tracked path that is missing on this machine — DO NOT ask the user "did you mean a different path?" or fall back to filesystem search when the path is inside a registered Noesis root. For read-only intent in plan mode (just reading content), prefer `get_note(path)` instead — it is read-only and plan-safe.',
+    'Bidirectional sync for the listed files. If a `files` path is MISSING LOCALLY but present in the cloud, this materializes the cloud content onto local disk at that path — creating any missing parent directories — and sets a sync baseline so future edits diff correctly. Use this whenever the user references a path inside a registered Noesis root and the file is not yet on this machine (e.g., the note was created by Claude Code on another laptop and pushed to Noesis); after the call the file will exist on disk at the canonical path and can be read, edited, and re-pushed normally. A path is inside a Noesis root if it contains `/.noesis/`, sits under a folder named `Noesis` (the cloud root — `~/Noesis/…`, `%USERPROFILE%\\Noesis\\…`, `C:\\Users\\<you>\\Noesis\\…`), or is under any directory in `list_roots`; absolute paths work even when the cloud stored the root in tilde form. If both sides have content and differ, conflicts are detected and reported. Calling without `root` or `files` performs a FULL root scan, which is slow and should only be used for intentional bulk syncs. PLAN-MODE GUIDANCE: This tool writes to disk so plan mode forbids the actual call, but you SHOULD propose calling it as Step 1 of any plan that needs a local file for a Noesis-tracked path that is missing on this machine — DO NOT ask the user "did you mean a different path?" or fall back to filesystem search when the path is inside a registered Noesis root. For read-only intent in plan mode (just reading content), prefer `get_note(path)` instead — it is read-only and plan-safe.',
     {
       root: z.string().optional().describe('Sync only a specific root folder (by name)'),
       files: z.array(z.string()).optional().describe('Sync specific file paths only. IMPORTANT: Use absolute paths (e.g., "C:/projects/docs/file.md"). Relative paths may resolve incorrectly.'),
