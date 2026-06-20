@@ -423,6 +423,97 @@ export function registerTools(server: McpServer, services: ToolServices): void {
     }
   );
 
+  // Register get_note_skim_read tool
+  server.tool(
+    'get_note_skim_read',
+    "Read a note's SKIM-READ KEY PARTS — the spans the app's Skim-Read feature surfaces as the gist a reader should focus on. READ-ONLY: it computes the key parts on demand and writes NO marks to the note. Accepts a Note ID (`id`) or a file path (`path`). Use this to inspect what Skim-Read extracts for a note, or when iterating on the Skim-Read feature itself (set `fresh:true` to bypass the 30-min server cache after changing extraction logic). Cost: ~1 LLM call per (content+style+intensity), cached 30 min unless `fresh`. Knobs: `style` (gist|balanced|thorough|structure|keyword|question|inverse), `intensity` (light|normal|heavy), `granularities` (section|paragraph|sentence|keyword), `focusQuestion` (with style='question'), `language`. Returns key parts grouped by granularity with each part's importance (0..1) and a short reason. A note with no skimmable gist (a list/tracker/changelog) may correctly return zero parts.",
+    {
+      id: z.number().optional().describe('Note ID'),
+      path: z.string().optional().describe('File path of the note'),
+      style: z.enum(['gist', 'balanced', 'thorough', 'structure', 'keyword', 'question', 'inverse']).optional()
+        .describe("Reading strategy (default: balanced)"),
+      intensity: z.enum(['light', 'normal', 'heavy']).optional().describe('How many parts to surface (default: normal)'),
+      granularities: z.array(z.enum(['section', 'paragraph', 'sentence', 'keyword'])).optional()
+        .describe('Which granularities to allow (default: all)'),
+      focusQuestion: z.string().optional().describe("Only with style='question': surface only spans relevant to this question"),
+      language: z.string().optional().describe("Note language hint (e.g. 'en', 'zh')"),
+      fresh: z.boolean().optional().describe('Bypass the 30-min server cache and recompute (use when iterating on extraction logic)')
+    },
+    async (args) => {
+      const { id, path, style, intensity, granularities, focusQuestion, language, fresh } = args;
+
+      if (!id && !path) {
+        return {
+          content: [{ type: 'text', text: 'Error: Please provide either an id or a path.' }],
+          isError: true
+        };
+      }
+
+      // Resolve a path to a note id locally first (mirrors get_note) so tilde-stored
+      // roots resolve; then skim-read by id. Fall back to sending the path through.
+      let noteId = id;
+      if (!noteId && path) {
+        const roots = await client.getRoots();
+        const resolved = resolvePathToRoot(path, roots);
+        const note = resolved
+          ? await client.getNoteByRelativePath(resolved.rootId, resolved.relativePath)
+          : await client.getNoteByPath(path);
+        if (note) noteId = (note as any).id;
+      }
+
+      let result;
+      try {
+        result = await client.getNoteSkimRead(
+          noteId
+            ? { id: noteId, style, intensity, granularities, focusQuestion, language, fresh }
+            : { path, style, intensity, granularities, focusQuestion, language, fresh }
+        );
+      } catch (e) {
+        return {
+          content: [{ type: 'text', text: `Skim-Read failed: ${(e as Error).message}` }],
+          isError: true
+        };
+      }
+
+      const meta = `**Note ID:** ${result.noteId} · **kind:** ${result.noteKind} · **parts:** ${result.keyPartCount} · **model:** ${result.model ?? 'n/a'}${result.cached ? ' · cached' : ' · fresh'}`;
+
+      if (!result.keyParts || result.keyParts.length === 0) {
+        return {
+          content: [{
+            type: 'text',
+            text: `# Skim-Read — ${result.title}\n\n${meta}\n\nNo key parts surfaced — this note has no skimmable gist (kind: ${result.noteKind}). For a list / tracker / changelog this is the expected result.`
+          }]
+        };
+      }
+
+      const ORDER = ['section', 'paragraph', 'sentence', 'keyword'];
+      const byGran = new Map<string, typeof result.keyParts>();
+      for (const kp of result.keyParts) {
+        if (!byGran.has(kp.granularity)) byGran.set(kp.granularity, []);
+        byGran.get(kp.granularity)!.push(kp);
+      }
+
+      let body = '';
+      for (const g of ORDER) {
+        const items = byGran.get(g);
+        if (!items || items.length === 0) continue;
+        items.sort((a, b) => b.importance - a.importance);
+        body += `\n## ${g.charAt(0).toUpperCase() + g.slice(1)} (${items.length})\n`;
+        for (const kp of items) {
+          const reason = kp.reason ? ` — ${kp.reason}` : '';
+          body += `- [${kp.importance.toFixed(2)}] ${JSON.stringify(kp.quote)}${reason}\n`;
+        }
+      }
+
+      return {
+        content: [{
+          type: 'text',
+          text: `# Skim-Read — ${result.title}\n\n${meta}\n${body}`
+        }]
+      };
+    }
+  );
+
   server.tool(
     'get_bookmark_context',
     'Read the note content surrounding a specific bookmark/tag. ' +

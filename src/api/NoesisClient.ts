@@ -262,6 +262,36 @@ export interface SyncLogOptions {
   notes?: string;
 }
 
+export interface SkimReadKeyPart {
+  granularity: string;
+  quote: string;
+  reason: string;
+  importance: number;
+}
+
+export interface SkimReadResult {
+  noteId: number;
+  title: string;
+  contentHash: string;
+  model: string | null;
+  cached: boolean;
+  noteKind: string;
+  keyPartCount: number;
+  declined: boolean;
+  keyParts: SkimReadKeyPart[];
+}
+
+export interface SkimReadParams {
+  id?: number;
+  path?: string;
+  style?: string;
+  intensity?: string;
+  granularities?: string[];
+  focusQuestion?: string;
+  language?: string;
+  fresh?: boolean;
+}
+
 /**
  * HTTP client for Noesis API
  */
@@ -648,6 +678,15 @@ export class NoesisClient {
     } catch {
       return undefined;
     }
+  }
+
+  /**
+   * Compute a note's Skim-Read KEY PARTS on demand (read-only; the server writes
+   * no marks). Errors propagate so the tool can surface AI-not-configured / quota
+   * / too-large messages rather than swallowing them.
+   */
+  async getNoteSkimRead(params: SkimReadParams): Promise<SkimReadResult> {
+    return this.request<SkimReadResult>('POST', '/api/mcp/notes/skim-read', params);
   }
 
   async searchByRelatedCode(path: string, limit: number = 20): Promise<any[]> {
