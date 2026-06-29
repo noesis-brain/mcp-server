@@ -426,7 +426,7 @@ export function registerTools(server: McpServer, services: ToolServices): void {
   // Register get_note_skim_read tool
   server.tool(
     'get_note_skim_read',
-    "Read a note's SKIM-READ KEY PARTS — the spans the app's Skim-Read feature surfaces as the gist a reader should focus on. READ-ONLY: it computes the key parts on demand and writes NO marks to the note. Accepts a Note ID (`id`) or a file path (`path`). Use this to inspect what Skim-Read extracts for a note, or when iterating on the Skim-Read feature itself (set `fresh:true` to bypass the 30-min server cache after changing extraction logic). Cost: ~1 LLM call per (content+style+intensity), cached 30 min unless `fresh`. Knobs: `style` (gist|balanced|thorough|structure|keyword|question|inverse), `intensity` (light|normal|heavy), `granularities` (section|paragraph|sentence|keyword), `focusQuestion` (with style='question'), `language`. Returns key parts grouped by granularity with each part's importance (0..1) and a short reason. A note with no skimmable gist (a list/tracker/changelog) may correctly return zero parts.",
+    "Read a note's SKIM-READ KEY PARTS — the spans the app's Skim-Read feature surfaces as the gist a reader should focus on. READ-ONLY: it computes the key parts on demand and writes NO marks to the note. Accepts a Note ID (`id`) or a file path (`path`). Use this to inspect what Skim-Read extracts for a note, or when iterating on the Skim-Read feature itself (set `fresh:true` to bypass the 30-min server cache after changing extraction logic). Cost: ~1 LLM call per (content+style+intensity), cached 30 min unless `fresh`. Knobs: `style` (gist|balanced|thorough|structure|keyword|question|inverse), `intensity` (light|normal|heavy), `granularities` (section|paragraph|sentence|keyword), `focusQuestion` (with style='question'), `language`. Returns key parts grouped by granularity with each part's importance (0..1) and a short reason. A note with no skimmable gist (a list/tracker/changelog) may correctly return zero parts. NOTE: this tool calls the in-app AI; if it fails with a quota/503/'AI not configured' error, use `apply_note_skim_read` instead — YOU generate the key parts and the server just persists them (no in-app AI needed).",
     {
       id: z.number().optional().describe('Note ID'),
       path: z.string().optional().describe('File path of the note'),
@@ -509,6 +509,100 @@ export function registerTools(server: McpServer, services: ToolServices): void {
         content: [{
           type: 'text',
           text: `# Skim-Read — ${result.title}\n\n${meta}\n${body}`
+        }]
+      };
+    }
+  );
+
+  server.tool(
+    'apply_note_skim_read',
+    [
+      "Persist Skim-Read KEY PARTS that YOU generate for a note — the Gemini-free fallback for the app's Skim-Read feature when the in-app AI is rate-limited/503/unconfigured. WRITES marks: the server anchors each verbatim quote against the note's authoritative content and persists the matches as `suggested` ai_skim marks (the same marks the Skim-Read panel renders). The server does NO LLM call — it only anchors + persists what you provide.",
+      "",
+      "WORKFLOW: (1) read the note's content (get_note); (2) pick the key parts a reader should focus on to get the gist; (3) call this tool with `id` (or `path`) and `keyParts`; (4) if the result lists `unmatchedQuotes`, FIX those quotes (they weren't found verbatim) and call again.",
+      "",
+      "Each keyPart: { granularity, quote, headingPath?, importance?, reason? }.",
+      "- quote: MUST be copied CHARACTER-FOR-CHARACTER (verbatim) from the note — do NOT paraphrase, fix typos, translate, summarize, or add ellipses. Make it long enough to occur exactly once; if a short phrase repeats, include enough surrounding words to be unique. For a 'section' quote the heading line text; 'sentence' the full sentence; 'paragraph' its first ~12 words; 'keyword' the exact token(s).",
+      "- granularity: section | paragraph | sentence | keyword.",
+      "- importance: 0..1; reserve > 0.8 for the few genuinely load-bearing parts.",
+      "- reason: <= 12 words, plainly what the span says (no hype words).",
+      "- Only quote VISIBLE prose. Never quote inside code fences (```), YAML frontmatter, HTML tags, or a COLLAPSED `<details>` block (one without the `open` attribute).",
+      "- headingPath: ancestor heading texts (top-most first) to disambiguate a repeated quote; [] if unknown.",
+      "Knobs (optional): `style`, `intensity` (light|normal|heavy — bounds how many parts persist), `granularities`, `language`, `model` (provenance label). Re-applying replaces prior un-accepted suggestions; accepted/dismissed marks are preserved.",
+    ].join('\n'),
+    {
+      id: z.number().optional().describe('Note ID'),
+      path: z.string().optional().describe('File path of the note'),
+      keyParts: z.array(z.object({
+        granularity: z.enum(['section', 'paragraph', 'sentence', 'keyword']),
+        quote: z.string().describe('Verbatim slice of the note content (character-for-character)'),
+        headingPath: z.array(z.string()).optional().describe('Ancestor heading texts, top-most first; [] if unknown'),
+        importance: z.number().min(0).max(1).optional().describe('0..1; > 0.8 only for load-bearing parts'),
+        reason: z.string().optional().describe('<= 12 words: plainly what the span says'),
+      })).min(1).describe('The key parts you generated (verbatim quotes from the note)'),
+      style: z.enum(['gist', 'balanced', 'thorough', 'structure', 'keyword', 'question', 'inverse']).optional()
+        .describe('Reading strategy hint (default: balanced)'),
+      intensity: z.enum(['light', 'normal', 'heavy']).optional().describe('Bounds how many parts persist (default: normal)'),
+      granularities: z.array(z.enum(['section', 'paragraph', 'sentence', 'keyword'])).optional()
+        .describe('Which granularities to allow (default: all)'),
+      language: z.string().optional().describe("Note language hint (e.g. 'en', 'zh')"),
+      model: z.string().optional().describe("Provenance label stored on the run (default: 'claude-code')"),
+    },
+    async (args) => {
+      const { id, path, keyParts, style, intensity, granularities, language, model } = args;
+
+      if (!id && !path) {
+        return {
+          content: [{ type: 'text', text: 'Error: Please provide either an id or a path.' }],
+          isError: true
+        };
+      }
+
+      // Resolve a path to a note id locally first (mirrors get_note_skim_read).
+      let noteId = id;
+      if (!noteId && path) {
+        const roots = await client.getRoots();
+        const resolved = resolvePathToRoot(path, roots);
+        const note = resolved
+          ? await client.getNoteByRelativePath(resolved.rootId, resolved.relativePath)
+          : await client.getNoteByPath(path);
+        if (note) noteId = (note as any).id;
+      }
+
+      let result;
+      try {
+        result = await client.applyNoteSkimRead(
+          noteId
+            ? { id: noteId, keyParts, style, intensity, granularities, language, model }
+            : { path, keyParts, style, intensity, granularities, language, model }
+        );
+      } catch (e) {
+        return {
+          content: [{ type: 'text', text: `Apply Skim-Read failed: ${(e as Error).message}` }],
+          isError: true
+        };
+      }
+
+      const lines: string[] = [
+        `**Note ID:** ${result.noteId} · **applied:** ${result.keyPartCount}/${result.providedCount} provided · **anchored:** ${result.anchoredCount} · **model:** ${result.model ?? 'n/a'}`,
+      ];
+      if (result.unmatchedQuotes && result.unmatchedQuotes.length > 0) {
+        lines.push('');
+        lines.push(`**${result.unmatchedQuotes.length} quote(s) did NOT anchor (not found verbatim in the note). Fix the exact text and re-apply:**`);
+        for (const q of result.unmatchedQuotes) lines.push(`- ${JSON.stringify(q)}`);
+      } else if (result.keyPartCount > 0) {
+        lines.push('');
+        lines.push('All provided quotes anchored. Open the note in Noesis — the Skim-Read panel now shows these key parts.');
+      }
+      if (result.declined) {
+        lines.push('');
+        lines.push('(Nothing anchored — no suggestions were persisted.)');
+      }
+
+      return {
+        content: [{
+          type: 'text',
+          text: `# Skim-Read applied — ${result.title}\n\n${lines.join('\n')}`
         }]
       };
     }

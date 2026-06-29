@@ -292,6 +292,50 @@ export interface SkimReadParams {
   fresh?: boolean;
 }
 
+/** A key part generated externally (by Claude) to apply to a note. */
+export interface ApplySkimKeyPart {
+  granularity: 'section' | 'paragraph' | 'sentence' | 'keyword';
+  /** Verbatim, character-for-character slice of the note content. */
+  quote: string;
+  /** Ancestor heading texts (top-most first) locating the quote; [] if unknown. */
+  headingPath?: string[];
+  /** 0..1; reserve > 0.8 for genuinely load-bearing parts. */
+  importance?: number;
+  /** <= 12 words, plainly what the span says. */
+  reason?: string;
+}
+
+export interface ApplySkimReadParams {
+  id?: number;
+  path?: string;
+  keyParts: ApplySkimKeyPart[];
+  style?: string;
+  intensity?: string;
+  granularities?: string[];
+  language?: string;
+  /** Provenance label stored on the run (defaults to 'claude-code' server-side). */
+  model?: string;
+}
+
+export interface ApplySkimReadResult {
+  noteId: number;
+  title: string;
+  /** null when nothing anchored (zero-anchor attempt — no run was logged). */
+  runId: string | null;
+  contentHash: string;
+  model: string | null;
+  noteKind: string;
+  maxParts: number;
+  providedCount: number;
+  anchoredCount: number;
+  keyPartCount: number;
+  truncated: boolean;
+  declined: boolean;
+  /** Provided quotes that did NOT occur verbatim — fix these and re-apply. */
+  unmatchedQuotes: string[];
+  suggestions: unknown[];
+}
+
 /**
  * HTTP client for Noesis API
  */
@@ -687,6 +731,16 @@ export class NoesisClient {
    */
   async getNoteSkimRead(params: SkimReadParams): Promise<SkimReadResult> {
     return this.request<SkimReadResult>('POST', '/api/mcp/notes/skim-read', params);
+  }
+
+  /**
+   * Apply externally-generated Skim-Read key parts to a note (no in-app LLM call):
+   * the server anchors each verbatim quote and persists matches as `suggested`
+   * marks. The Gemini-free fallback. `unmatchedQuotes` in the result lists quotes
+   * that didn't anchor so the caller can fix them and re-apply.
+   */
+  async applyNoteSkimRead(params: ApplySkimReadParams): Promise<ApplySkimReadResult> {
+    return this.request<ApplySkimReadResult>('POST', '/api/mcp/notes/skim-read/apply', params);
   }
 
   async searchByRelatedCode(path: string, limit: number = 20): Promise<any[]> {
