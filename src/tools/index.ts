@@ -1495,8 +1495,15 @@ export function registerTools(server: McpServer, services: ToolServices): void {
               }
             } else if (localFile && cloudNote) {
               // BOTH EXIST: Compare hashes
-              if (localFile.hash === cloudNote.hash) {
-                // Same hash: seed baseline and check for metadata enrichment
+              if (
+                localFile.hash === cloudNote.hash &&
+                cloudNote.content != null &&
+                NoesisClient.computeHash(cloudNote.content) === cloudNote.hash
+              ) {
+                // Same hash AND cloud internally consistent: seed baseline + metadata enrichment.
+                // The computeHash(cloudNote.content) === cloudNote.hash guard defends against a
+                // "hash-ahead-of-content" divergence (cloud hash matches local but cloud content
+                // is stale); when detected we fall through to the push/three-way branch below.
                 if (!dryRun && localFile.hash) {
                   stateMgr.setBaseline(
                     relativePath,
@@ -1543,7 +1550,10 @@ export function registerTools(server: McpServer, services: ToolServices): void {
                 const baselineLastSyncedAt = baselineMeta?.lastSyncedAt;
                 const localMtime = localFile.mtime ? localFile.mtime.getTime() : Date.now();
                 const cloudMtime = new Date(cloudNote.modified_at).getTime();
-                const direction = force
+                // Push when forced, OR when we reached this branch with equal hashes (only
+                // possible via the divergence fall-through above) — determineSyncDirection
+                // would see equal hashes and skip, so override to repair the stale cloud content.
+                const direction = (force || localFile.hash === cloudNote.hash)
                   ? 'push'
                   : determineSyncDirection(
                       localFile.hash!,
@@ -3377,8 +3387,19 @@ async function syncSpecificFiles(
           result.pushed.created++;
           affectedRoots.add(matchingRoot.id);
         }
-      } else if (localHash === cloudNote.hash) {
-        // SAME CONTENT HASH: Check if metadata differs
+      } else if (
+        localHash === cloudNote.hash &&
+        cloudNote.content != null &&
+        NoesisClient.computeHash(cloudNote.content) === cloudNote.hash
+      ) {
+        // SAME CONTENT HASH (and the cloud is internally consistent): metadata-only diff.
+        // The computeHash(cloudNote.content) === cloudNote.hash guard defends against a
+        // "hash-ahead-of-content" divergence — a cloud row whose stored hash matches local
+        // but whose stored *content* is stale. When detected, we fall through to the push
+        // branch below (which force-pushes on equal hashes) instead of trusting hash-equality
+        // and skipping, so a diverged note can always be repaired. (force is intentionally NOT
+        // part of this gate: a forced re-sync of genuinely-identical content should keep the
+        // original same-hash/metadata behavior, not re-upload the whole body.) Metadata diff:
         const cloudKeywords = parseCloudKeywords(cloudNote.keywords);
 
         const metadataDiffers =
@@ -3457,7 +3478,11 @@ async function syncSpecificFiles(
         const baselineHash = baselineMeta?.hash;
         const baselineLastSyncedAt = baselineMeta?.lastSyncedAt;
         const cloudMtime = new Date(cloudNote.modified_at).getTime();
-        const direction = force
+        // Push when forced, OR when we reached this branch with matching hashes — which now
+        // only happens via the divergence/force fall-through above (a cloud row whose hash
+        // matches local but whose content is stale). determineSyncDirection would see equal
+        // hashes and return 'skip', so override it to repair the stale cloud content.
+        const direction = (force || localHash === cloudNote.hash)
           ? 'push'
           : determineSyncDirection(
               localHash,
