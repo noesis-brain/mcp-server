@@ -13,7 +13,7 @@ Accepted forms:
 
 - `<path>.md` — a file path (e.g. from the Noesis web UI "Copy File Path" button). Quote paths with spaces.
 - `<id>` — a numeric Note ID.
-- Natural language — e.g. `Create skim-read for the note "C:\…\note.md"`; extract the path/ID from the request.
+- Natural language — e.g. `Create skim-read for the note "/path/to/note.md"`; extract the path/ID from the request.
 - `--style <s>` — reading strategy: `gist` | `balanced` (default) | `thorough` | `structure` | `keyword`.
 - `--intensity <i>` — how many parts: `light` | `normal` (default) | `heavy`.
 
@@ -66,7 +66,7 @@ State how many key parts were applied (`keyPartCount`), list any quotes that sti
 
 ## Examples
 
-- `/skim-read "C:\temp_cGit\.noesis\b-roll\1b1bcf99-f520-4bf5-9575-247d7574e8f5.md"` — skim-read by file path.
-- `/skim-read 2302 --style gist` — terse gist of note 2302.
-- `/skim-read 2302 --intensity heavy` — more key parts.
-- `Create skim-read for the note "C:\…\note.md"` — natural-language invocation.
+- `/noesis-skim-read "/path/to/note.md"` — skim-read by file path.
+- `/noesis-skim-read 2302 --style gist` — terse gist of note 2302.
+- `/noesis-skim-read 2302 --intensity heavy` — more key parts.
+- `Create skim-read for the note "/path/to/note.md"` — natural-language invocation.

@@ -23,6 +23,7 @@ const SCRIPTS_DIR = path.join(PACKAGE_ROOT, 'scripts');
 const CLAUDE_DIR = path.join(os.homedir(), '.claude');
 const CLAUDE_MD_PATH = path.join(CLAUDE_DIR, 'CLAUDE.md');
 const COMMANDS_DIR = path.join(CLAUDE_DIR, 'commands');
+const SETTINGS_PATH = path.join(CLAUDE_DIR, 'settings.json');
 
 /**
  * A versioned block injected into ~/.claude/CLAUDE.md, delimited by HTML-comment
@@ -64,6 +65,8 @@ interface SetupOptions {
   dryRun: boolean;
   withRestructure: boolean;
   noRestructure: boolean;
+  withCapture: boolean;
+  noCapture: boolean;
 }
 
 function parseArgs(argv: string[]): SetupOptions {
@@ -73,6 +76,8 @@ function parseArgs(argv: string[]): SetupOptions {
     dryRun: argv.includes('--dry-run'),
     withRestructure: argv.includes('--with-restructure-rule'),
     noRestructure: argv.includes('--no-restructure-rule'),
+    withCapture: argv.includes('--with-capture'),
+    noCapture: argv.includes('--no-capture'),
   };
 }
 
@@ -188,9 +193,19 @@ async function resolveRestructureChoice(options: SetupOptions, alreadyInstalled:
   return promptYesNo(`Install this optional rule?${suffix}`, alreadyInstalled);
 }
 
+// Commands a prior version installed that have since been renamed or retired.
+// Any stale copy under ~/.claude/commands/ is deleted on setup so users don't
+// end up with both the old and the new command. (installSkills only ever wrote
+// files, so without this a rename orphans the old one.) The `signature` guards
+// against nuking an unrelated user file that happens to share the basename —
+// we only delete a file that still contains a string unique to our old skill.
+const RETIRED_SKILLS: Array<{ name: string; signature: string }> = [
+  { name: 'skim-read', signature: 'apply_note_skim_read' },
+];
+
 interface SkillResult {
   name: string;
-  action: 'created' | 'updated' | 'unchanged';
+  action: 'created' | 'updated' | 'unchanged' | 'removed';
   path: string;
 }
 
@@ -200,6 +215,7 @@ function installSkills(dryRun: boolean): SkillResult[] {
   }
 
   const scriptPath = path.join(SCRIPTS_DIR, 'noesis-sync.mjs').replace(/\\/g, '/');
+  const captureWatcherPath = path.join(SCRIPTS_DIR, 'noesis-capture-watcher.mjs').replace(/\\/g, '/');
   const templates = fs.readdirSync(SKILL_TEMPLATES_DIR).filter((f) => f.endsWith('.md'));
   const results: SkillResult[] = [];
 
@@ -208,6 +224,7 @@ function installSkills(dryRun: boolean): SkillResult[] {
     const targetPath = path.join(COMMANDS_DIR, filename);
     let content = fs.readFileSync(templatePath, 'utf-8');
     content = content.replace(/\{\{NOESIS_MCP_SCRIPT_PATH\}\}/g, scriptPath);
+    content = content.replace(/\{\{NOESIS_CAPTURE_WATCHER_PATH\}\}/g, captureWatcherPath);
 
     let action: SkillResult['action'];
     if (!fs.existsSync(targetPath)) {
@@ -224,7 +241,147 @@ function installSkills(dryRun: boolean): SkillResult[] {
     results.push({ name: filename.replace(/\.md$/, ''), action, path: targetPath });
   }
 
+  // Remove any retired command left behind by an earlier install (only if the
+  // file is still recognizably ours — see RETIRED_SKILLS).
+  for (const { name, signature } of RETIRED_SKILLS) {
+    const stalePath = path.join(COMMANDS_DIR, `${name}.md`);
+    if (fs.existsSync(stalePath) && fs.readFileSync(stalePath, 'utf-8').includes(signature)) {
+      if (!dryRun) fs.unlinkSync(stalePath);
+      results.push({ name, action: 'removed', path: stalePath });
+    }
+  }
+
   return results;
+}
+
+// ---------------------------------------------------------------------------
+// Optional /noesis-capture SessionEnd hook (opt-in).
+//
+// Registers a SessionEnd hook in ~/.claude/settings.json so that when a capture
+// controller session ends, its background watchers are marked stopped and killed.
+// The /noesis-capture skill itself is always installed (it's a normal skill
+// template); only this hook — which touches settings.json and runs on every
+// session exit — is gated behind opt-in, mirroring the restructure-on-sync rule.
+// ---------------------------------------------------------------------------
+
+const CAPTURE_HOOK_MARKER = 'noesis-capture-session-end';
+
+/** The exact command we register for the SessionEnd hook (packaged script). */
+function captureHookCommand(): string {
+  const script = path.join(SCRIPTS_DIR, 'noesis-capture-session-end.mjs').replace(/\\/g, '/');
+  return `node "${script}"`;
+}
+
+/** Parse settings.json, or null if absent. Throws on malformed JSON (never clobber it). */
+function readSettings(): any | null {
+  if (!fs.existsSync(SETTINGS_PATH)) return null;
+  try {
+    return JSON.parse(fs.readFileSync(SETTINGS_PATH, 'utf-8'));
+  } catch {
+    throw new Error(`Could not parse ${SETTINGS_PATH} as JSON. Fix it manually and re-run.`);
+  }
+}
+
+/** Whether any SessionEnd hook command is ours. */
+function settingsHasCaptureHook(settings: any): boolean {
+  const arr = settings?.hooks?.SessionEnd;
+  if (!Array.isArray(arr)) return false;
+  return arr.some(
+    (e: any) =>
+      Array.isArray(e?.hooks) &&
+      e.hooks.some((h: any) => typeof h?.command === 'string' && h.command.includes(CAPTURE_HOOK_MARKER)),
+  );
+}
+
+/** Tolerant presence check for the interactive prompt default (never throws). */
+function captureHookInstalled(): boolean {
+  try {
+    const s = readSettings();
+    return s !== null && settingsHasCaptureHook(s);
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Install or remove the capture SessionEnd hook in settings.json, idempotently.
+ * Other hooks and settings are preserved. Returns the action taken.
+ */
+function registerCaptureHook(install: boolean, dryRun: boolean): BlockAction {
+  let settings = readSettings();
+  const existed = settings !== null;
+  const command = captureHookCommand();
+
+  // Removal path.
+  if (!install) {
+    if (!settings || !settingsHasCaptureHook(settings)) return 'absent';
+    const arr = settings.hooks.SessionEnd as any[];
+    settings.hooks.SessionEnd = arr
+      .map((e) => {
+        if (Array.isArray(e?.hooks)) {
+          e.hooks = e.hooks.filter(
+            (h: any) => !(typeof h?.command === 'string' && h.command.includes(CAPTURE_HOOK_MARKER)),
+          );
+        }
+        return e;
+      })
+      .filter((e) => !Array.isArray(e?.hooks) || e.hooks.length > 0);
+    if (settings.hooks.SessionEnd.length === 0) delete settings.hooks.SessionEnd;
+    if (settings.hooks && Object.keys(settings.hooks).length === 0) delete settings.hooks;
+    if (!dryRun) fs.writeFileSync(SETTINGS_PATH, JSON.stringify(settings, null, 2) + '\n', 'utf-8');
+    return 'removed';
+  }
+
+  // Install path.
+  if (!settings) settings = {};
+  if (!settings.hooks || typeof settings.hooks !== 'object') settings.hooks = {};
+  if (!Array.isArray(settings.hooks.SessionEnd)) settings.hooks.SessionEnd = [];
+  const arr = settings.hooks.SessionEnd as any[];
+
+  let found = false;
+  let changed = false;
+  for (const e of arr) {
+    if (!Array.isArray(e?.hooks)) continue;
+    for (const h of e.hooks) {
+      if (typeof h?.command === 'string' && h.command.includes(CAPTURE_HOOK_MARKER)) {
+        found = true;
+        if (h.command !== command) {
+          h.command = command; // upgrade a stale path (e.g. package moved)
+          changed = true;
+        }
+      }
+    }
+  }
+  if (!found) {
+    arr.push({ matcher: '', hooks: [{ type: 'command', command }] });
+  }
+  if (found && !changed) return 'unchanged';
+  if (!dryRun) {
+    if (!fs.existsSync(CLAUDE_DIR)) fs.mkdirSync(CLAUDE_DIR, { recursive: true });
+    fs.writeFileSync(SETTINGS_PATH, JSON.stringify(settings, null, 2) + '\n', 'utf-8');
+  }
+  return existed ? (found ? 'upgraded' : 'inserted') : 'created';
+}
+
+/**
+ * Decide what to do with the optional capture SessionEnd hook.
+ * Returns true (install), false (remove/skip), or undefined (leave current state).
+ * Precedence: explicit flags > interactive prompt > leave-as-is (non-TTY / dry-run).
+ */
+async function resolveCaptureChoice(options: SetupOptions, alreadyInstalled: boolean): Promise<boolean | undefined> {
+  if (options.noCapture) return false;
+  if (options.withCapture) return true;
+  if (options.dryRun) return undefined;
+  if (!process.stdin.isTTY) return undefined;
+
+  console.log('');
+  console.log('Optional feature — "/noesis-capture" session-capture auto-cleanup:');
+  console.log('  The /noesis-capture skill mirrors live Claude Code sessions into Noesis notes.');
+  console.log('  This optional SessionEnd hook auto-stops a capture\'s background watchers when');
+  console.log('  the controller session ends (otherwise you run "/noesis-capture stop" yourself).');
+  console.log('  It adds a fast, fail-safe hook to ~/.claude/settings.json that runs on session exit.');
+  const suffix = alreadyInstalled ? ' [Y/n] ' : ' [y/N] ';
+  return promptYesNo(`Install this optional hook?${suffix}`, alreadyInstalled);
 }
 
 function printMcpRegistrationHint(): void {
@@ -279,6 +436,18 @@ export async function runSetup(argv: string[]): Promise<void> {
     const skillResults = installSkills(options.dryRun);
     for (const r of skillResults) {
       console.log(`  Skill /${r.name}: ${r.action}`);
+    }
+
+    // Optional opt-in SessionEnd hook for /noesis-capture. State is persisted as
+    // the hook's presence in settings.json, so re-runs default the prompt to the
+    // current state and never lose the user's choice.
+    const captureAlready = captureHookInstalled();
+    const captureChoice = await resolveCaptureChoice(options, captureAlready);
+    if (captureChoice === undefined) {
+      console.log(`  Capture SessionEnd hook: ${captureAlready ? 'kept (installed)' : 'not installed'}`);
+    } else {
+      const action = registerCaptureHook(captureChoice, options.dryRun);
+      console.log(`  Capture SessionEnd hook: ${action}`);
     }
   } else {
     console.log('  Skills: skipped (--claude-md-only)');

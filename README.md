@@ -70,7 +70,14 @@ You're done. Try `"List my recent Noesis notes"` in Claude Code to verify.
 ## Optional: CLAUDE.md conventions & skills
 
 `noesis-mcp setup` installs Noesis's CLAUDE.md conventions (how Claude reads, writes, and
-syncs your notes) plus the `/noesis-sync` and `/noesis-refine-note` skills into `~/.claude/`.
+syncs your notes) plus a set of Noesis slash-command skills into `~/.claude/commands/`:
+
+- `/noesis-sync` — pull web-UI edits, push local changes, resolve conflicts inline.
+- `/noesis-refine-note` — polish a note's metadata and structure (single note or a scoped batch).
+- `/noesis-create-study-note` — research a URL or topic and author a structured study note.
+- `/noesis-skim-read` — generate Skim-Read key parts yourself (no in-app AI) and persist them.
+- `/noesis-capture` — mirror a live Claude Code session into a Noesis note that updates in the cloud in real time.
+
 It's idempotent — re-run any time to upgrade in place; your own content outside the markers is
 preserved.
 
@@ -97,6 +104,21 @@ noesis-mcp setup --no-restructure-rule     # remove / skip it (no prompt)
 
 In non-interactive shells (CI, piped input) the prompt is skipped and your current choice is
 left untouched unless one of the flags above is passed.
+
+### Opt-in feature: `/noesis-capture` session-capture auto-cleanup
+
+The `/noesis-capture` skill mirrors a live Claude Code session into a Noesis note via a
+zero-token background watcher. `setup` also offers an **optional, off-by-default** `SessionEnd`
+hook that auto-stops a capture's watchers when the controller session ends (otherwise you run
+`/noesis-capture stop` yourself). Because it adds a hook to `~/.claude/settings.json` that runs
+on every session exit (a fast, fail-safe no-op unless you're capturing), it stays opt-in:
+
+```bash
+noesis-mcp setup --with-capture   # install the SessionEnd auto-cleanup hook (no prompt)
+noesis-mcp setup --no-capture     # remove / skip it (no prompt)
+```
+
+The `/noesis-capture` skill itself is always installed; only the hook is gated.
 
 ## Configuration
 
@@ -208,10 +230,12 @@ src/
 └── utils/suggestPath.ts        # Path-completion helpers
 
 scripts/
-└── noesis-sync.mjs             # Standalone sync script (zero deps, Node 18+)
+├── noesis-sync.mjs                  # Standalone sync script (zero deps, Node 18+)
+├── noesis-capture-watcher.mjs       # Live session-capture watcher (tails a transcript, renders + pushes)
+└── noesis-capture-session-end.mjs   # Optional SessionEnd hook that auto-stops captures
 
-skill-templates/                # Claude Code skill templates
-templates/                      # Markdown templates injected into notes
+skill-templates/                # Claude Code skill templates (noesis-sync, -refine-note, -create-study-note, -skim-read, -capture)
+templates/                      # CLAUDE.md convention blocks
 ```
 
 The server is a thin client — almost all logic lives behind the Noesis cloud API. This makes the server safe to run in untrusted environments (no DB access, no file writes outside the user's notes folder).
