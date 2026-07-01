@@ -13,7 +13,7 @@ The watcher path is `{{NOESIS_CAPTURE_WATCHER_PATH}}` — invoke it with `node "
 
 > There is **no** model-driven sync loop and **no** wake-up/reschedule here. That earlier design was unreliable — a single missed/no-op model turn, an `Esc`, or a non-resumed restart killed cloud sync permanently while the local file kept updating. The watcher now owns the cloud push, so cloud freshness is as reliable as the local render. **Never** reintroduce a model-driven periodic sync.
 
-The watcher writes each capture note to `<captureDir>/<session-id>.md`, where `<captureDir>` is a `captures/` folder under one of your registered Noesis roots (resolved in Step 0b), plus a per-session status sidecar `<captureDir>/.<session-id>.cloud.json` (last push time / action / error — read by the `status` sub-command for cloud freshness). All controller state lives in a single shared file **`~/.claude/noesis-capture-state.json`** (v3 schema below), keyed by session id so multiple captures coexist. If the optional `SessionEnd` hook is installed (via `noesis-mcp setup --with-capture`), it marks every capture stopped and kills lingering watchers when this controller session ends; otherwise stop them yourself with `/noesis-capture stop`.
+The watcher writes each capture note to `<outPath>` — an absolute path the watcher itself chooses: a `captures/` folder under a registered Noesis root (it prefers the standard `~/Noesis` root, already home-expanded), so the cloud push always finds a matching root. You get the exact `outPath` from the watcher's `--resolve-only` output (Step 1) — **do not compute it yourself from `list_roots`** (stored root paths can be in `~`/`%USERPROFILE%` form and must not be passed to the watcher literally). Alongside the note the watcher writes a per-session status sidecar `<dir>/.<session-id>.cloud.json` (last push time / action / error — read by the `status` sub-command for cloud freshness). All controller state lives in a single shared file **`~/.claude/noesis-capture-state.json`** (v3 schema below), keyed by session id so multiple captures coexist. If the optional `SessionEnd` hook is installed (via `noesis-mcp setup --with-capture`), it marks every capture stopped and kills lingering watchers when this controller session ends; otherwise stop them yourself with `/noesis-capture stop`.
 
 **Cloud auth (handled by the watcher).** The watcher reads `NOESIS_API_TOKEN` / `NOESIS_API_URL` from its environment, else from `~/.claude.json → mcpServers.noesis.env`. The token is never logged or placed on a command line. If no token is found, the watcher runs **local-only** (renders but does not push); in that case the cloud copy is maintained only by the skill's `mcp__noesis__sync_notes` calls at Start / Stop / `sync`.
 
@@ -39,7 +39,7 @@ Forms:
   "sessions": {
     "<session-id>": {
       "title": "<display-title> — Capture",
-      "outPath": "<captureDir>/<id>.md",
+      "outPath": "<absolute path returned by --resolve-only>",
       "transcriptPath": "<path-to-source-.jsonl>",
       "bgTaskId": "<background-task-id>",
       "watching": true,
@@ -66,7 +66,7 @@ Only **Start**, **Sync**, and **Stop** write the file back (Write tool, whole ob
 
 ## Instructions
 
-### Step 0a — Discover THIS session id (for the self-monitor guard)
+### Step 0 — Discover THIS session id (for the self-monitor guard)
 
 Ask the watcher for the current session's id so it can refuse to capture itself:
 
@@ -76,9 +76,7 @@ node "{{NOESIS_CAPTURE_WATCHER_PATH}}" --print-self
 
 It prints `SELF=<id>` (possibly empty if it can't resolve — then omit `--self`). Keep `SELF` for the `--self` flag.
 
-### Step 0b — Resolve the capture directory (under a registered Noesis root)
-
-Call `mcp__noesis__list_roots`. Pick the target root: the one the user named if they specified one, else the first registered root. Let `<captureDir>` = that root's local path (for this OS) + `/captures`. All capture notes for this run go under `<captureDir>` so the watcher's cloud push always finds a matching root. If `list_roots` returns no roots, tell the user to register a root first (in the Noesis app or via `mcp__noesis__add_root`) and stop.
+The watcher picks the output location itself (a `captures/` folder under a registered Noesis root, home-expanded), so you do **not** resolve roots or build paths here — you get the exact `outPath` back from `--resolve-only` in the Start step.
 
 ### Step 1 — Route on the sub-command
 
@@ -97,7 +95,7 @@ Call `mcp__noesis__list_roots`. Pick the target root: the one the user named if 
 
    - Non-zero exit / `ERROR: could not resolve` -> tell the user no session matched and stop. Suggest the session id (UUID) or a more specific name fragment.
    - Exit code 3 (`REFUSED: self-monitor guard`) -> they pointed capture at the current session; refuse and stop.
-   - Success -> parse the JSON (`sessionId`, `transcriptPath`, `title`, `candidates`). If `candidates` has more than one entry, briefly say which match was chosen (most recently modified) and list the alternatives. Compute `outPath = <captureDir>/<sessionId>.md`.
+   - Success -> parse the JSON (`sessionId`, `transcriptPath`, `title`, `outPath`, `candidates`). Use the returned **`outPath` as-is** (an absolute path under a registered Noesis root) for state, sync, and sidecar — do not recompute it. If `candidates` has more than one entry, briefly say which match was chosen (most recently modified) and list the alternatives.
 
 2. **Read + migrate state.** Compute `activeCount` = number of sessions with `watching === true` **before** this start (informational only — there is no shared loop to start).
 
@@ -150,7 +148,7 @@ Write state once at the end. Confirm to the user with the final note path(s).
 
 ## Constraints
 
-- **Never** sync this skill file or the watcher to Noesis — only the generated `<captureDir>/*.md` capture notes.
+- **Never** sync this skill file or the watcher to Noesis — only the generated capture `.md` notes (the `outPath` files).
 - The watcher owns the **periodic** cloud push; the controller **never** runs a sync loop or reschedule. The only cloud pushes the controller issues are the one-shot `mcp__noesis__sync_notes` at Start (confirmation), `sync`, and Stop (final).
 - Push to Noesis **only** via the watcher or `mcp__noesis__sync_notes` (never `cp` into a folder).
 - Never edit a watcher's output `.md` by hand — it is fully regenerated on every change.

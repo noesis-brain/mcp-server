@@ -24,7 +24,7 @@ If no codebases AND no notes are found, `AskUserQuestion` for paths, then re-par
 ## Step 2 — Resolve notes to Noesis IDs (parallel)
 
 - **`path`** → `mcp__noesis__get_note(path)`.
-- **`filename`** → resolve under a registered Noesis root (get roots via `mcp__noesis__list_roots`, then `Glob` `<root>/**/<filename>`), then `get_note(path)`. Or find it via `mcp__noesis__list_notes`.
+- **`filename`** → find it via `mcp__noesis__list_notes` matching the filename (or `mcp__noesis__search_notes` on the name), then `get_note` by its id/path — resolve by the Noesis DB, not the filesystem.
 - **`query`** → `mcp__noesis__search_notes(query, limit:3)`; use the top hit, falling back to `search_semantic`.
 
 For each resolved note store `note_id`, `note_path`, `note_title`, `note_description`, `note_keywords`, `note_aliases`, `note_relations` (typed links w/ target_id), `note_related_codebases` (resolved objects — read `entry.path`). Skip (don't abort on) individual resolution failures. If ALL notes fail and no codebases were given, stop with an error.

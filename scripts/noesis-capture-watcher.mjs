@@ -577,6 +577,30 @@ async function noesisFetch(cfg, method, p, body) {
   return res.json();
 }
 
+// Choose the default capture output directory: a `captures/` folder under a
+// registered Noesis root, so the cloud push always finds a matching root.
+// Prefers the standard ~/Noesis root; else the first root configured for this OS.
+// Falls back to DEFAULT_OUT_DIR when the cloud/roots are unavailable. All paths are
+// home-expanded HERE so the caller (and the /noesis-capture skill via --resolve-only)
+// never has to expand a literal `~` / `%USERPROFILE%` from the stored root path.
+async function resolveDefaultOutDir(cfg) {
+  if (!cfg) return DEFAULT_OUT_DIR;
+  try {
+    const data = await noesisFetch(cfg, 'GET', '/api/mcp/roots');
+    const roots = Array.isArray(data?.roots) ? data.roots : [];
+    const expanded = roots
+      .map((r) => (r.local_paths && r.local_paths[cfg.clientOs]) || r.path || '')
+      .filter(Boolean)
+      .map((lp) => path.resolve(expandHome(lp)));
+    const standard = path.resolve(path.join(HOME, 'Noesis'));
+    if (expanded.some((p) => p.toLowerCase() === standard.toLowerCase())) {
+      return path.join(standard, 'captures');
+    }
+    if (expanded.length) return path.join(expanded[0], 'captures');
+  } catch { /* fall through to the default */ }
+  return DEFAULT_OUT_DIR;
+}
+
 // Map an absolute outPath to {rootId, rootName, relativePath} via GET /api/mcp/roots
 // (longest-prefix match, case-insensitive on Windows). Returns null if no root matches.
 async function resolveRoot(cfg, outPath) {
@@ -658,7 +682,10 @@ async function main() {
     process.exit(3);
   }
 
-  const outPath = args.out || path.join(DEFAULT_OUT_DIR, `${resolved.sessionId}.md`);
+  // Cloud config drives both root resolution (below) and the sync loop. Resolve it
+  // once, up front, so --resolve-only reports the same root-derived outPath the run uses.
+  const cloudCfg = args.noCloud ? null : loadCloudConfig();
+  const outPath = args.out || path.join(await resolveDefaultOutDir(cloudCfg), `${resolved.sessionId}.md`);
 
   if (args.resolveOnly) {
     const meta = extractMeta(readEntries(resolved.transcriptPath), resolved.sessionId);
@@ -675,7 +702,6 @@ async function main() {
   }
 
   // -------- cloud-sync state (deterministic; no Claude session involved) --------
-  const cloudCfg = args.noCloud ? null : loadCloudConfig();
   const pushMinIntervalMs = args.pushMinIntervalMs && args.pushMinIntervalMs > 0 ? args.pushMinIntervalMs : 5000;
   let cloudRoot = null;
   let lastRootAttempt = 0;

@@ -272,6 +272,11 @@ function captureHookCommand(): string {
   return `node "${script}"`;
 }
 
+/** A non-null, non-array object. */
+function isPlainObject(v: any): boolean {
+  return typeof v === 'object' && v !== null && !Array.isArray(v);
+}
+
 /** Parse settings.json, or null if absent. Throws on malformed JSON (never clobber it). */
 function readSettings(): any | null {
   if (!fs.existsSync(SETTINGS_PATH)) return null;
@@ -332,10 +337,23 @@ function registerCaptureHook(install: boolean, dryRun: boolean): BlockAction {
     return 'removed';
   }
 
-  // Install path.
+  // Install path. Refuse to touch a settings.json with an unexpected shape rather
+  // than silently discarding data or reporting a write that JSON.stringify drops
+  // (e.g. a named prop set on an array).
   if (!settings) settings = {};
-  if (!settings.hooks || typeof settings.hooks !== 'object') settings.hooks = {};
-  if (!Array.isArray(settings.hooks.SessionEnd)) settings.hooks.SessionEnd = [];
+  if (!isPlainObject(settings)) {
+    throw new Error(`Unexpected JSON root in ${SETTINGS_PATH} (expected an object). Fix it manually and re-run.`);
+  }
+  if (settings.hooks == null) {
+    settings.hooks = {};
+  } else if (!isPlainObject(settings.hooks)) {
+    throw new Error(`"hooks" in ${SETTINGS_PATH} is not an object. Fix it manually and re-run.`);
+  }
+  if (settings.hooks.SessionEnd == null) {
+    settings.hooks.SessionEnd = [];
+  } else if (!Array.isArray(settings.hooks.SessionEnd)) {
+    throw new Error(`"hooks.SessionEnd" in ${SETTINGS_PATH} is not an array. Fix it manually and re-run.`);
+  }
   const arr = settings.hooks.SessionEnd as any[];
 
   let found = false;

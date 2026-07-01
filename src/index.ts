@@ -89,7 +89,12 @@ async function main(): Promise<void> {
   const subcommand = process.argv[2];
   if (subcommand === 'setup' || subcommand === 'upgrade') {
     const { runSetup } = await import('./cli/setup.js');
-    await runSetup(process.argv.slice(3));
+    try {
+      await runSetup(process.argv.slice(3));
+    } catch (err) {
+      console.error(`\nnoesis-mcp setup failed: ${err instanceof Error ? err.message : String(err)}`);
+      process.exit(1);
+    }
     return;
   }
 

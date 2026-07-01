@@ -20,7 +20,7 @@ Parse an optional leading integer **N** (1–50, how many results to display; de
 
 - **Numeric only** → a note **ID** → Note mode.
 - **Path ending in `.md`** (has `/` or `\`) → a note **path** → Note mode.
-- **`.md` filename** (no path separator) → Note mode (resolve the file via `mcp__noesis__list_notes` or a root-relative `Glob` under a registered Noesis root — get roots from `mcp__noesis__list_roots`).
+- **`.md` filename** (no path separator) → Note mode (find it via `mcp__noesis__list_notes` matching the filename, or `mcp__noesis__search_notes` on the name — resolve by the Noesis DB, not the filesystem).
 - **Path without `.md`** (a directory, or `.`) → a **codebase directory** → Codebase mode.
 - **Anything else** → a **search query** → Note mode (resolve to a note first).
 - **Empty** → Codebase mode with the current working directory.
