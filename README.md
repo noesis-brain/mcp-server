@@ -123,6 +123,15 @@ noesis-mcp setup --no-capture     # remove / skip it (no prompt)
 
 The `/noesis-capture` skill itself is always installed; only the hook is gated.
 
+### Using Noesis from other AI CLIs
+
+The **MCP server is the portable layer** — it speaks the Model Context Protocol, so any
+MCP-capable client (Claude Code, Claude Desktop, Cursor, and other MCP hosts) can use all of
+Noesis's tools once registered. The slash-command **skills above are Claude-Code-specific**
+(they install into `~/.claude/commands/`). Porting them to other CLIs' command/rule formats
+(e.g. Cursor `.mdc`, `AGENTS.md`) is a planned future addition; for now, other CLIs get the
+full tool surface via MCP and can drive the same workflows by prompting directly.
+
 ## Configuration
 
 | Environment variable | Required | Description |
