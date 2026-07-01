@@ -298,6 +298,9 @@ function frontmatter(meta) {
     '---',
     `title: ${yq(meta.title)}`,
     `description: 'Live capture of a Claude Code session, auto-synced to Noesis.'`,
+    // `source: claude` drives the Noesis "Captured from Claude Code" badge
+    // (SourceProviderBadge resolves note.source === 'claude'; must be exactly 'claude').
+    `source: claude`,
     `keywords: [session-capture, claude-code, noesis]`,
     `date: ${meta.date}`,
     `updated: ${meta.updated}`,
