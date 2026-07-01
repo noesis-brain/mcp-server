@@ -76,6 +76,9 @@ syncs your notes) plus a set of Noesis slash-command skills into `~/.claude/comm
 - `/noesis-refine-note` — polish a note's metadata and structure (single note or a scoped batch).
 - `/noesis-create-study-note` — research a URL or topic and author a structured study note.
 - `/noesis-skim-read` — generate Skim-Read key parts yourself (no in-app AI) and persist them.
+- `/noesis-find-related` — discover related notes for a note (relations, similar, graph) or a codebase (tech/domain/concept search).
+- `/noesis-investigate` — enrich a prompt that spans codebases and notes into a consolidated context brief before you dig in.
+- `/noesis-manage-news` — manage your Daily News preferences (sources, topics, language, limits) in natural language.
 - `/noesis-capture` — mirror a live Claude Code session into a Noesis note that updates in the cloud in real time.
 
 It's idempotent — re-run any time to upgrade in place; your own content outside the markers is
@@ -234,7 +237,8 @@ scripts/
 ├── noesis-capture-watcher.mjs       # Live session-capture watcher (tails a transcript, renders + pushes)
 └── noesis-capture-session-end.mjs   # Optional SessionEnd hook that auto-stops captures
 
-skill-templates/                # Claude Code skill templates (noesis-sync, -refine-note, -create-study-note, -skim-read, -capture)
+skill-templates/                # Claude Code skill templates (noesis-sync, -refine-note, -create-study-note,
+                                #   -skim-read, -find-related, -investigate, -manage-news, -capture)
 templates/                      # CLAUDE.md convention blocks
 ```
 
