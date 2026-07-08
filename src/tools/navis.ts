@@ -58,6 +58,7 @@ function formatNaviDetail(n: Navi): string {
   if (n.tts_provider) lines.push(`TTS: ${n.tts_provider} (voice: ${n.tts_voice_id ?? 'default'}, rate: ${n.tts_rate ?? 'default'}, pitch: ${n.tts_pitch ?? 'default'})`);
   if (n.ai_provider) lines.push(`AI override: ${n.ai_provider}${n.ai_model ? ` / ${n.ai_model}` : ''}`);
   if (n.animation_presets?.length) lines.push(`Animations: ${n.animation_presets.join(', ')} (triggers: ${(n.animation_triggers ?? []).join(', ') || 'none'})`);
+  if (n.inspired_by_living_person) lines.push('Inspired by a living person: true (public sharing disabled)');
   lines.push('');
   lines.push('## System Prompt');
   lines.push(n.system_prompt);
@@ -173,6 +174,7 @@ export function registerNaviTools(server: McpServer, client: NoesisClient): void
       ...naviFieldsShape,
       name: z.string().describe('Display name for the Navi (required)'),
       system_prompt: z.string().describe('The system prompt that defines the Navi\'s persona and behavior (required)'),
+      inspired_by_living_person: z.boolean().optional().describe('Set true when this persona is modeled on a real, living person. Create-only and immutable afterward (update_navi cannot change it). Blocks the Navi from ever being public-shared.'),
     },
     async (args) => {
       const body: CreateNaviInput = {
@@ -194,6 +196,7 @@ export function registerNaviTools(server: McpServer, client: NoesisClient): void
         tts_autoplay: args.tts_autoplay,
         ai_provider: args.ai_provider,
         ai_model: args.ai_model,
+        inspired_by_living_person: args.inspired_by_living_person,
       };
       const navi = await client.createNavi(body);
       return {

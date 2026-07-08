@@ -199,6 +199,7 @@ export interface Navi {
   tts_autoplay?: boolean;
   ai_provider: 'claude' | 'gemini' | null;
   ai_model: string | null;
+  inspired_by_living_person?: boolean;
   created_at: string;
   updated_at: string;
 }
@@ -247,6 +248,8 @@ export interface CreateNaviInput {
   tts_autoplay?: boolean;
   ai_provider?: 'claude' | 'gemini' | null;
   ai_model?: string | null;
+  /** Create-only; the backend ignores this field on PUT (immutable post-insert). */
+  inspired_by_living_person?: boolean;
 }
 
 export type UpdateNaviInput = Partial<CreateNaviInput> & { is_active?: boolean };
