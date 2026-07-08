@@ -650,6 +650,20 @@ async function upsertNote(cfg, root, outPath, content, { force = false } = {}) {
   return noesisFetch(cfg, 'POST', '/api/mcp/notes/upsert', body);
 }
 
+// Lightweight liveness ping — deliberately separate from upsertNote(), which
+// carries the note's entire content. Powers the frontend's "actively under
+// watching" title indicator (Noesis web app), which treats capture as live
+// only while this heartbeat is recent (see capture_heartbeat_at staleness
+// check there) — a killed/crashed watcher never sends watching:false, so the
+// frontend times it out instead of waiting for an explicit stop signal.
+async function sendHeartbeat(cfg, root, watching) {
+  return noesisFetch(cfg, 'POST', '/api/mcp/notes/heartbeat', {
+    rootId: root.rootId,
+    relativePath: root.relativePath,
+    watching,
+  });
+}
+
 // Per-session status sidecar the statusline reads (.<id>.cloud.json). Owned solely
 // by this watcher; written atomically so it never races the skill's state file.
 function sidecarPath(outPath) {
@@ -706,6 +720,8 @@ async function main() {
 
   // -------- cloud-sync state (deterministic; no Claude session involved) --------
   const pushMinIntervalMs = args.pushMinIntervalMs && args.pushMinIntervalMs > 0 ? args.pushMinIntervalMs : 5000;
+  const heartbeatIntervalMs = 45000; // must stay well under the frontend's ~2min staleness cutoff
+  let lastHeartbeatAt = 0;
   let cloudRoot = null;
   let lastRootAttempt = 0;
   let currentMd = null;       // latest rendered markdown
@@ -783,6 +799,18 @@ async function main() {
     }
   };
 
+  // Periodic liveness ping, independent of content changes — an idle session
+  // (no new transcript entries) would otherwise never push anything via
+  // syncTick(), leaving the frontend's staleness check with no way to tell
+  // "quiet but alive" from "dead". Fire-and-forget; a dropped heartbeat just
+  // waits for the next tick rather than backing off like content pushes do.
+  const heartbeatTick = async (watching) => {
+    if (!cloudCfg || !cloudRoot) return;
+    lastHeartbeatAt = Date.now();
+    try { await sendHeartbeat(cloudCfg, cloudRoot, watching); }
+    catch (err) { log(`cloud: heartbeat failed — ${err.message}`); }
+  };
+
   // Best-effort final push on graceful shutdown (Ctrl+C / SIGTERM). A force-kill
   // by the SessionEnd hook skips this, but the cloud is already current from the
   // last change-driven push, so that is acceptable.
@@ -823,6 +851,9 @@ async function main() {
   else log('cloud: disabled — no NOESIS_API_TOKEN in env or ~/.claude.json (local render only)');
   publishSidecar();
   if (cloudCfg) syncTick(true).catch(() => {});   // initial cloud push (fire-and-forget)
+  // lastHeartbeatAt stays 0 — the main loop below sends the first heartbeat as soon
+  // as cloudRoot resolves (heartbeatTick no-ops until then), skipping the case where
+  // the note doesn't exist in the cloud yet.
 
   let last = { mtimeMs: statMtime(resolved.transcriptPath), size: -1 };
   try { const s = fs.statSync(resolved.transcriptPath); last = { mtimeMs: s.mtimeMs, size: s.size }; } catch {}
@@ -838,7 +869,7 @@ async function main() {
     if (maxLifeMs && Date.now() - lifeStartMs >= maxLifeMs) {
       clearInterval(timer);
       log(`lifetime cap reached (${Math.round(maxLifeMs / 60000)}m) — stopping watcher`);
-      (async () => { await finalPush(); process.exit(0); })();
+      (async () => { await heartbeatTick(false); await finalPush(); process.exit(0); })();
       return;
     }
     const s = fs.statSync(resolved.transcriptPath, { throwIfNoEntry: false });
@@ -854,12 +885,17 @@ async function main() {
     // Cloud push: drive a pending change OR retry a prior failure, regardless of
     // whether the transcript changed this tick.
     syncTick().catch(() => {});
+    // Liveness heartbeat: independent of content changes, so an idle-but-alive
+    // session still refreshes capture_heartbeat_at before it goes stale.
+    if (Date.now() - lastHeartbeatAt >= heartbeatIntervalMs) {
+      heartbeatTick(true).catch(() => {});
+    }
   }, args.intervalMs);
 
   const stop = () => {
     clearInterval(timer);
     log('stopped');
-    (async () => { await finalPush(); process.exit(0); })();
+    (async () => { await heartbeatTick(false); await finalPush(); process.exit(0); })();
   };
   process.on('SIGINT', stop);
   process.on('SIGTERM', stop);
