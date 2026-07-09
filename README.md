@@ -126,11 +126,31 @@ The `/noesis-capture` skill itself is always installed; only the hook is gated.
 ### Using Noesis from other AI CLIs
 
 The **MCP server is the portable layer** — it speaks the Model Context Protocol, so any
-MCP-capable client (Claude Code, Claude Desktop, Cursor, and other MCP hosts) can use all of
-Noesis's tools once registered. The slash-command **skills above are Claude-Code-specific**
-(they install into `~/.claude/commands/`). Porting them to other CLIs' command/rule formats
-(e.g. Cursor `.mdc`, `AGENTS.md`) is a planned future addition; for now, other CLIs get the
-full tool surface via MCP and can drive the same workflows by prompting directly.
+MCP-capable client (Claude Code, Claude Desktop, Cursor, GitHub Copilot, and other MCP hosts)
+can use all of Noesis's tools once registered. The slash-command **skills above are
+Claude-Code-specific** (they install into `~/.claude/commands/`). Porting them to other CLIs'
+command/rule formats (e.g. Cursor `.mdc`, Copilot prompt files) is a planned future addition;
+for now, other CLIs get the full tool surface via MCP and can drive the same workflows by
+prompting directly.
+
+#### GitHub Copilot
+
+`setup` supports installing the **conventions blocks** (the same content as the CLAUDE.md
+block above — writing/syncing/discovering notes, path-as-identifier, the opt-in
+restructure-on-sync rule) into a per-repo `.github/copilot-instructions.md` instead of the
+global `~/.claude/CLAUDE.md`. Skills and the capture SessionEnd hook are not installed for
+Copilot — there's no Copilot equivalent yet.
+
+```bash
+noesis-mcp setup --client=copilot            # install/upgrade conventions into .github/copilot-instructions.md
+noesis-mcp setup --client=copilot --dry-run  # preview only
+```
+
+Unlike the personal, global Claude Code file, `.github/copilot-instructions.md` is typically
+**committed to the repo** so teammates share the same conventions in Copilot Chat.
+
+After running setup, register the MCP server with Copilot via VS Code's Command Palette →
+**"MCP: Open User Configuration"** (the setup command prints the exact JSON to paste).
 
 ## Configuration
 

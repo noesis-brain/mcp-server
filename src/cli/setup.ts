@@ -25,6 +25,10 @@ const CLAUDE_MD_PATH = path.join(CLAUDE_DIR, 'CLAUDE.md');
 const COMMANDS_DIR = path.join(CLAUDE_DIR, 'commands');
 const SETTINGS_PATH = path.join(CLAUDE_DIR, 'settings.json');
 
+// Copilot targets a per-repo instructions file, not a global profile — VS Code
+// Copilot has no established global-instructions equivalent to ~/.claude/CLAUDE.md.
+const COPILOT_INSTRUCTIONS_PATH = path.join(process.cwd(), '.github', 'copilot-instructions.md');
+
 /**
  * A versioned block injected into ~/.claude/CLAUDE.md, delimited by HTML-comment
  * markers so re-runs can upgrade or remove it in place without touching the user's
@@ -59,7 +63,10 @@ const RESTRUCTURE_BLOCK: BlockSpec = {
   startRe: /<!-- noesis-mcp-server:restructure-on-sync:start [^>]*-->/,
 };
 
+type Client = 'claude' | 'copilot';
+
 interface SetupOptions {
+  client: Client;
   claudeMdOnly: boolean;
   skillsOnly: boolean;
   dryRun: boolean;
@@ -70,7 +77,14 @@ interface SetupOptions {
 }
 
 function parseArgs(argv: string[]): SetupOptions {
+  const clientArg = argv.find((a) => a.startsWith('--client='));
+  const client = clientArg ? clientArg.slice('--client='.length) : 'claude';
+  if (client !== 'claude' && client !== 'copilot') {
+    throw new Error(`Unknown --client "${client}" (expected "claude" or "copilot").`);
+  }
+
   return {
+    client,
     claudeMdOnly: argv.includes('--claude-md-only'),
     skillsOnly: argv.includes('--skills-only'),
     dryRun: argv.includes('--dry-run'),
@@ -83,13 +97,13 @@ function parseArgs(argv: string[]): SetupOptions {
 
 type BlockAction = 'created' | 'inserted' | 'upgraded' | 'unchanged' | 'removed' | 'absent';
 
-function readClaudeMd(): string | null {
-  return fs.existsSync(CLAUDE_MD_PATH) ? fs.readFileSync(CLAUDE_MD_PATH, 'utf-8') : null;
+function readTargetFile(targetPath: string): string | null {
+  return fs.existsSync(targetPath) ? fs.readFileSync(targetPath, 'utf-8') : null;
 }
 
-/** Whether the given block is currently present in CLAUDE.md. */
-function blockExists(spec: BlockSpec): boolean {
-  const current = readClaudeMd();
+/** Whether the given block is currently present in the target file. */
+function blockExists(spec: BlockSpec, targetPath: string): boolean {
+  const current = readTargetFile(targetPath);
   return current !== null && spec.startRe.test(current);
 }
 
@@ -111,11 +125,11 @@ function locateBlock(current: string, spec: BlockSpec): { start: number; end: nu
 }
 
 /**
- * Install (install=true) or remove (install=false) a block in CLAUDE.md, idempotently.
+ * Install (install=true) or remove (install=false) a block in the target file, idempotently.
  * User content outside the markers is preserved.
  */
-function applyBlock(spec: BlockSpec, install: boolean, dryRun: boolean): BlockAction {
-  const current = readClaudeMd();
+function applyBlock(spec: BlockSpec, install: boolean, dryRun: boolean, targetPath: string): BlockAction {
+  const current = readTargetFile(targetPath);
 
   // Removal path — strip the marker pair and its content, collapsing the surrounding blank lines.
   if (!install) {
@@ -126,7 +140,7 @@ function applyBlock(spec: BlockSpec, install: boolean, dryRun: boolean): BlockAc
     const after = current.slice(loc.end).replace(/^\n+/, '');
     let next = before + after;
     if (next.length > 0 && !next.endsWith('\n')) next += '\n';
-    if (!dryRun) fs.writeFileSync(CLAUDE_MD_PATH, next, 'utf-8');
+    if (!dryRun) fs.writeFileSync(targetPath, next, 'utf-8');
     return 'removed';
   }
 
@@ -135,8 +149,9 @@ function applyBlock(spec: BlockSpec, install: boolean, dryRun: boolean): BlockAc
 
   if (current === null) {
     if (!dryRun) {
-      if (!fs.existsSync(CLAUDE_DIR)) fs.mkdirSync(CLAUDE_DIR, { recursive: true });
-      fs.writeFileSync(CLAUDE_MD_PATH, wrappedBlock + '\n', 'utf-8');
+      const targetDir = path.dirname(targetPath);
+      if (!fs.existsSync(targetDir)) fs.mkdirSync(targetDir, { recursive: true });
+      fs.writeFileSync(targetPath, wrappedBlock + '\n', 'utf-8');
     }
     return 'created';
   }
@@ -146,7 +161,7 @@ function applyBlock(spec: BlockSpec, install: boolean, dryRun: boolean): BlockAc
     // No existing block — append.
     const sep = current.endsWith('\n') ? '\n' : '\n\n';
     const next = current + sep + wrappedBlock + '\n';
-    if (!dryRun) fs.writeFileSync(CLAUDE_MD_PATH, next, 'utf-8');
+    if (!dryRun) fs.writeFileSync(targetPath, next, 'utf-8');
     return 'inserted';
   }
 
@@ -155,7 +170,7 @@ function applyBlock(spec: BlockSpec, install: boolean, dryRun: boolean): BlockAc
     return 'unchanged';
   }
   const next = current.substring(0, loc.start) + wrappedBlock + current.substring(loc.end);
-  if (!dryRun) fs.writeFileSync(CLAUDE_MD_PATH, next, 'utf-8');
+  if (!dryRun) fs.writeFileSync(targetPath, next, 'utf-8');
   return 'upgraded';
 }
 
@@ -423,27 +438,60 @@ function printMcpRegistrationHint(): void {
   console.log('');
 }
 
-export async function runSetup(argv: string[]): Promise<void> {
-  const options = parseArgs(argv);
-  const note = options.dryRun ? ' (dry-run)' : '';
+/**
+ * Registration hint for VS Code Copilot. Unlike `claude mcp add`, Copilot has no
+ * CLI for this — it's a JSON file edited via the Command Palette. The root key is
+ * "servers" (not "mcpServers" like Claude/Cursor), and secrets go through an
+ * "inputs" promptString reference rather than a literal value in the file.
+ */
+function printCopilotMcpRegistrationHint(): void {
+  const entry = path.join(PACKAGE_ROOT, 'dist', 'index.js').replace(/\\/g, '/');
+  console.log('');
+  console.log('───────────────────────────────────────────────────────────────');
+  console.log('Final step: register the Noesis MCP server with Copilot.');
+  console.log('───────────────────────────────────────────────────────────────');
+  console.log('');
+  console.log('In VS Code, open the Command Palette → "MCP: Open User Configuration"');
+  console.log('(or "MCP: Add Server" for a guided flow), and add:');
+  console.log('');
+  console.log('  {');
+  console.log('    "inputs": [');
+  console.log('      { "type": "promptString", "id": "noesis-token", "description": "Noesis API Token", "password": true }');
+  console.log('    ],');
+  console.log('    "servers": {');
+  console.log('      "noesis": {');
+  console.log('        "type": "stdio",');
+  console.log('        "command": "node",');
+  console.log(`        "args": ["${entry}"],`);
+  console.log('        "env": {');
+  console.log('          "NOESIS_API_TOKEN": "${input:noesis-token}",');
+  console.log('          "NOESIS_API_URL": "https://noesisbrain.com"');
+  console.log('        }');
+  console.log('      }');
+  console.log('    }');
+  console.log('  }');
+  console.log('');
+  console.log('VS Code will prompt for the token on first use and store it securely.');
+  console.log('');
+}
 
-  console.log(`noesis-mcp setup${note}`);
+async function runClaudeSetup(options: SetupOptions): Promise<void> {
   console.log(`  CLAUDE.md target:   ${CLAUDE_MD_PATH}`);
   console.log(`  Commands target:    ${COMMANDS_DIR}`);
   console.log('');
 
   if (!options.skillsOnly) {
-    const coreAction = applyBlock(CORE_BLOCK, true, options.dryRun);
+    const coreAction = applyBlock(CORE_BLOCK, true, options.dryRun, CLAUDE_MD_PATH);
     console.log(`  CLAUDE.md: ${coreAction}`);
 
     // Optional opt-in rule. State is persisted as the block's presence in CLAUDE.md,
     // so re-runs default the prompt to the current state and never lose the user's choice.
-    const alreadyInstalled = blockExists(RESTRUCTURE_BLOCK);
+    const alreadyInstalled = blockExists(RESTRUCTURE_BLOCK, CLAUDE_MD_PATH);
     const choice = await resolveRestructureChoice(options, alreadyInstalled);
     if (choice === undefined) {
       console.log(`  Restructure-on-sync rule: ${alreadyInstalled ? 'kept (installed)' : 'not installed'}`);
     } else {
-      const action = applyBlock(RESTRUCTURE_BLOCK, choice, options.dryRun);
+      const action = applyBlock(RESTRUCTURE_BLOCK, choice, options.dryRun, CLAUDE_MD_PATH);
       console.log(`  Restructure-on-sync rule: ${action}`);
     }
   } else {
@@ -476,5 +524,60 @@ export async function runSetup(argv: string[]): Promise<void> {
   } else {
     console.log('');
     console.log('Dry-run complete. Re-run without --dry-run to apply.');
+  }
+}
+
+/**
+ * Copilot support is instructions-only: it installs the same portable conventions
+ * blocks into a per-repo .github/copilot-instructions.md instead of the global
+ * ~/.claude/CLAUDE.md. Skills (slash-commands) and the capture SessionEnd hook are
+ * Claude-Code-specific mechanisms with no Copilot analog, so they're not offered here.
+ */
+async function runCopilotSetup(options: SetupOptions): Promise<void> {
+  if (options.skillsOnly || options.claudeMdOnly) {
+    throw new Error(
+      '--skills-only and --claude-md-only are not applicable with --client=copilot: ' +
+        'Copilot setup only installs the conventions blocks (no skills/commands exist for Copilot yet).',
+    );
+  }
+
+  console.log(`  Instructions target: ${COPILOT_INSTRUCTIONS_PATH}`);
+  console.log('');
+
+  const coreAction = applyBlock(CORE_BLOCK, true, options.dryRun, COPILOT_INSTRUCTIONS_PATH);
+  console.log(`  copilot-instructions.md: ${coreAction}`);
+
+  const alreadyInstalled = blockExists(RESTRUCTURE_BLOCK, COPILOT_INSTRUCTIONS_PATH);
+  const choice = await resolveRestructureChoice(options, alreadyInstalled);
+  if (choice === undefined) {
+    console.log(`  Restructure-on-sync rule: ${alreadyInstalled ? 'kept (installed)' : 'not installed'}`);
+  } else {
+    const action = applyBlock(RESTRUCTURE_BLOCK, choice, options.dryRun, COPILOT_INSTRUCTIONS_PATH);
+    console.log(`  Restructure-on-sync rule: ${action}`);
+  }
+
+  console.log('');
+  console.log('Note: .github/copilot-instructions.md is typically committed to the repo so');
+  console.log('teammates share these conventions in Copilot Chat — unlike the personal, global');
+  console.log('~/.claude/CLAUDE.md used for Claude Code.');
+
+  if (!options.dryRun) {
+    printCopilotMcpRegistrationHint();
+  } else {
+    console.log('');
+    console.log('Dry-run complete. Re-run without --dry-run to apply.');
+  }
+}
+
+export async function runSetup(argv: string[]): Promise<void> {
+  const options = parseArgs(argv);
+  const note = options.dryRun ? ' (dry-run)' : '';
+
+  console.log(`noesis-mcp setup${note} [--client=${options.client}]`);
+
+  if (options.client === 'copilot') {
+    await runCopilotSetup(options);
+  } else {
+    await runClaudeSetup(options);
   }
 }
