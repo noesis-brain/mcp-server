@@ -187,12 +187,11 @@ export function resolvePathReference(ctx: ResolverContext, inputPath: string): R
 }
 
 /**
- * The local absolute path (this machine, CLIENT_OS) for a note of `rootId` at
- * `relativePath` — or null when that root has no usable path on this OS
- * (never a cwd-relative guess). Tilde-form root paths expand against THIS
- * machine's home dir.
+ * The local base directory (this machine, CLIENT_OS) of a root — tilde-form
+ * expanded against THIS machine's home dir — or null when the root has no
+ * usable path on this OS (never a cwd-relative guess).
  */
-export function localAbsFor(ctx: ResolverContext, rootId: number, relativePath: string): string | null {
+export function rootLocalBase(ctx: ResolverContext, rootId: number): string | null {
   const root = ctx.roots.find((r) => r.id === rootId);
   const rawBase = root?.local_paths?.[ctx.clientOs]?.trim();
   if (!rawBase) return null;
@@ -203,7 +202,16 @@ export function localAbsFor(ctx: ResolverContext, rootId: number, relativePath: 
   if (expanded) base = expanded;
   if (base.startsWith('~') || /^%USERPROFILE%/i.test(base)) return null; // home unknown — refuse to guess
 
-  base = base.length > 1 ? base.replace(/\/+$/, '') : base;
+  return base.length > 1 ? base.replace(/\/+$/, '') : base;
+}
+
+/**
+ * The local absolute path (this machine, CLIENT_OS) for a note of `rootId` at
+ * `relativePath` — or null when that root has no usable path on this OS.
+ */
+export function localAbsFor(ctx: ResolverContext, rootId: number, relativePath: string): string | null {
+  const base = rootLocalBase(ctx, rootId);
+  if (!base) return null;
   const rel = relativePath.replace(/^\/+/, '');
   return `${base}/${rel}`;
 }

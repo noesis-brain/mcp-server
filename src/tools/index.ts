@@ -9,6 +9,7 @@ import * as os from 'os';
 import * as yaml from 'js-yaml';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { NoesisClient, type LocalFile, type EditedOnlineNote, type OsKey, CLIENT_OS, getActivePathFromMap, expandHome } from '../api/NoesisClient.js';
+import { parseNoteReference, resolvePathReference, rootLocalBase } from '../resolve/noteRef.js';
 import type { SyncResult, SyncStatus, BidirectionalSyncResult } from '../types/index.js';
 import { initEmbeddingService, generateEmbedding, generateEmbeddingsBatch } from '../services/embedding.js';
 import { SyncStateManager, determineSyncDirection } from './SyncStateManager.js';
@@ -332,18 +333,27 @@ export function registerTools(server: McpServer, services: ToolServices): void {
       if (id) {
         note = await client.getNote(id);
       } else {
-        // Resolve the path against registered roots locally first. This handles
-        // absolute clipboard paths (C:\Users\me\Noesis\...) against tilde-stored
-        // cloud roots (~/Noesis), which the server-side by-path route can't match
-        // because it never expands `~`. Fall back to by-path for any path that
-        // isn't inside a known root.
-        const roots = await client.getRoots();
-        const resolved = resolvePathToRoot(path!, roots);
-        note = resolved
-          ? await client.getNoteByRelativePath(resolved.rootId, resolved.relativePath)
-          : undefined;
-        if (!note) {
-          note = await client.getNoteByPath(path!);
+        // Unified resolution (M2): the `path` arg also accepts note URLs
+        // (https://…/notes/{id}), noesis://note/{id}, and bare numeric ids.
+        // Real paths resolve locally against ACTIVE + ARCHIVED roots (tilde/
+        // home expansion on both sides, longest prefix, legacy translation
+        // into the vault) — the server by-path route stays as the final
+        // fallback for anything the local context can't place.
+        const ref = parseNoteReference(path!);
+        if (ref.kind === 'id') {
+          note = await client.getNote(ref.id);
+        } else {
+          const ctx = await client.getResolverContext();
+          const resolved = resolvePathReference(ctx, ref.path);
+          if (resolved) {
+            for (const rel of resolved.candidates) {
+              note = await client.getNoteByRelativePath(resolved.rootId, rel);
+              if (note) break;
+            }
+          }
+          if (!note) {
+            note = await client.getNoteByPath(path!);
+          }
         }
       }
 
@@ -1287,7 +1297,7 @@ export function registerTools(server: McpServer, services: ToolServices): void {
 
       // Handle specific files sync mode (push-only for specific files)
       if (files && files.length > 0) {
-        return await syncSpecificFiles(files, roots, dryRun, client, force, regenerateMetadata);
+        return await syncSpecificFiles(files, dryRun, client, force, regenerateMetadata);
       }
 
       // Filter to specific root if requested
@@ -3193,7 +3203,6 @@ function scanMarkdownFiles(rootPath: string, rootId: number, rootName: string, d
  */
 async function syncSpecificFiles(
   filePaths: string[],
-  roots: Array<{ id: number; name: string; path: string; lastScannedAt: string | null }>,
   dryRun: boolean,
   client: NoesisClient,
   force: boolean = false,
@@ -3227,63 +3236,78 @@ async function syncSpecificFiles(
     edited_online_at: string | null;
   }>>();
 
-  for (const filePath of filePaths) {
-    // Normalize path — with auto-correction for doubled directory segments.
-    // expandHome handles `~/...`, `~\...`, and `%USERPROFILE%\...` (the Windows
-    // display form clients copy from the Noesis frontend) before path.resolve,
-    // which itself doesn't expand `~` or env vars.
-    let normalizedPath = normalizePath(path.resolve(expandHome(filePath)));
+  // Unified reference resolution (M2): entries may be note URLs, noesis://
+  // ids, bare ids, or paths of ANY OS's shape — including legacy
+  // pre-migration paths translated through archived roots. Materialization
+  // ALWAYS targets the resolver-derived local path for this machine (never
+  // the caller-typed string), which also retires the old empty-root-path →
+  // cwd footgun and the doubled-segment auto-correction heuristic.
+  const resolverCtx = await client.getResolverContext();
 
-    // Check if resolved path falls inside any known root
-    const inKnownRoot = roots.some(r => normalizedPath.startsWith(normalizePath(path.resolve(r.path))));
-    if (!inKnownRoot) {
-      // Look for consecutive duplicate segments (e.g., md-manager/md-manager)
-      const segments = normalizedPath.split('/');
-      let corrected = false;
-      for (let i = 1; i < segments.length; i++) {
-        if (segments[i] === segments[i - 1]) {
-          const deduped = [...segments.slice(0, i), ...segments.slice(i + 1)];
-          const candidate = deduped.join('/');
-          if (roots.some(r => candidate.startsWith(normalizePath(path.resolve(r.path))))) {
-            warnings.push(`Auto-corrected doubled path segment "${segments[i]}": ${filePath} -> ${candidate}`);
-            normalizedPath = candidate;
-            corrected = true;
-            break;
-          }
-        }
+  for (const filePath of filePaths) {
+    const ref = parseNoteReference(filePath);
+
+    let targetRootId: number | null = null;
+    let candidates: string[] = [];
+    if (ref.kind === 'id') {
+      const idNote = await client.getNote(ref.id).catch(() => undefined);
+      const rel = (idNote as any)?.relative_path;
+      const rootId = (idNote as any)?.root_id;
+      if (!idNote || rootId == null || !rel) {
+        result.errors.push(`Note not found for id reference: ${filePath}`);
+        result.details.push({ file: filePath, action: 'error', reason: 'Note id not found' });
+        continue;
+      }
+      targetRootId = rootId;
+      candidates = [normalizePath(rel)];
+    } else {
+      const resolved = resolvePathReference(resolverCtx, ref.path);
+      if (resolved) {
+        targetRootId = resolved.rootId;
+        candidates = resolved.candidates.map(c => normalizePath(c));
       }
     }
 
-    // Check if it's a markdown file (before existence check so cloud-only pulls also validate)
-    if (!normalizedPath.endsWith('.md')) {
+    if (targetRootId === null || candidates.length === 0) {
+      result.errors.push(`Path '${filePath}' is not inside any registered Noesis root (active or archived). Check list_roots, or reference the note by its URL or id instead.`);
+      result.details.push({ file: filePath, action: 'error', reason: 'Not in configured root' });
+      continue;
+    }
+
+    const ctxRoot = resolverCtx.roots.find(r => r.id === targetRootId);
+    const rootBase = rootLocalBase(resolverCtx, targetRootId);
+    if (!ctxRoot || !rootBase) {
+      result.errors.push(`Root ${targetRootId} has no usable path on this machine (${resolverCtx.clientOs}) — cannot materialize '${filePath}'.`);
+      result.details.push({ file: filePath, action: 'error', reason: 'No local path for root on this OS' });
+      continue;
+    }
+    const matchingRoot = { id: ctxRoot.id, name: ctxRoot.name, path: rootBase };
+
+    // Prime the cloud map for this root, then pick the candidate that exists
+    // in the cloud (collapsed form first); local-only pushes use the first.
+    if (!cloudNotesCache.has(matchingRoot.id)) {
+      const cloudNotes = await client.getNotesForSync(matchingRoot.id);
+      const cloudMap = new Map<string, typeof cloudNotes[0]>();
+      for (const note of cloudNotes) {
+        if (note.relative_path) {
+          cloudMap.set(normalizePath(note.relative_path), note);
+        }
+      }
+      cloudNotesCache.set(matchingRoot.id, cloudMap);
+    }
+    const cloudNotesMap = cloudNotesCache.get(matchingRoot.id)!;
+    const relativePath = candidates.find(c => cloudNotesMap.has(c)) ?? candidates[0];
+    const normalizedPath = `${matchingRoot.path}/${relativePath}`;
+
+    // Markdown-only (before existence check so cloud-only pulls also validate)
+    if (!relativePath.endsWith('.md')) {
       result.errors.push(`Not a markdown file: ${filePath}`);
       result.details.push({ file: filePath, action: 'error', reason: 'Not a markdown file' });
       continue;
     }
 
-    // Check if file exists locally — if not, try pulling from cloud
+    // Missing locally — pull from cloud to the VAULT-DERIVED path
     if (!fs.existsSync(normalizedPath)) {
-      const matchingRoot = roots.find(r => normalizedPath.startsWith(normalizePath(path.resolve(r.path))));
-      if (!matchingRoot) {
-        result.errors.push(`File not in any configured root: ${filePath}`);
-        result.details.push({ file: filePath, action: 'error', reason: 'Not in configured root' });
-        continue;
-      }
-
-      const relativePath = normalizePath(path.relative(matchingRoot.path, normalizedPath));
-
-      // Fetch cloud notes (cached)
-      if (!cloudNotesCache.has(matchingRoot.id)) {
-        const cloudNotes = await client.getNotesForSync(matchingRoot.id);
-        const cloudMap = new Map<string, typeof cloudNotes[0]>();
-        for (const note of cloudNotes) {
-          if (note.relative_path) {
-            cloudMap.set(normalizePath(note.relative_path), note);
-          }
-        }
-        cloudNotesCache.set(matchingRoot.id, cloudMap);
-      }
-      const cloudNotesMap = cloudNotesCache.get(matchingRoot.id)!;
       const cloudNote = cloudNotesMap.get(relativePath);
 
       if (cloudNote) {
@@ -3298,7 +3322,7 @@ async function syncSpecificFiles(
           }
           fs.writeFileSync(normalizedPath, cloudNote.content, 'utf-8');
           const stats = fs.statSync(normalizedPath);
-          await client.updateFileMetadata(normalizedPath, stats.size, cloudNote.hash);
+          await client.updateFileMetadata({ rootId: matchingRoot.id, relativePath }, stats.size, cloudNote.hash);
           // Set baseline
           if (!syncStateCache.has(matchingRoot.path)) {
             const mgr = new SyncStateManager(matchingRoot.path);
@@ -3311,18 +3335,9 @@ async function syncSpecificFiles(
           affectedRoots.add(matchingRoot.id);
         }
       } else {
-        result.errors.push(`Path '${filePath}' is inside root '${matchingRoot.name}' but no note at relative path '${relativePath}' exists in the cloud. This is a genuinely missing note — not a stale local cache. Try search_notes or list_notes to find similar paths in this root.`);
+        result.errors.push(`'${filePath}' resolved to root '${matchingRoot.name}' but no note exists at '${candidates.join("' or '")}' in the cloud, and there is no local file at ${normalizedPath}. This is a genuinely missing note — try search_notes or list_notes.`);
         result.details.push({ file: filePath, action: 'error', reason: 'Not found locally or in cloud' });
       }
-      continue;
-    }
-
-    // Find which root this file belongs to
-    const matchingRoot = roots.find(r => normalizedPath.startsWith(normalizePath(path.resolve(r.path))));
-
-    if (!matchingRoot) {
-      result.errors.push(`Path '${filePath}' is not inside any registered Noesis root. Call list_roots to see what's registered, or use add_root to register a parent directory before syncing this path.`);
-      result.details.push({ file: filePath, action: 'error', reason: 'Not in configured root' });
       continue;
     }
 

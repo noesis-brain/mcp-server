@@ -8,6 +8,7 @@
 import crypto from 'crypto';
 import os from 'os';
 import path from 'path';
+import type { ResolverContext } from '../resolve/noteRef.js';
 
 // ============================================================
 // Cross-platform OS detection (phase32)
@@ -389,6 +390,33 @@ export class NoesisClient {
     // Backfill `path` convenience field from local_paths[CLIENT_OS] for any
     // call site still reading r.path directly.
     return result.roots.map(r => ({ ...r, path: getActivePathFromMap(r.local_paths) }));
+  }
+
+  /**
+   * Everything the unified reference resolver needs, in one round-trip
+   * (single-vault V3/M2): active + ARCHIVED roots (the legacy-path
+   * translation table) plus the {vault_root_id, device_home_dirs} meta the
+   * server attaches to the roots response.
+   */
+  async getResolverContext(): Promise<ResolverContext> {
+    const result = await this.request<{
+      roots: Array<Root & { archived_at?: string | null; vault_subfolder?: string | null }>;
+      vault_root_id?: number | null;
+      device_home_dirs?: Record<string, string> | null;
+    }>('GET', '/api/mcp/roots?includeArchived=1');
+    return {
+      clientOs: CLIENT_OS,
+      homeDir: os.homedir(),
+      vaultRootId: result.vault_root_id ?? null,
+      deviceHomeDirs: result.device_home_dirs ?? null,
+      roots: (result.roots ?? []).map(r => ({
+        id: r.id,
+        name: r.name,
+        local_paths: r.local_paths || {},
+        archived_at: r.archived_at ?? null,
+        vault_subfolder: r.vault_subfolder ?? null,
+      })),
+    };
   }
 
   /**
