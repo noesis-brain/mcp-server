@@ -10,6 +10,7 @@ import * as yaml from 'js-yaml';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { NoesisClient, type LocalFile, type EditedOnlineNote, type OsKey, CLIENT_OS, getActivePathFromMap, expandHome } from '../api/NoesisClient.js';
 import { parseNoteReference, resolvePathReference, rootLocalBase } from '../resolve/noteRef.js';
+import { formatRootsList } from '../resolve/rootsFormat.js';
 import type { SyncResult, SyncStatus, BidirectionalSyncResult } from '../types/index.js';
 import { initEmbeddingService, generateEmbedding, generateEmbeddingsBatch } from '../services/embedding.js';
 import { SyncStateManager, determineSyncDirection } from './SyncStateManager.js';
@@ -818,44 +819,11 @@ export function registerTools(server: McpServer, services: ToolServices): void {
     'List all watched root directories in the knowledge base.',
     {},
     async () => {
-      const roots = await client.getRoots();
-
-      if (roots.length === 0) {
-        return {
-          content: [{
-            type: 'text',
-            text: 'No root directories configured.'
-          }]
-        };
-      }
-
-      // Phase32: each root now has a per-OS path map. Show all configured
-      // entries with an [active] marker on the CLIENT_OS row.
-      const lines: string[] = [];
-      let anyMissing = false;
-      roots.forEach((root, index) => {
-        lines.push(`${index + 1}. **${root.name}**`);
-        for (const key of ['win32', 'darwin', 'linux'] as const) {
-          const v = root.local_paths?.[key];
-          const label = key === 'win32' ? 'Windows' : key === 'darwin' ? 'macOS  ' : 'Linux  ';
-          const marker = key === CLIENT_OS ? '  [active]' : '';
-          if (v) {
-            lines.push(`   ${label}: ${v}${marker}`);
-          } else if (key === CLIENT_OS) {
-            lines.push(`   ${label}: (not configured for this OS)${marker}`);
-            anyMissing = true;
-          }
-        }
-        lines.push('');
-      });
-
-      let text = `Watched directories (${roots.length}):\n\n${lines.join('\n').trimEnd()}`;
-      if (anyMissing) {
-        text += `\n\nTip: roots missing a path for the current OS (${CLIENT_OS}) cannot be used for get_note/sync_notes on this machine. Add the missing path in Noesis Dashboard.`;
-      }
-
+      // Single-vault (M3): render the vault + any active roots with this
+      // machine's resolved base, plus the archived legacy-translation table.
+      const ctx = await client.getResolverContext();
       return {
-        content: [{ type: 'text', text }]
+        content: [{ type: 'text', text: formatRootsList(ctx) }]
       };
     }
   );
@@ -1328,10 +1296,21 @@ export function registerTools(server: McpServer, services: ToolServices): void {
       const allMovedToNoesis: string[] = [];
 
       for (const syncRoot of rootsToSync) {
-        // Check if root path exists
-        if (!fs.existsSync(syncRoot.path)) {
-          result.errors.push(`Root path not found: ${syncRoot.path}`);
+        // Fresh-machine bootstrap (M3): a root with a known local path that
+        // doesn't exist on disk yet (e.g. ~/Noesis on a machine that has never
+        // synced) is CREATED, not error-skipped — the sync below then pulls
+        // the cloud notes into it. Roots with NO path for this OS still skip.
+        if (!syncRoot.path || /%[^%/\\]+%/.test(syncRoot.path)) {
+          result.errors.push(
+            !syncRoot.path
+              ? `Root '${syncRoot.name}' has no local path configured for this OS (${CLIENT_OS}) — skipped.`
+              : `Root '${syncRoot.name}' has an unexpanded template token in its path (${syncRoot.path}) — fix it in the Noesis Dashboard; skipped.`
+          );
           continue;
+        }
+        if (!fs.existsSync(syncRoot.path)) {
+          fs.mkdirSync(syncRoot.path, { recursive: true });
+          result.details.push({ file: syncRoot.path, action: 'pulled_create', reason: `created local root directory for '${syncRoot.name}' (fresh machine bootstrap)` });
         }
 
         // Load sync state for three-way hash comparison
@@ -3316,9 +3295,13 @@ async function syncSpecificFiles(
           result.details.push({ file: relativePath, action: 'pulled_create' });
           result.pulled.created++;
         } else {
+          const rootDirExisted = fs.existsSync(matchingRoot.path);
           const localDir = path.dirname(normalizedPath);
           if (!fs.existsSync(localDir)) {
             fs.mkdirSync(localDir, { recursive: true });
+          }
+          if (!rootDirExisted) {
+            warnings.push(`Created local vault/root directory at ${matchingRoot.path} (fresh machine bootstrap).`);
           }
           fs.writeFileSync(normalizedPath, cloudNote.content, 'utf-8');
           const stats = fs.statSync(normalizedPath);

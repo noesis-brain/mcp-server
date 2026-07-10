@@ -200,7 +200,10 @@ export function rootLocalBase(ctx: ResolverContext, rootId: number): string | nu
   const home = normalizePath(ctx.homeDir ?? '').replace(/\/+$/, '');
   const expanded = home ? expandHomePrefix(base, home) : null;
   if (expanded) base = expanded;
-  if (base.startsWith('~') || /^%USERPROFILE%/i.test(base)) return null; // home unknown — refuse to guess
+  if (base.startsWith('~')) return null; // home unknown — refuse to guess
+  // Any unexpanded %TOKEN% (e.g. a stored literal %USERNAME% template) would
+  // otherwise mkdir a literal '%USERNAME%' directory on materialize.
+  if (/%[^%/\\]+%/.test(base)) return null;
 
   return base.length > 1 ? base.replace(/\/+$/, '') : base;
 }

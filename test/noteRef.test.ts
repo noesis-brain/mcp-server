@@ -161,5 +161,14 @@ describe('localAbsFor', () => {
     expect(localAbsFor(macCtx(), 21, 'foo.md')).toBeNull(); // My Git has win32 only
     expect(localAbsFor(macCtx(), 24, 'x.md')).toBeNull(); // empty darwin slot (footgun)
     expect(localAbsFor(macCtx({ homeDir: '' }), VAULT_ID, 'x.md')).toBeNull(); // tilde base, home unknown
+
+    // Unexpanded %USERNAME% template must never materialize a literal folder.
+    const winCtxWithTemplate: ResolverContext = {
+      ...macCtx(),
+      clientOs: 'win32',
+      homeDir: 'C:\\Users\\ccheng',
+      roots: [{ id: 40, name: 'templated', local_paths: { win32: 'c:/Users/%USERNAME%/Noesis' } }],
+    };
+    expect(localAbsFor(winCtxWithTemplate, 40, 'x.md')).toBeNull();
   });
 });
