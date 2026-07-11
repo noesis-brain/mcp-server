@@ -1295,7 +1295,15 @@ export function registerTools(server: McpServer, services: ToolServices): void {
       // Track files moved to .noesis folder
       const allMovedToNoesis: string[] = [];
 
+      // H4 (F4): the vault IS the notes home, so the "move new files to a
+      // .noesis subfolder" concept is meaningless there — worse, moving files
+      // into dot-folders makes them invisible to future full scans (the
+      // scanner skips dot-dirs) and thus silently clobberable. Identify the
+      // vault so the move-prompt + move-block are skipped for it.
+      const vaultRootId = (await client.getResolverContext()).vaultRootId;
+
       for (const syncRoot of rootsToSync) {
+        const isVault = vaultRootId != null && syncRoot.id === vaultRootId;
         // Fresh-machine bootstrap (M3): a root with a known local path that
         // doesn't exist on disk yet (e.g. ~/Noesis on a machine that has never
         // synced) is CREATED, not error-skipped — the sync below then pulls
@@ -1364,8 +1372,11 @@ export function registerTools(server: McpServer, services: ToolServices): void {
           }
         }
 
-        // If LOCAL ONLY files found and moveNewToNoesis not set, return prompt
-        if (localOnlyFiles.length > 0 && !moveNewToNoesis && !dryRun) {
+        // If LOCAL ONLY files found and moveNewToNoesis not set, return prompt.
+        // H4: NEVER prompt for the vault — new files there just push-create
+        // (falling through to the loop below); moving them into .noesis would
+        // trap them under a dot-dir the scanner can't see.
+        if (localOnlyFiles.length > 0 && !moveNewToNoesis && !dryRun && !isVault) {
           return {
             content: [{
               type: 'text',
@@ -1380,9 +1391,10 @@ export function registerTools(server: McpServer, services: ToolServices): void {
           };
         }
 
-        // If moveNewToNoesis is true and there are LOCAL ONLY files, move them to .noesis
+        // If moveNewToNoesis is true and there are LOCAL ONLY files, move them
+        // to .noesis — but NEVER inside the vault (H4: the dot-folder trap).
         const movedToNoesisFiles: string[] = [];
-        if (moveNewToNoesis && localOnlyFiles.length > 0 && !dryRun) {
+        if (moveNewToNoesis && !isVault && localOnlyFiles.length > 0 && !dryRun) {
           for (const file of localOnlyFiles) {
             const oldPath = file.path;
             const fileName = path.basename(oldPath);
@@ -1459,13 +1471,27 @@ export function registerTools(server: McpServer, services: ToolServices): void {
                 result.pushed.created++;
               }
             } else if (!localFile && cloudNote) {
-              // CLOUD ONLY: Pull to local (create)
-              if (dryRun) {
+              // CLOUD ONLY (per the local SCAN) — but the scanner skips
+              // dot-directories, so a note whose rel contains `.noesis/` can be
+              // absent from localMap while a file DOES exist on disk. H4 (F4):
+              // never blind-overwrite such a file. Check the real disk state
+              // first; only a genuinely-absent file is a pure cloud-create.
+              const localPath = path.join(syncRoot.path, relativePath);
+              const existsOnDisk = fs.existsSync(localPath);
+              const diskContent = existsOnDisk ? fs.readFileSync(localPath, 'utf-8') : null;
+              const diskDiffers = diskContent != null && NoesisClient.computeHash(diskContent) !== cloudNote.hash;
+
+              if (existsOnDisk && diskDiffers) {
+                // Real local edit the scan couldn't see. Preserve it — record a
+                // conflict instead of clobbering; the user resolves via a
+                // per-file sync (the resolver reaches dot-rel paths).
+                result.conflicts.push({ path: relativePath, localModified: '', cloudModified: cloudNote.modified_at });
+                result.details.push({ file: relativePath, action: 'conflict', reason: 'scan-hidden local edit preserved (under a dot-folder) — sync this file directly to resolve' });
+              } else if (dryRun) {
                 result.details.push({ file: relativePath, action: 'pulled_create' });
                 result.pulled.created++;
               } else {
-                // Write file locally
-                const localPath = path.join(syncRoot.path, relativePath);
+                // Genuinely absent (or byte-identical on disk): safe to write.
                 const localDir = path.dirname(localPath);
                 if (!fs.existsSync(localDir)) {
                   fs.mkdirSync(localDir, { recursive: true });
