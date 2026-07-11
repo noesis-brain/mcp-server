@@ -13,6 +13,7 @@ import type { SyncResult, SyncStatus, BidirectionalSyncResult } from '../types/i
 import { initEmbeddingService, generateEmbedding, generateEmbeddingsBatch } from '../services/embedding.js';
 import { SyncStateManager, determineSyncDirection } from './SyncStateManager.js';
 import { registerNaviTools } from './navis.js';
+import { registerBacklogTools } from './backlog.js';
 import { suggestOtherOsPath } from '../utils/suggestPath.js';
 import { diff3Merge, diffPatch } from 'node-diff3';
 
@@ -214,6 +215,7 @@ export function registerTools(server: McpServer, services: ToolServices): void {
 
   // Register Navi management tools
   registerNaviTools(server, client);
+  registerBacklogTools(server, client);
 
   // Register search_notes tool
   server.tool(

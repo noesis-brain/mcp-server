@@ -1235,4 +1235,52 @@ export class NoesisClient {
   async close(): Promise<void> {
     // No-op - HTTP client doesn't need cleanup
   }
+
+  // ── Backlog v2 (loop surface /api/mcp/backlog) — thin passthroughs; semantics live server-side ──
+
+  async backlogList(params: { stage?: string; q?: string } = {}): Promise<any> {
+    const qs = new URLSearchParams();
+    if (params.stage) qs.set('stage', params.stage);
+    if (params.q) qs.set('q', params.q);
+    const suffix = qs.toString() ? `?${qs.toString()}` : '';
+    return this.request('GET', `/api/mcp/backlog/issues${suffix}`);
+  }
+
+  async backlogGet(key: string): Promise<any> {
+    return this.request('GET', `/api/mcp/backlog/issues/${encodeURIComponent(key)}`);
+  }
+
+  async backlogCreate(body: Record<string, unknown>): Promise<any> {
+    return this.request('POST', '/api/mcp/backlog/issues', body);
+  }
+
+  async backlogPatch(key: string, body: Record<string, unknown>): Promise<any> {
+    return this.request('PATCH', `/api/mcp/backlog/issues/${encodeURIComponent(key)}`, body);
+  }
+
+  async backlogSetStage(key: string, to: string, reason?: string): Promise<any> {
+    return this.request('POST', `/api/mcp/backlog/issues/${encodeURIComponent(key)}/stage`, { to, reason });
+  }
+
+  async backlogPlanIncrements(key: string, increments: Array<Record<string, unknown>>): Promise<any> {
+    return this.request('PUT', `/api/mcp/backlog/issues/${encodeURIComponent(key)}/increments`, { increments });
+  }
+
+  async backlogReportIncrement(key: string, sequence: number, body: Record<string, unknown>): Promise<any> {
+    return this.request('POST', `/api/mcp/backlog/issues/${encodeURIComponent(key)}/increments/${sequence}/report`, body);
+  }
+
+  async backlogControl(key: string, afterMessageId?: number): Promise<any> {
+    const suffix = afterMessageId ? `?after_message_id=${afterMessageId}` : '';
+    return this.request('GET', `/api/mcp/backlog/issues/${encodeURIComponent(key)}/control${suffix}`);
+  }
+
+  async backlogPostMessage(key: string, body: Record<string, unknown>): Promise<any> {
+    return this.request('POST', `/api/mcp/backlog/issues/${encodeURIComponent(key)}/messages`, body);
+  }
+
+  async backlogAppendEvent(key: string, body: Record<string, unknown>): Promise<any> {
+    return this.request('POST', `/api/mcp/backlog/issues/${encodeURIComponent(key)}/events`, body);
+  }
+
 }
