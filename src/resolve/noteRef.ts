@@ -179,8 +179,14 @@ export function resolvePathReference(ctx: ResolverContext, inputPath: string): R
   const subfolder = best.root.vault_subfolder?.replace(/^\/+|\/+$/g, '');
   if (!subfolder || ctx.vaultRootId == null) return null;
 
+  // F8: when the input EXPLICITLY names a `.noesis/` dot path, try the
+  // UNCOLLAPSED candidate first. In a collapse-fallback pair (a different file
+  // won the collapsed slot at migration, so this note kept its `.noesis/`
+  // prefix), collapsed-first would wrongly return the native sibling; the
+  // dot-path the caller typed is the one they mean. Harmless in the common
+  // case: the uncollapsed candidate simply misses and falls to the collapsed.
   const candidates = rel.startsWith(NOESIS_SEG)
-    ? [`${subfolder}/${rel.slice(NOESIS_SEG.length)}`, `${subfolder}/${rel}`]
+    ? [`${subfolder}/${rel}`, `${subfolder}/${rel.slice(NOESIS_SEG.length)}`]
     : [`${subfolder}/${rel}`];
 
   return { rootId: ctx.vaultRootId, candidates, via: 'legacy-translation', archivedRootId: best.root.id };

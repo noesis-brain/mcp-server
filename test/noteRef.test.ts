@@ -78,11 +78,14 @@ describe('parseNoteReference', () => {
 describe('resolvePathReference on a macOS client', () => {
   const ctx = macCtx();
 
-  it('translates a legacy Windows path via the archived root, collapsed first', () => {
+  it('translates a legacy Windows .noesis/ path — uncollapsed candidate first (F8)', () => {
+    // The input explicitly names the dot path → the literal (uncollapsed) rel
+    // is tried first, so a collapse-fallback note is returned over its native
+    // sibling; the collapsed rel remains as the common-case fallback.
     const r = resolvePathReference(ctx, 'C:\\temp_cGit\\.noesis\\foo.md');
     expect(r).toEqual({
       rootId: VAULT_ID,
-      candidates: ['my-git/foo.md', 'my-git/.noesis/foo.md'],
+      candidates: ['my-git/.noesis/foo.md', 'my-git/foo.md'],
       via: 'legacy-translation',
       archivedRootId: 21,
     });

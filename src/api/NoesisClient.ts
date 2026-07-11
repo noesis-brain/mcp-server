@@ -347,10 +347,23 @@ export class NoesisClient {
   private baseUrl: string;
   private apiToken: string;
 
+  // H8: short-lived cache for the resolver context. It's fetched fresh on
+  // every path-form get_note and every sync_notes; the archived translation
+  // table is effectively immutable within a session, so a brief TTL collapses
+  // N calls into one round-trip. Kept short (45s) so a web-UI root change
+  // (create/archive) is picked up quickly.
+  private resolverCtxCache: { ctx: ResolverContext; at: number } | null = null;
+  private static readonly RESOLVER_CTX_TTL_MS = 45_000;
+
   constructor(baseUrl: string, apiToken: string) {
     // Remove trailing slash
     this.baseUrl = baseUrl.replace(/\/$/, '');
     this.apiToken = apiToken;
+  }
+
+  /** Drop the cached resolver context (call after any local root mutation). */
+  invalidateResolverContext(): void {
+    this.resolverCtxCache = null;
   }
 
   /**
@@ -399,12 +412,16 @@ export class NoesisClient {
    * server attaches to the roots response.
    */
   async getResolverContext(): Promise<ResolverContext> {
+    const cached = this.resolverCtxCache;
+    if (cached && Date.now() - cached.at < NoesisClient.RESOLVER_CTX_TTL_MS) {
+      return cached.ctx;
+    }
     const result = await this.request<{
       roots: Array<Root & { archived_at?: string | null; vault_subfolder?: string | null }>;
       vault_root_id?: number | null;
       device_home_dirs?: Record<string, string> | null;
     }>('GET', '/api/mcp/roots?includeArchived=1');
-    return {
+    const ctx: ResolverContext = {
       clientOs: CLIENT_OS,
       homeDir: os.homedir(),
       vaultRootId: result.vault_root_id ?? null,
@@ -417,6 +434,8 @@ export class NoesisClient {
         vault_subfolder: r.vault_subfolder ?? null,
       })),
     };
+    this.resolverCtxCache = { ctx, at: Date.now() };
+    return ctx;
   }
 
   /**
@@ -434,6 +453,8 @@ export class NoesisClient {
       '/api/mcp/device-home',
       { osKey: CLIENT_OS, homeDir: os.homedir() }
     );
+    // device_home_dirs is part of the resolver context — bust the cache (H8).
+    this.invalidateResolverContext();
   }
 
   async getRootsForSync(): Promise<Array<{
@@ -473,6 +494,10 @@ export class NoesisClient {
     const body: Record<string, unknown> = { name: options.name, local_paths };
     if (options.type) body.type = options.type;
     const result = await this.request<{ root: Root }>('POST', '/api/mcp/roots', body);
+    // A new root changes the resolver context — bust the cache (H8). (Under
+    // single-vault the backend 409s this, so request() throws before here; the
+    // invalidate is correct defense-in-depth if root creation is ever allowed.)
+    this.invalidateResolverContext();
     return { ...result.root, path: getActivePathFromMap(result.root.local_paths) };
   }
 
