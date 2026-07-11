@@ -2328,10 +2328,14 @@ export function registerTools(server: McpServer, services: ToolServices): void {
         };
       }
 
-      // 3. If move_file, physically move the file on disk
+      // 3. If move_file, physically move the file on disk.
+      // H5: expandHome first — oldPath is the server-synthesized file_path,
+      // which for the vault is tilde-form (~/Noesis/...), and new_path may be
+      // tilde too. normalizePath does NOT expand ~, so without this the mkdir/
+      // rename would create a literal '~' directory under the process cwd.
       if (move_file) {
-        const normalizedOldPath = normalizePath(oldPath);
-        const normalizedNewPath = normalizePath(new_path);
+        const normalizedOldPath = normalizePath(expandHome(oldPath));
+        const normalizedNewPath = normalizePath(expandHome(new_path));
 
         try {
           // Create destination directory
@@ -2362,9 +2366,11 @@ export function registerTools(server: McpServer, services: ToolServices): void {
       try {
         const roots = await client.getRootsForSync();
 
-        // Remove baseline from old root
+        // Remove baseline from old root (expandHome so a tilde-form oldPath
+        // matches an expanded root path — H5).
+        const expandedOld = normalizePath(expandHome(oldPath));
         const oldRoot = roots.find(r => {
-          return normalizePath(oldPath).startsWith(normalizePath(r.path));
+          return expandedOld.startsWith(normalizePath(expandHome(r.path)));
         });
         if (oldRoot && oldRelativePath) {
           const oldMgr = new SyncStateManager(oldRoot.path);
@@ -2378,8 +2384,8 @@ export function registerTools(server: McpServer, services: ToolServices): void {
         if (newRoot && moveResult.relative_path) {
           const newMgr = new SyncStateManager(newRoot.path);
           newMgr.load();
-          // Compute hash from file content if available
-          const filePath = normalizePath(new_path);
+          // Compute hash from file content if available (expandHome for the vault tilde path — H5)
+          const filePath = normalizePath(expandHome(new_path));
           if (fs.existsSync(filePath)) {
             const content = fs.readFileSync(filePath, 'utf-8');
             const hash = NoesisClient.computeHash(content);
