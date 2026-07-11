@@ -8,7 +8,7 @@ import * as path from 'path';
 import * as os from 'os';
 import * as yaml from 'js-yaml';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
-import { NoesisClient, type LocalFile, type EditedOnlineNote, type OsKey, CLIENT_OS, getActivePathFromMap, expandHome } from '../api/NoesisClient.js';
+import { NoesisClient, type LocalFile, type EditedOnlineNote, type Note, type OsKey, CLIENT_OS, getActivePathFromMap, expandHome } from '../api/NoesisClient.js';
 import { parseNoteReference, resolvePathReference, rootLocalBase } from '../resolve/noteRef.js';
 import { formatRootsList } from '../resolve/rootsFormat.js';
 import type { SyncResult, SyncStatus, BidirectionalSyncResult } from '../types/index.js';
@@ -3176,11 +3176,43 @@ function scanMarkdownFiles(rootPath: string, rootId: number, rootName: string, d
 }
 
 /**
+ * A cloud note in the exact shape the sync branches consume (matching the old
+ * getNotesForSync element). Built by adaptCloudNote from a single-note fetch
+ * (content + metadata) plus the authoritative hash from the root hash map.
+ */
+type CloudNoteRow = {
+  id: number;
+  relative_path: string;
+  hash: string;
+  modified_at: string;
+  content: string;
+  title: string | null;
+  description: string | null;
+  keywords: string | string[] | null;
+  edited_online_at: string | null;
+};
+
+/** Adapt a by-relative Note (+ its hash from the root hash map) into CloudNoteRow. */
+export function adaptCloudNote(n: Note, relativePath: string, hash: string): CloudNoteRow {
+  return {
+    id: n.id,
+    relative_path: n.relative_path ?? relativePath,
+    hash,
+    modified_at: n.modified_at ?? new Date(0).toISOString(),
+    content: n.content ?? '',
+    title: n.title ?? null,
+    description: n.description ?? null,
+    keywords: n.keywords ?? null,
+    edited_online_at: n.edited_online_at ?? null,
+  };
+}
+
+/**
  * Sync specific files by path (single-file or multi-file sync mode)
  * @param force - If true, bypass hash check and always re-sync (useful for metadata regeneration)
  * @param regenerateMetadata - If true, backend AI regenerates all metadata fields, overwriting existing values
  */
-async function syncSpecificFiles(
+export async function syncSpecificFiles(
   filePaths: string[],
   dryRun: boolean,
   client: NoesisClient,
@@ -3203,17 +3235,14 @@ async function syncSpecificFiles(
   // Cache SyncStateManagers per root path
   const syncStateCache = new Map<string, SyncStateManager>();
 
-  // Cache cloud notes per root to avoid multiple API calls
-  const cloudNotesCache = new Map<number, Map<string, {
-    id: number;
-    hash: string;
-    modified_at: string;
-    content: string;
-    title: string | null;
-    description: string | null;
-    keywords: string | null;
-    edited_online_at: string | null;
-  }>>();
+  // H3a: hash-first delta sync. Post-migration one root (the vault) holds the
+  // whole corpus (~50MB+), so priming full content per root — the old
+  // getNotesForSync approach — cost the entire corpus on every per-file sync.
+  // Instead cache a lightweight relative_path→hash map per root (KB), and
+  // fetch a single note's full content ONLY for the file being synced, only
+  // when it actually exists in the cloud.
+  const rootHashCache = new Map<number, Map<string, string>>();
+  const cloudNoteCache = new Map<string, CloudNoteRow | null>(); // key: `${rootId}::${rel}`
 
   // Unified reference resolution (M2): entries may be note URLs, noesis://
   // ids, bare ids, or paths of ANY OS's shape — including legacy
@@ -3262,20 +3291,20 @@ async function syncSpecificFiles(
     }
     const matchingRoot = { id: ctxRoot.id, name: ctxRoot.name, path: rootBase };
 
-    // Prime the cloud map for this root, then pick the candidate that exists
-    // in the cloud (collapsed form first); local-only pushes use the first.
-    if (!cloudNotesCache.has(matchingRoot.id)) {
-      const cloudNotes = await client.getNotesForSync(matchingRoot.id);
-      const cloudMap = new Map<string, typeof cloudNotes[0]>();
-      for (const note of cloudNotes) {
-        if (note.relative_path) {
-          cloudMap.set(normalizePath(note.relative_path), note);
-        }
-      }
-      cloudNotesCache.set(matchingRoot.id, cloudMap);
+    // H3a: fetch the root's lightweight relative_path→hash map (KB), pick the
+    // candidate present in it (collapsed form first; local-only pushes use the
+    // first), then fetch that ONE note's full content lazily — never the whole
+    // corpus. cloudNote===null means the note doesn't exist in the cloud.
+    if (!rootHashCache.has(matchingRoot.id)) {
+      const raw = await client.getNoteHashesByRoot(matchingRoot.id);
+      // Normalize keys the same way candidates are (forward-slash), matching
+      // the pre-H3a cloud-map keying so lookups stay byte-identical.
+      const norm = new Map<string, string>();
+      for (const [rel, h] of raw) norm.set(normalizePath(rel), h);
+      rootHashCache.set(matchingRoot.id, norm);
     }
-    const cloudNotesMap = cloudNotesCache.get(matchingRoot.id)!;
-    const relativePath = candidates.find(c => cloudNotesMap.has(c)) ?? candidates[0];
+    const rootHashes = rootHashCache.get(matchingRoot.id)!;
+    const relativePath = candidates.find(c => rootHashes.has(c)) ?? candidates[0];
     const normalizedPath = `${matchingRoot.path}/${relativePath}`;
 
     // Markdown-only (before existence check so cloud-only pulls also validate)
@@ -3285,10 +3314,21 @@ async function syncSpecificFiles(
       continue;
     }
 
+    // Lazily materialize the single cloud note (content + metadata) only when
+    // the candidate exists in the hash map — the delta-sync payload win.
+    const cloudHash = rootHashes.get(relativePath);
+    let cloudNote: CloudNoteRow | null = null;
+    if (cloudHash) {
+      const cnKey = `${matchingRoot.id}::${relativePath}`;
+      if (!cloudNoteCache.has(cnKey)) {
+        const n = await client.getNoteByRelativePath(matchingRoot.id, relativePath);
+        cloudNoteCache.set(cnKey, n ? adaptCloudNote(n, relativePath, cloudHash) : null);
+      }
+      cloudNote = cloudNoteCache.get(cnKey)!;
+    }
+
     // Missing locally — pull from cloud to the VAULT-DERIVED path
     if (!fs.existsSync(normalizedPath)) {
-      const cloudNote = cloudNotesMap.get(relativePath);
-
       if (cloudNote) {
         // CLOUD ONLY: Pull to local (create)
         if (dryRun) {
@@ -3325,26 +3365,13 @@ async function syncSpecificFiles(
     }
 
     try {
-      // Read local file content
+      // Read local file content. relativePath + cloudNote were resolved above
+      // (H3a) — the outer relativePath equals path.relative(root, normalizedPath)
+      // by construction, and cloudNote is the single fetched note (or null).
       const localContent = fs.readFileSync(normalizedPath, 'utf-8');
       const stats = fs.statSync(normalizedPath);
-      const relativePath = normalizePath(path.relative(matchingRoot.path, normalizedPath));
       const localHash = NoesisClient.computeHash(localContent);
       const localMtime = stats.mtime.getTime();
-
-      // Get cloud notes for this root (cached)
-      if (!cloudNotesCache.has(matchingRoot.id)) {
-        const cloudNotes = await client.getNotesForSync(matchingRoot.id);
-        const cloudMap = new Map<string, typeof cloudNotes[0]>();
-        for (const note of cloudNotes) {
-          if (note.relative_path) {
-            cloudMap.set(normalizePath(note.relative_path), note);
-          }
-        }
-        cloudNotesCache.set(matchingRoot.id, cloudMap);
-      }
-      const cloudNotesMap = cloudNotesCache.get(matchingRoot.id)!;
-      const cloudNote = cloudNotesMap.get(relativePath);
 
       // Get or create SyncStateManager for this root
       if (!syncStateCache.has(matchingRoot.path)) {
