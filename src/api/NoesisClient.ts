@@ -829,15 +829,26 @@ export class NoesisClient {
     relative_path: string;
     root_name: string;
   }>> {
-    const params = new URLSearchParams();
-    if (options.root) params.append('root', options.root);
-    params.append('for_pull', 'true');
+    // H3b (F3): the for_pull response carries full content, so the server now
+    // paginates it. Page through until a short page so the caller still gets
+    // every note without a single whole-corpus (~50MB) response.
+    const pageSize = 500;
+    const all: Array<{ id: number; title: string; content: string; relative_path: string; root_name: string }> = [];
+    for (let offset = 0; ; offset += pageSize) {
+      const params = new URLSearchParams();
+      if (options.root) params.append('root', options.root);
+      params.append('for_pull', 'true');
+      params.append('limit', String(pageSize));
+      params.append('offset', String(offset));
 
-    const result = await this.request<{ notes: any[] }>(
-      'GET',
-      `/api/mcp/notes?${params}`
-    );
-    return result.notes;
+      const result = await this.request<{ notes: any[] }>(
+        'GET',
+        `/api/mcp/notes?${params}`
+      );
+      all.push(...result.notes);
+      if (result.notes.length < pageSize) break;
+    }
+    return all;
   }
 
   /**
