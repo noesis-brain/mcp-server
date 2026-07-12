@@ -1,7 +1,7 @@
 {
   "name": "@noesis-brain/mcp-server",
   "version": "2.0.1",
-  "description": "Official MCP server for Noesis — the markdown notes manager for Claude Code. Search, sync, and manage your .md knowledge base via 19 AI-powered tools.",
+  "description": "Official MCP server for Noesis \u2014 the markdown notes manager for Claude Code. Search, sync, and manage your .md knowledge base via 19 AI-powered tools.",
   "type": "module",
   "main": "dist/index.js",
   "bin": {
@@ -67,5 +67,8 @@
     "@types/pg": "^8.10.0",
     "tsx": "^4.19.0",
     "typescript": "^5.6.0"
+  },
+  "optionalDependencies": {
+    "@anthropic-ai/claude-agent-sdk": "^0.1.0"
   }
 }

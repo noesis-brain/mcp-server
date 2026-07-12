@@ -98,6 +98,24 @@ async function main(): Promise<void> {
     return;
   }
 
+  // `noesis-mcp agent` runs the Local Agent daemon (ai_mode = claude-subscription):
+  // it polls the Noesis agent-job queue and runs jobs on your own Claude subscription.
+  if (subcommand === 'agent') {
+    const { runAgentDaemon, resolveAgentConfig } = await import('./agent/runner.js');
+    try {
+      const cfg = resolveAgentConfig();
+      const controller = new AbortController();
+      for (const sig of ['SIGINT', 'SIGTERM'] as const) {
+        process.on(sig, () => { console.error(`\n[noesis-agent] ${sig} — shutting down`); controller.abort(); });
+      }
+      await runAgentDaemon(cfg, controller.signal);
+    } catch (err) {
+      console.error(`\nnoesis-mcp agent failed: ${err instanceof Error ? err.message : String(err)}`);
+      process.exit(1);
+    }
+    return;
+  }
+
   // Get API configuration
   const { apiToken, apiBaseUrl } = getApiConfig();
   const geminiApiKey = getGeminiApiKey();
