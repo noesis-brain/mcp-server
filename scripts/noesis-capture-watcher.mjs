@@ -88,6 +88,13 @@ const stripAnsi = (s) => String(s == null ? '' : s).replace(ANSI_RE, '');
 const GIT_CRLF_WARN_RE = /warning: in the working copy of '[^']*', LF will be replaced by CRLF the next time Git touches it\.?\s*/g;
 const stripCmdNoise = (s) => String(s == null ? '' : s).replace(GIT_CRLF_WARN_RE, '');
 
+// Some Windows console tools (`wsl --status`, certain `reg`/`netsh` invocations)
+// write UTF-16LE to a piped stdout; captured as UTF-8 that leaves NUL bytes
+// interleaved through the text. Postgres rejects NUL in text columns outright,
+// and render() joins the whole note into one string before the cloud push, so
+// a single stray NUL anywhere fails the ENTIRE push, not just that one entry.
+const stripNulBytes = (s) => String(s == null ? '' : s).replace(/\u0000/g, '');
+
 // Drop Claude Code image placeholders ("[Image #1]", "[Image: source: <path>]")
 // that carry no readable signal in a text capture.
 const stripImageRefs = (s) =>
@@ -315,8 +322,8 @@ function frontmatter(meta) {
 
 function resultText(res) {
   const c = res?.content;
-  if (typeof c === 'string') return stripCmdNoise(stripAnsi(c));
-  if (Array.isArray(c)) return stripCmdNoise(stripAnsi(c.filter((b) => b && b.type === 'text').map((b) => b.text).join(' ')));
+  if (typeof c === 'string') return stripNulBytes(stripCmdNoise(stripAnsi(c)));
+  if (Array.isArray(c)) return stripNulBytes(stripCmdNoise(stripAnsi(c.filter((b) => b && b.type === 'text').map((b) => b.text).join(' '))));
   return '';
 }
 
@@ -328,6 +335,46 @@ function firstWords(s, n) {
 
 function blockquote(text) {
   return text.split('\n').map((l) => (l.length ? `> ${l}` : '>')).join('\n');
+}
+
+// Returns the exact CommonMark closing fence needed to balance `text` if it ends
+// inside an open fenced code block (``` or ~~~), or '' if none is open. Mirrors
+// the fence-parity rules in frontend/src/utils/codeFences.ts.
+function unterminatedFenceCloser(text) {
+  let openChar = '';
+  let openLen = 0;
+  for (const raw of text.split('\n')) {
+    const trimmed = raw.trim();
+    const m = /^(`{3,}|~{3,})(.*)$/.exec(trimmed);
+    if (!m) continue;
+    const char = m[1][0];
+    const len = m[1].length;
+    const info = m[2].trim();
+    if (!openChar) {
+      openChar = char;
+      openLen = len;
+    } else if (char === openChar && len >= openLen && info === '') {
+      openChar = '';
+      openLen = 0;
+    }
+  }
+  return openChar ? openChar.repeat(openLen) : '';
+}
+
+// Truncates `text` to at most `maxLen` characters, closing any fenced code block
+// left dangling by the cut. An unclosed ``` fence would otherwise mark the rest
+// of the note as code (per CommonMark), silently swallowing every later heading
+// from both the TOC panel and the rendered body until EOF.
+//
+// The fence check runs even when THIS function doesn't truncate: Claude Code's
+// own transcript can already contain a tool result that IT truncated upstream
+// (its own "… (truncated)" marker, mid-fence, before this script ever sees the
+// text) -- observed in the wild at ~11968 chars, under this function's 12000
+// cap. Closing only on our own cut would miss that case entirely.
+function truncateSafely(text, maxLen) {
+  const cut = text.length > maxLen ? `${text.slice(0, maxLen)}\n\n… (truncated)` : text;
+  const closer = unterminatedFenceCloser(cut);
+  return closer ? `${cut}\n${closer}` : cut;
 }
 
 function isSystemInjection(text) {
@@ -415,7 +462,7 @@ function renderPlanBlock(toolUse, resultMap) {
     const body = txt
       .replace(/<\/details>/gi, '&lt;/details&gt;')   // never let an inner tag close our wrapper
       .replace(/^(#{1,6})\s+(.*)$/gm, '**$2**');       // demote headings so they don't pollute the note outline
-    const capped = body.length > 12000 ? `${body.slice(0, 12000)}\n\n… (truncated)` : body;
+    const capped = truncateSafely(body, 12000);
     lines.push('', '<details>', '<summary>Plan / approval</summary>', '', capped, '', '</details>', '');
   } else {
     lines.push('  - ↳ _(awaiting approval)_');
@@ -428,8 +475,7 @@ function renderUserPrompt(turn, text, entry, queued = false) {
   const imageOnly = !clean;
   const heading = imageOnly ? '(image)' : (firstWords(clean, 9) || '(empty)');
   const ts = tsStamp(entry.timestamp);
-  const body = imageOnly ? '_(image attachment)_'
-             : (clean.length > 3000 ? `${clean.slice(0, 3000)}\n\n… (truncated)` : clean);
+  const body = imageOnly ? '_(image attachment)_' : truncateSafely(clean, 3000);
   const parts = [`### ${turn}. ${heading}`];
   const meta = [ts, queued ? '_(queued while working)_' : ''].filter(Boolean).join(' · ');
   if (meta) parts.push(`*${meta}*`);
