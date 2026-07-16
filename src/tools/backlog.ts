@@ -2,14 +2,18 @@
  * Backlog v2 MCP tools — the loop's view of /api/mcp/backlog. Thin wrappers:
  * every rule (stage legality, OWNER_GATE, freeze, park guards) is enforced
  * server-side; these tools shape requests and return compact JSON text that a
- * driving loop can parse. The owner-only acts (approve / reject / cancel) have
- * NO tool here by design — they exist only on the owner's page.
+ * driving loop can parse. The owner-only acts (approve / cancel, and reject of
+ * anything UN-parked) have NO tool here by design — they exist only on the
+ * owner's page. The one disposal this surface carries is the owner-instructed
+ * reject of a PARKED item: ambiguous|superseded -> rejected, reason required.
  */
 import { z } from 'zod';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import type { NoesisClient } from '../api/NoesisClient.js';
 
-const STAGE_ENUM = z.enum(['jot', 'ambiguous', 'superseded', 'refined', 'materialized', 'approved', 'running', 'implemented', 'shipped']);
+// 'rejected' rides along for set_stage's parked disposal and as a backlog_get
+// list filter; it is NOT a stage the loop may reach from un-parked items.
+const STAGE_ENUM = z.enum(['jot', 'ambiguous', 'superseded', 'refined', 'materialized', 'approved', 'running', 'implemented', 'shipped', 'rejected']);
 const KIND_ENUM = z.enum(['feature', 'bug', 'design', 'process', 'research']);
 const SIZE_ENUM = z.enum(['S', 'M', 'L']);
 
@@ -76,11 +80,11 @@ export function registerBacklogTools(server: McpServer, client: NoesisClient): v
 
   server.tool(
     'backlog_set_stage',
-    "Move an issue through its lifecycle on the loop surface: jot->refined, refined->materialized (send-back too), approved->running, running->approved (STOP-acknowledge), running->implemented, implemented->shipped; plus the groom detours: jot->ambiguous (reading forks; post the question FIRST), ambiguous->refined/jot (resolve/retract), and jot|refined|ambiguous|materialized->superseded (grooming believes it ALREADY SHIPPED — post the evidence question first; disposal is the owner's page Reject), superseded->jot/refined (retract/keep). Cannot approve/reject/cancel — those are the owner's page buttons (OWNER_GATE).",
+    "Move an issue through its lifecycle on the loop surface: jot->refined, refined->materialized (send-back too), approved->running, running->approved (STOP-acknowledge), running->implemented, implemented->shipped; plus the groom detours: jot->ambiguous (reading forks; post the question FIRST), ambiguous->refined/jot (resolve/retract), and jot|refined|ambiguous|materialized->superseded (grooming believes it ALREADY SHIPPED — post the evidence question first), superseded->jot/refined (retract/keep). Parked disposal: ambiguous|superseded->rejected, ONLY on the owner's explicit instruction (in chat, or their answer to the park question) — reason REQUIRED and must record that instruction. Cannot approve/cancel, nor reject un-parked items — those are the owner's page buttons (OWNER_GATE).",
     {
       key: z.string().describe('Issue key like TCK-7'),
       to: STAGE_ENUM.describe('Target stage (approve only as the running->approved stop-ack)'),
-      reason: z.string().optional().describe('Reason for send-backs'),
+      reason: z.string().optional().describe("Reason for send-backs; REQUIRED for rejected (record the owner's instruction)"),
     },
     async (args) => {
       try {
