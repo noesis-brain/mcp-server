@@ -76,7 +76,7 @@ export function registerBacklogTools(server: McpServer, client: NoesisClient): v
 
   server.tool(
     'backlog_set_stage',
-    "Move an issue through its lifecycle on the loop surface: jot->refined, refined->materialized (send-back too), approved->running, running->approved (STOP-acknowledge), running->implemented, implemented->shipped; plus the groom detours: jot->ambiguous (reading forks; post the question FIRST), ambiguous->refined/jot (resolve/retract), and jot|refined|ambiguous->superseded (grooming believes it ALREADY SHIPPED — post the evidence question first; disposal is the owner's page Reject), superseded->jot/refined (retract/keep). Cannot approve/reject/cancel — those are the owner's page buttons (OWNER_GATE).",
+    "Move an issue through its lifecycle on the loop surface: jot->refined, refined->materialized (send-back too), approved->running, running->approved (STOP-acknowledge), running->implemented, implemented->shipped; plus the groom detours: jot->ambiguous (reading forks; post the question FIRST), ambiguous->refined/jot (resolve/retract), and jot|refined|ambiguous|materialized->superseded (grooming believes it ALREADY SHIPPED — post the evidence question first; disposal is the owner's page Reject), superseded->jot/refined (retract/keep). Cannot approve/reject/cancel — those are the owner's page buttons (OWNER_GATE).",
     {
       key: z.string().describe('Issue key like TCK-7'),
       to: STAGE_ENUM.describe('Target stage (approve only as the running->approved stop-ack)'),
