@@ -9,7 +9,7 @@ import { z } from 'zod';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import type { NoesisClient } from '../api/NoesisClient.js';
 
-const STAGE_ENUM = z.enum(['jot', 'ambiguous', 'refined', 'materialized', 'approved', 'running', 'implemented', 'shipped']);
+const STAGE_ENUM = z.enum(['jot', 'ambiguous', 'superseded', 'refined', 'materialized', 'approved', 'running', 'implemented', 'shipped']);
 const KIND_ENUM = z.enum(['feature', 'bug', 'design', 'process', 'research']);
 const SIZE_ENUM = z.enum(['S', 'M', 'L']);
 
@@ -76,7 +76,7 @@ export function registerBacklogTools(server: McpServer, client: NoesisClient): v
 
   server.tool(
     'backlog_set_stage',
-    "Move an issue through its lifecycle on the loop surface: jot->refined, refined->materialized (send-back too), approved->running, running->approved (STOP-acknowledge), running->implemented, implemented->shipped; plus the groom detour jot->ambiguous (post the question FIRST), ambiguous->refined (resolve from the owner's answer), ambiguous->jot (retract). Cannot approve/reject/cancel — those are the owner's page buttons (OWNER_GATE).",
+    "Move an issue through its lifecycle on the loop surface: jot->refined, refined->materialized (send-back too), approved->running, running->approved (STOP-acknowledge), running->implemented, implemented->shipped; plus the groom detours: jot->ambiguous (reading forks; post the question FIRST), ambiguous->refined/jot (resolve/retract), and jot|refined|ambiguous->superseded (grooming believes it ALREADY SHIPPED — post the evidence question first; disposal is the owner's page Reject), superseded->jot/refined (retract/keep). Cannot approve/reject/cancel — those are the owner's page buttons (OWNER_GATE).",
     {
       key: z.string().describe('Issue key like TCK-7'),
       to: STAGE_ENUM.describe('Target stage (approve only as the running->approved stop-ack)'),
@@ -160,7 +160,7 @@ export function registerBacklogTools(server: McpServer, client: NoesisClient): v
 
   server.tool(
     'backlog_post_message',
-    "The loop's voice on an issue: kind 'answer' + answer_to replies to an owner question WITHOUT stopping work; kind 'question' + parks_sequence asks the owner and parks that increment ([Q] park); kind 'question' WITHOUT parks_sequence is the issue-level ambiguity question (groom park — pair it with set_stage jot->ambiguous); kind 'comment' leaves a note.",
+    "The loop's voice on an issue: kind 'answer' + answer_to replies to an owner question WITHOUT stopping work; kind 'question' + parks_sequence asks the owner and parks that increment ([Q] park); kind 'question' WITHOUT parks_sequence is the issue-level groom question (pair it with set_stage to 'ambiguous' for reading forks, or 'superseded' for already-shipped evidence); kind 'comment' leaves a note.",
     {
       key: z.string(),
       body_md: z.string(),
