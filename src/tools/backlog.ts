@@ -9,7 +9,7 @@ import { z } from 'zod';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import type { NoesisClient } from '../api/NoesisClient.js';
 
-const STAGE_ENUM = z.enum(['jot', 'refined', 'materialized', 'approved', 'running', 'implemented', 'shipped']);
+const STAGE_ENUM = z.enum(['jot', 'ambiguous', 'refined', 'materialized', 'approved', 'running', 'implemented', 'shipped']);
 const KIND_ENUM = z.enum(['feature', 'bug', 'design', 'process', 'research']);
 const SIZE_ENUM = z.enum(['S', 'M', 'L']);
 
@@ -25,7 +25,7 @@ function errText(e: unknown): { content: Array<{ type: 'text'; text: string }>; 
 export function registerBacklogTools(server: McpServer, client: NoesisClient): void {
   server.tool(
     'backlog_get',
-    'Read the Backlog: without a key, list issues (+ per-stage counts, optionally filtered by stage or a text query); with a key (TCK-<n>), the full issue including increments and open owner questions.',
+    'Read the Backlog: without a key, list issues (+ per-stage counts and open_question_count, optionally filtered by stage or a text query); with a key (TCK-<n>), the full issue including increments, open owner questions, and the bounded message thread (questions + answers linked via answered_by_message_id — what RESOLVE reads).',
     {
       key: z.string().optional().describe('Issue key like TCK-7 (omit to list)'),
       stage: STAGE_ENUM.optional().describe('List filter: only this stage'),
@@ -76,7 +76,7 @@ export function registerBacklogTools(server: McpServer, client: NoesisClient): v
 
   server.tool(
     'backlog_set_stage',
-    "Move an issue through its lifecycle on the loop surface: jot->refined, refined->materialized (send-back too), approved->running, running->approved (STOP-acknowledge), running->implemented, implemented->shipped. Cannot approve/reject/cancel — those are the owner's page buttons (OWNER_GATE).",
+    "Move an issue through its lifecycle on the loop surface: jot->refined, refined->materialized (send-back too), approved->running, running->approved (STOP-acknowledge), running->implemented, implemented->shipped; plus the groom detour jot->ambiguous (post the question FIRST), ambiguous->refined (resolve from the owner's answer), ambiguous->jot (retract). Cannot approve/reject/cancel — those are the owner's page buttons (OWNER_GATE).",
     {
       key: z.string().describe('Issue key like TCK-7'),
       to: STAGE_ENUM.describe('Target stage (approve only as the running->approved stop-ack)'),
@@ -160,7 +160,7 @@ export function registerBacklogTools(server: McpServer, client: NoesisClient): v
 
   server.tool(
     'backlog_post_message',
-    "The loop's voice on an issue: kind 'answer' + answer_to replies to an owner question WITHOUT stopping work; kind 'question' (+ parks_sequence) asks the owner and parks that increment ([Q] park); kind 'comment' leaves a note.",
+    "The loop's voice on an issue: kind 'answer' + answer_to replies to an owner question WITHOUT stopping work; kind 'question' + parks_sequence asks the owner and parks that increment ([Q] park); kind 'question' WITHOUT parks_sequence is the issue-level ambiguity question (groom park — pair it with set_stage jot->ambiguous); kind 'comment' leaves a note.",
     {
       key: z.string(),
       body_md: z.string(),
