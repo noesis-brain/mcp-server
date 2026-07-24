@@ -1625,26 +1625,32 @@ export function registerTools(server: McpServer, services: ToolServices): void {
                         })
                       : mergedContent;
 
-                    const enrichedHash = NoesisClient.computeHash(enrichedContent);
-                    const mergedFile: LocalFile = {
-                      ...localFile,
-                      content: enrichedContent,
-                      hash: enrichedHash
-                    };
-                    // preserveMetadata=true: keep cloud's AI-generated title/description/keywords
-                    await client.upsertNote(mergedFile, metadata, { force: true, regenerateMetadata, preserveMetadata: true });
+                    // Safety net: never silently destroy content on merge (see per-file branch).
+                    if (enrichedContent.length < localFile.content.length * 0.5 && localFile.content.length > 2048) {
+                      const lost = Math.round(100 * (1 - enrichedContent.length / localFile.content.length));
+                      result.errors.push(`Skipped push for ${relativePath}: merge would drop ${lost}% of content (${localFile.content.length}->${enrichedContent.length} bytes). Left unchanged to avoid data loss.`);
+                    } else {
+                      const enrichedHash = NoesisClient.computeHash(enrichedContent);
+                      const mergedFile: LocalFile = {
+                        ...localFile,
+                        content: enrichedContent,
+                        hash: enrichedHash
+                      };
+                      // preserveMetadata=true: keep cloud's AI-generated title/description/keywords
+                      await client.upsertNote(mergedFile, metadata, { force: true, regenerateMetadata, preserveMetadata: true });
 
-                    // Write enriched content back to local file
-                    const localPath = path.join(syncRoot.path, relativePath);
-                    fs.writeFileSync(localPath, enrichedContent, 'utf-8');
+                      // Write enriched content back to local file
+                      const localPath = path.join(syncRoot.path, relativePath);
+                      fs.writeFileSync(localPath, enrichedContent, 'utf-8');
 
-                    stateMgr.setBaseline(
-                      relativePath,
-                      { hash: enrichedHash, lastSyncedAt: new Date().toISOString() },
-                      enrichedContent
-                    );
-                    result.details.push({ file: relativePath, action: 'pushed_update', reason: 'merged' });
-                    result.pushed.updated++;
+                      stateMgr.setBaseline(
+                        relativePath,
+                        { hash: enrichedHash, lastSyncedAt: new Date().toISOString() },
+                        enrichedContent
+                      );
+                      result.details.push({ file: relativePath, action: 'pushed_update', reason: 'merged' });
+                      result.pushed.updated++;
+                    }
                   }
                 } else if (direction === 'pull') {
                   // Cloud changed: pull to local
@@ -3609,32 +3615,40 @@ export async function syncSpecificFiles(
                 })
               : mergedContent;
 
-            const enrichedHash = NoesisClient.computeHash(enrichedContent);
-            const localFile: LocalFile = {
-              path: normalizedPath,
-              relativePath,
-              content: enrichedContent,
-              hash: enrichedHash,
-              mtime: stats.mtime,
-              size: stats.size,
-              rootId: matchingRoot.id,
-              rootName: matchingRoot.name,
-              project
-            };
-            // preserveMetadata=true: keep cloud's AI-generated title/description/keywords
-            await client.upsertNote(localFile, localMetadata, { force: true, regenerateMetadata, preserveMetadata: true });
+            // Safety net: a merge must never silently destroy content. If the merged
+            // result lost most of the local body, abort this file's push instead of
+            // overwriting local + cloud with a truncated note.
+            if (enrichedContent.length < localContent.length * 0.5 && localContent.length > 2048) {
+              const lost = Math.round(100 * (1 - enrichedContent.length / localContent.length));
+              result.errors.push(`Skipped push for ${relativePath}: merge would drop ${lost}% of content (${localContent.length}->${enrichedContent.length} bytes). Left unchanged to avoid data loss.`);
+            } else {
+              const enrichedHash = NoesisClient.computeHash(enrichedContent);
+              const localFile: LocalFile = {
+                path: normalizedPath,
+                relativePath,
+                content: enrichedContent,
+                hash: enrichedHash,
+                mtime: stats.mtime,
+                size: stats.size,
+                rootId: matchingRoot.id,
+                rootName: matchingRoot.name,
+                project
+              };
+              // preserveMetadata=true: keep cloud's AI-generated title/description/keywords
+              await client.upsertNote(localFile, localMetadata, { force: true, regenerateMetadata, preserveMetadata: true });
 
-            // Write enriched content back to local file
-            fs.writeFileSync(normalizedPath, enrichedContent, 'utf-8');
+              // Write enriched content back to local file
+              fs.writeFileSync(normalizedPath, enrichedContent, 'utf-8');
 
-            stateMgr.setBaseline(
-              relativePath,
-              { hash: enrichedHash, lastSyncedAt: new Date().toISOString() },
-              enrichedContent
-            );
-            result.details.push({ file: relativePath, action: 'pushed_update', reason: 'merged' });
-            result.pushed.updated++;
-            affectedRoots.add(matchingRoot.id);
+              stateMgr.setBaseline(
+                relativePath,
+                { hash: enrichedHash, lastSyncedAt: new Date().toISOString() },
+                enrichedContent
+              );
+              result.details.push({ file: relativePath, action: 'pushed_update', reason: 'merged' });
+              result.pushed.updated++;
+              affectedRoots.add(matchingRoot.id);
+            }
           }
         } else if (direction === 'pull') {
           // Cloud changed - pull content to local
@@ -3760,6 +3774,25 @@ export async function syncSpecificFiles(
 }
 
 /**
+ * Split leading YAML frontmatter from a markdown document.
+ *
+ * The opening `---` must be the very first line and the closing `---` must be on its
+ * own line (line-anchored). This deliberately does NOT use `indexOf('---', 3)`: a bare
+ * substring search matches a `---` inside a frontmatter value, a `---`/`----` thematic
+ * break in the body, or a `---` inside a code fence — which previously caused notes to
+ * be truncated / their frontmatter duplicated on sync.
+ *
+ * @returns raw = whole matched block incl. fences + trailing newline; inner = the YAML
+ *          between the fences; body = everything after the block. If there is no valid
+ *          leading frontmatter, raw/inner are '' and body is the full content.
+ */
+export function splitFrontmatter(content: string): { raw: string; inner: string; body: string } {
+  const m = content.match(/^---[ \t]*\r?\n([\s\S]*?)\r?\n---[ \t]*(?:\r?\n|$)/);
+  if (!m) return { raw: '', inner: '', body: content };
+  return { raw: m[0], inner: m[1], body: content.slice(m[0].length) };
+}
+
+/**
  * Parse YAML frontmatter from markdown content using js-yaml
  */
 function parseYamlFrontmatter(content: string): {
@@ -3769,20 +3802,13 @@ function parseYamlFrontmatter(content: string): {
 } {
   const result: { title?: string; description?: string; keywords?: string[] } = {};
 
-  // Check for YAML frontmatter (--- at start)
-  if (!content.startsWith('---')) {
+  const { inner } = splitFrontmatter(content);
+  if (!inner) {
     return result;
   }
-
-  const endIndex = content.indexOf('---', 3);
-  if (endIndex === -1) {
-    return result;
-  }
-
-  const frontmatterStr = content.substring(3, endIndex).trim();
 
   try {
-    const parsed = yaml.load(frontmatterStr) as Record<string, unknown>;
+    const parsed = yaml.load(inner) as Record<string, unknown>;
     if (!parsed || typeof parsed !== 'object') {
       return result;
     }
@@ -3831,12 +3857,18 @@ function parseCloudKeywords(keywords: string | string[] | null): string[] {
  * Update frontmatter in file content with new metadata values
  * Preserves existing frontmatter structure and only updates specified fields
  */
-function updateFrontmatter(
+export function updateFrontmatter(
   content: string,
   updates: { title?: string; description?: string; keywords?: string[] }
 ): string {
-  // If no frontmatter exists, create one
-  if (!content.startsWith('---')) {
+  const { inner, body } = splitFrontmatter(content);
+
+  // If no (valid) frontmatter exists, create one
+  if (!inner) {
+    if (content.startsWith('---')) {
+      // Opens with a fence but has no valid closing fence: don't risk mangling it.
+      return content;
+    }
     const frontmatterLines = ['---'];
     if (updates.title) frontmatterLines.push(`title: ${updates.title}`);
     if (updates.description) frontmatterLines.push(`description: ${updates.description}`);
@@ -3850,14 +3882,8 @@ function updateFrontmatter(
     return frontmatterLines.join('\n') + '\n' + content;
   }
 
-  // Find end of frontmatter
-  const endIndex = content.indexOf('---', 3);
-  if (endIndex === -1) {
-    return content; // Invalid frontmatter, return unchanged
-  }
-
-  const frontmatter = content.substring(3, endIndex);
-  const bodyContent = content.substring(endIndex + 3);
+  const frontmatter = inner;
+  const bodyContent = body;
   const lines = frontmatter.split(/\r?\n/);
   const newLines: string[] = [];
   const updatedKeys = new Set<string>();
@@ -3924,39 +3950,34 @@ function updateFrontmatter(
     }
   }
 
-  return '---\n' + newLines.filter(l => l.trim() !== '').join('\n') + '\n---' + bodyContent;
+  return '---\n' + newLines.filter(l => l.trim() !== '').join('\n') + '\n---\n' + bodyContent;
 }
 
 /**
  * Parse markdown content into structure: frontmatter, H1 heading, and body
  */
-function parseMarkdownStructure(content: string): {
+export function parseMarkdownStructure(content: string): {
   frontmatter: string;
   h1: string | null;
   body: string;
 } {
-  let frontmatter = '';
-  let remaining = content;
+  // Extract YAML frontmatter (line-anchored; see splitFrontmatter).
+  const { raw, body: afterFrontmatter } = splitFrontmatter(content);
+  const frontmatter = raw ? raw.replace(/\r?\n$/, '') : ''; // keep fences; reconstruct re-adds the trailing newline
+  const remaining = afterFrontmatter;
 
-  // Extract YAML frontmatter (--- ... ---)
-  if (content.startsWith('---')) {
-    const endIndex = content.indexOf('---', 3);
-    if (endIndex !== -1) {
-      frontmatter = content.substring(0, endIndex + 3);
-      remaining = content.substring(endIndex + 3).replace(/^\r?\n/, ''); // Remove leading newline after frontmatter
-    }
-  }
-
-  // Extract first H1 heading (# ...)
-  const h1Match = remaining.match(/^(#\s+.+?)(\r?\n|$)/m);
+  // Extract the note's H1 heading — ONLY when it is the first non-blank line of the
+  // body. A non-anchored /m search would match a `# ...` line inside a fenced code
+  // block (e.g. a shell comment) and set body to everything after it, silently
+  // dropping the whole note above it. Anchoring to the start keeps all content.
+  const h1Match = remaining.match(/^\s*(#[ \t]+.+?)(\r?\n|$)/);
   let h1: string | null = null;
   let body = remaining;
 
   if (h1Match) {
     h1 = h1Match[1];
-    // Get everything after the H1 (including the newline after it)
-    const h1EndIndex = remaining.indexOf(h1Match[0]) + h1Match[0].length;
-    body = remaining.substring(h1EndIndex);
+    // Everything after the matched leading H1 line becomes the body.
+    body = remaining.substring(h1Match[0].length);
   }
 
   return { frontmatter, h1, body };
@@ -4264,7 +4285,7 @@ async function runConflictCascade(opts: {
  * Merge local content with cloud content
  * Strategy: Cloud's H1 wins (Noesis edits), Local's body wins (local edits)
  */
-function mergeContent(localContent: string, cloudContent: string): string {
+export function mergeContent(localContent: string, cloudContent: string): string {
   const localParsed = parseMarkdownStructure(localContent);
   const cloudParsed = parseMarkdownStructure(cloudContent);
 
