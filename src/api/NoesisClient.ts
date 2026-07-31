@@ -9,6 +9,8 @@ import crypto from 'crypto';
 import os from 'os';
 import path from 'path';
 import type { ResolverContext } from '../resolve/noteRef.js';
+import type { ExamData } from '../tools/exam/types.js';
+import { buildExamMarkdown } from '../tools/exam/examNoteTemplate.js';
 
 // ============================================================
 // Cross-platform OS detection (phase32)
@@ -909,6 +911,64 @@ export class NoesisClient {
 
   async logSyncOperation(options: SyncLogOptions): Promise<void> {
     await this.request('POST', '/api/mcp/sync/log', options);
+  }
+
+  // ============================================
+  // EXAMS
+  // ============================================
+
+  /**
+   * Create a real, DB-backed exam note (fillable answer markers + hidden
+   * answer key in exam_notes, gradeable via POST /:id/exam/grade) from a
+   * hand-authored ExamData object. Renders markdown+anchors locally via the
+   * ported buildExamMarkdown so they can never drift from what the backend
+   * expects.
+   *
+   * Deliberately does NOT go through the generic `request<T>()` helper: on a
+   * 422 (malformed examData, per the backend's validateExamData gate) that
+   * helper only forwards `error`, silently dropping `retryHint`/`rawSample` —
+   * exactly the actionable feedback a caller needs to fix and retry. Folds
+   * both into the thrown Error's message instead.
+   */
+  async createExamFromData(examData: ExamData): Promise<{
+    noteId: number;
+    questionMarks: Record<string, number | number[]>;
+    nameMarkId: number;
+  }> {
+    const { markdown, anchors } = buildExamMarkdown(examData);
+    const url = `${this.baseUrl}/api/notes/from-exam`;
+
+    const response = await fetch(url, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${this.apiToken}`,
+        'Content-Type': 'application/json',
+        'X-Client-OS': CLIENT_OS,
+      },
+      body: JSON.stringify({ examData, markdown, anchors }),
+    });
+
+    const responseBody = await response.json().catch(() => ({})) as {
+      error?: string;
+      retryHint?: string;
+      rawSample?: string;
+      noteId?: number;
+      questionMarks?: Record<string, number | number[]>;
+      nameMarkId?: number;
+    };
+
+    if (!response.ok) {
+      const parts = [responseBody.error || `HTTP ${response.status}: ${response.statusText}`];
+      if (responseBody.retryHint) parts.push(`Retry hint: ${responseBody.retryHint}`);
+      if (responseBody.rawSample) parts.push(`Raw sample: ${responseBody.rawSample}`);
+      throw new Error(parts.join(' — '));
+    }
+
+    return {
+      noteId: responseBody.noteId as number,
+      questionMarks: responseBody.questionMarks ?? {},
+      nameMarkId: responseBody.nameMarkId as number,
+    };
   }
 
   // ============================================
