@@ -152,6 +152,8 @@ async function executeJob(cfg: AgentConfig, job: ClaimedJob, sink: EventSink): P
     throw new Error('Install @anthropic-ai/claude-agent-sdk to run the Noesis local agent (real mode).');
   });
   let finalText = '';
+  let sawDelta = false;
+  let terminalText = '';
   const stream = sdk.query({
     prompt,
     options: {
@@ -161,24 +163,51 @@ async function executeJob(cfg: AgentConfig, job: ClaimedJob, sink: EventSink): P
       includePartialMessages: true,
     },
   });
+  // With includePartialMessages the stream carries BOTH incremental `stream_event`
+  // deltas AND a terminal `assistant` message holding the whole reply. Taking both
+  // would emit the answer twice, so deltas win and the terminal message is only a
+  // fallback for a stream that produced none (older SDK, or partials unsupported).
   for await (const message of stream) {
     if (sink.isClosed()) break;
-    // Extract assistant text deltas. The SDK surfaces streamed text on assistant
-    // messages; shapes vary by version, so pull text defensively.
-    const text = extractText(message);
-    if (text) {
-      sink.push(text);
-      finalText += text;
+    const delta = extractStreamDelta(message);
+    if (delta) {
+      sawDelta = true;
+      sink.push(delta);
+      finalText += delta;
+      continue;
     }
+    const whole = extractTerminalText(message);
+    if (whole) terminalText = whole;
+  }
+  if (!sawDelta && terminalText) {
+    sink.push(terminalText);
+    finalText = terminalText;
   }
   return finalText;
 }
 
-function extractText(message: unknown): string {
+/**
+ * Text carried by one streamed partial. Verified against the SDK (0.1.x): partials
+ * arrive as `{type:'stream_event', event:{type:'content_block_delta',
+ * delta:{type:'text_delta', text}}}`. The un-enveloped shape is accepted too, since
+ * this is the field older versions used.
+ */
+function extractStreamDelta(message: unknown): string {
   if (!message || typeof message !== 'object') return '';
   const m = message as Record<string, any>;
+  if (m.type !== 'stream_event') return '';
+  const ev = m.event;
+  if (ev?.type === 'content_block_delta' && typeof ev?.delta?.text === 'string') return ev.delta.text;
+  if (typeof m.delta?.text === 'string') return m.delta.text;
+  return '';
+}
+
+/** Whole-reply text from the terminal assistant message. Never combined with deltas. */
+function extractTerminalText(message: unknown): string {
+  if (!message || typeof message !== 'object') return '';
+  const m = message as Record<string, any>;
+  if (m.type === 'stream_event' || m.type === 'system' || m.type === 'result') return '';
   if (typeof m.text === 'string') return m.text;
-  if (m.delta && typeof m.delta.text === 'string') return m.delta.text;
   const content = m.message?.content ?? m.content;
   if (Array.isArray(content)) {
     return content.map((b: any) => (typeof b?.text === 'string' ? b.text : '')).join('');
