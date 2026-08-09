@@ -1,6 +1,6 @@
 {
   "name": "@noesis-brain/mcp-server",
-  "version": "2.1.0",
+  "version": "2.1.1",
   "description": "Official MCP server for Noesis — the markdown notes manager for Claude Code. Search, sync, and manage your .md knowledge base via 19 AI-powered tools.",
   "type": "module",
   "main": "dist/index.js",
@@ -19,7 +19,8 @@
     "build": "tsc",
     "start": "node dist/index.js",
     "dev": "tsx watch src/index.ts",
-    "test": "vitest run"
+    "test": "vitest run",
+    "prepublishOnly": "npm run build"
   },
   "keywords": [
     "mcp",
