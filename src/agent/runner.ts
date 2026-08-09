@@ -14,6 +14,8 @@
  * instead of the subscription — so we delete it (and warn) before any query().
  */
 
+import { fileURLToPath } from 'node:url';
+
 const POLL_INTERVAL_MS = 2000;      // idle poll cadence
 const CHUNK_FLUSH_MS = 500;         // batch streamed deltas before POST /events
 const KEEPALIVE_MS = 30_000;        // hold the lease during quiet stretches (< server's 120s stale)
@@ -51,6 +53,57 @@ interface JobPayload {
   system?: string;
   allowedTools?: string[];
   maxTurns?: number;
+}
+
+/**
+ * The ONLY tools the server may pre-approve — a literal allowlist, not a namespace
+ * prefix. Everything named here runs under this machine's ambient Claude Code login
+ * with no further prompt, so the boundary must be the exact set, not `mcp__noesis__*`:
+ * that namespace also contains mutating tools (`pull_notes` writes to an arbitrary
+ * local path with an overwrite flag, `add_root` + `sync_notes` ingest local files),
+ * which would hand a compromised server a filesystem primitive it otherwise lacks.
+ * Read-only Noesis lookups only.
+ */
+const ALLOWED_TOOLS = new Set([
+  'mcp__noesis__search_notes',
+  'mcp__noesis__search_semantic',
+  'mcp__noesis__get_note',
+  'mcp__noesis__list_notes',
+]);
+
+/** Highest turn budget a server may request; a tool loop otherwise burns the subscription. */
+const MAX_TURNS_CEILING = 12;
+
+/** Drop anything the server asked for that is not on the read-only allowlist. */
+export function clampAllowedTools(raw: unknown): string[] {
+  if (!Array.isArray(raw)) return [];
+  const kept = raw.filter((t): t is string => typeof t === 'string' && ALLOWED_TOOLS.has(t));
+  const dropped = (raw as unknown[]).length - kept.length;
+  if (dropped > 0) console.error(`[noesis-agent] dropped ${dropped} tool name(s) not on the read-only allowlist`);
+  return kept;
+}
+
+/** Clamp the server-requested turn budget into a sane range. */
+export function clampMaxTurns(raw: unknown): number {
+  const n = typeof raw === 'number' && Number.isFinite(raw) ? Math.floor(raw) : 1;
+  if (n < 1) return 1;
+  return Math.min(n, MAX_TURNS_CEILING);
+}
+
+/**
+ * MCP server config for the tools above, built from the daemon's OWN config —
+ * deliberately never from the job payload, so the server cannot point the model
+ * at a different endpoint or hand it a different token.
+ */
+function noesisMcpServers(cfg: AgentConfig): Record<string, unknown> {
+  const entry = fileURLToPath(new URL('../index.js', import.meta.url));
+  return {
+    noesis: {
+      command: process.execPath,
+      args: [entry],
+      env: { ...process.env, NOESIS_API_TOKEN: cfg.apiToken, NOESIS_API_URL: cfg.apiBaseUrl },
+    },
+  };
 }
 
 async function api(cfg: AgentConfig, path: string, body: unknown): Promise<Response> {
@@ -154,12 +207,15 @@ async function executeJob(cfg: AgentConfig, job: ClaimedJob, sink: EventSink): P
   let finalText = '';
   let sawDelta = false;
   let terminalText = '';
+  const allowedTools = clampAllowedTools(job.payload.allowedTools);
   const stream = sdk.query({
     prompt,
     options: {
       ...(job.payload.system ? { systemPrompt: job.payload.system } : {}),
-      allowedTools: job.payload.allowedTools ?? [],
-      maxTurns: job.payload.maxTurns ?? 1,
+      allowedTools,
+      // Only spawn the Noesis MCP server when a tool actually survived clamping.
+      ...(allowedTools.length > 0 ? { mcpServers: noesisMcpServers(cfg) } : {}),
+      maxTurns: clampMaxTurns(job.payload.maxTurns),
       includePartialMessages: true,
     },
   });
@@ -176,8 +232,10 @@ async function executeJob(cfg: AgentConfig, job: ClaimedJob, sink: EventSink): P
       finalText += delta;
       continue;
     }
+    // Concatenate, don't overwrite: with tools the run is multi-turn, and a
+    // stream that produced no deltas would otherwise keep only the LAST turn.
     const whole = extractTerminalText(message);
-    if (whole) terminalText = whole;
+    if (whole) terminalText += whole;
   }
   if (!sawDelta && terminalText) {
     sink.push(terminalText);
