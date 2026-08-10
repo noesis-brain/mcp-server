@@ -14,6 +14,7 @@
  * instead of the subscription — so we delete it (and warn) before any query().
  */
 
+import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 
 const POLL_INTERVAL_MS = 2000;      // idle poll cadence
@@ -114,8 +115,22 @@ async function api(cfg: AgentConfig, path: string, body: unknown): Promise<Respo
   });
 }
 
+/**
+ * This daemon's own package version, reported at claim time so the server can
+ * refuse to hand a job to a build too old for what that job needs. Read from
+ * package.json rather than hard-coded, so a release cannot forget to bump it.
+ */
+export function agentVersion(): string {
+  try {
+    const pkg = fileURLToPath(new URL('../../package.json', import.meta.url));
+    return JSON.parse(readFileSync(pkg, 'utf8')).version ?? '0.0.0';
+  } catch {
+    return '0.0.0';
+  }
+}
+
 async function claim(cfg: AgentConfig, workerId: string): Promise<ClaimedJob | null> {
-  const res = await api(cfg, '/api/agent/jobs/claim', { workerId });
+  const res = await api(cfg, '/api/agent/jobs/claim', { workerId, agentVersion: agentVersion() });
   if (!res.ok) return null;
   const data = (await res.json()) as { job: ClaimedJob | null };
   return data.job ?? null;
