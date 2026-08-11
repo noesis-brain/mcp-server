@@ -3856,6 +3856,21 @@ function parseCloudKeywords(keywords: string | string[] | null): string[] {
 }
 
 /**
+ * Serialize a single frontmatter scalar (title/description) via js-yaml so values
+ * containing YAML-significant characters (colons, quotes, etc.) round-trip safely.
+ * lineWidth: -1 disables js-yaml's 80-col folding, which would otherwise turn long
+ * values into a multi-line `>-` block instead of keeping the one-line-per-field style.
+ */
+function yamlScalarLine(key: string, value: string): string {
+  return yaml.dump({ [key]: value }, { lineWidth: -1 }).trimEnd();
+}
+
+/** Serialize a frontmatter list (keywords) the same way, one array entry per line. */
+function yamlListLines(key: string, items: string[]): string[] {
+  return yaml.dump({ [key]: items }, { lineWidth: -1 }).trimEnd().split('\n');
+}
+
+/**
  * Update frontmatter in file content with new metadata values
  * Preserves existing frontmatter structure and only updates specified fields
  */
@@ -3872,13 +3887,10 @@ export function updateFrontmatter(
       return content;
     }
     const frontmatterLines = ['---'];
-    if (updates.title) frontmatterLines.push(`title: ${updates.title}`);
-    if (updates.description) frontmatterLines.push(`description: ${updates.description}`);
+    if (updates.title) frontmatterLines.push(yamlScalarLine('title', updates.title));
+    if (updates.description) frontmatterLines.push(yamlScalarLine('description', updates.description));
     if (updates.keywords && updates.keywords.length > 0) {
-      frontmatterLines.push('keywords:');
-      for (const kw of updates.keywords) {
-        frontmatterLines.push(`  - ${kw}`);
-      }
+      frontmatterLines.push(...yamlListLines('keywords', updates.keywords));
     }
     frontmatterLines.push('---');
     return frontmatterLines.join('\n') + '\n' + content;
@@ -3913,22 +3925,19 @@ export function updateFrontmatter(
 
     if (key === 'title' && updates.title !== undefined) {
       if (!updatedKeys.has('title')) {
-        newLines.push(`title: ${updates.title}`);
+        newLines.push(yamlScalarLine('title', updates.title));
         updatedKeys.add('title');
       }
       lastReplacedKey = 'title';
     } else if (key === 'description' && updates.description !== undefined) {
       if (!updatedKeys.has('description')) {
-        newLines.push(`description: ${updates.description}`);
+        newLines.push(yamlScalarLine('description', updates.description));
         updatedKeys.add('description');
       }
       lastReplacedKey = 'description';
     } else if ((key === 'keywords' || key === 'tags') && updates.keywords !== undefined) {
       if (!updatedKeys.has('keywords')) {
-        newLines.push('keywords:');
-        for (const kw of updates.keywords) {
-          newLines.push(`  - ${kw}`);
-        }
+        newLines.push(...yamlListLines('keywords', updates.keywords));
         updatedKeys.add('keywords');
       }
       lastReplacedKey = 'keywords';
@@ -3940,16 +3949,13 @@ export function updateFrontmatter(
 
   // Add any new keys that weren't in original frontmatter
   if (updates.title !== undefined && !updatedKeys.has('title')) {
-    newLines.push(`title: ${updates.title}`);
+    newLines.push(yamlScalarLine('title', updates.title));
   }
   if (updates.description !== undefined && !updatedKeys.has('description')) {
-    newLines.push(`description: ${updates.description}`);
+    newLines.push(yamlScalarLine('description', updates.description));
   }
   if (updates.keywords !== undefined && !updatedKeys.has('keywords')) {
-    newLines.push('keywords:');
-    for (const kw of updates.keywords) {
-      newLines.push(`  - ${kw}`);
-    }
+    newLines.push(...yamlListLines('keywords', updates.keywords));
   }
 
   return '---\n' + newLines.filter(l => l.trim() !== '').join('\n') + '\n---\n' + bodyContent;

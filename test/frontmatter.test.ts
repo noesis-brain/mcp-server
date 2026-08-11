@@ -90,7 +90,8 @@ describe('markdown sync helpers', () => {
     const note = '---\ntitle: Old\nkeywords:\n  - x\n---\n## Heading\nbody line 1\nbody line 2';
     const updated = updateFrontmatter(note, { title: 'New', keywords: ['y', 'z'] });
     expect(updated).toContain('title: New');
-    expect(updated).toContain('- y');
+    // js-yaml quotes the bare 'y' (YAML 1.1 boolean-like token) to keep it a string on re-parse.
+    expect(updated).toContain("- 'y'");
     expect(updated).toContain('## Heading');
     expect(updated).toContain('body line 1');
     expect(updated).toContain('body line 2');
