@@ -54,6 +54,7 @@ interface JobPayload {
   system?: string;
   allowedTools?: string[];
   maxTurns?: number;
+  images?: Array<{ mimeType: string; data: string }>;
 }
 
 /**
@@ -193,12 +194,68 @@ class EventSink {
 }
 
 /**
+ * One Anthropic content block — a plain-text piece or a base64 image, the same
+ * shape the SSE path's formatClaudeContent() already builds (main repo,
+ * services/chatContextComposer.ts). Reimplemented here rather than imported: this
+ * submodule cannot import from the main repo it is published independently of.
+ */
+type ContentBlock =
+  | { type: 'text'; text: string }
+  | { type: 'image'; source: { type: 'base64'; media_type: string; data: string } };
+
+/**
+ * `sdk.query()`'s `prompt` accepts a plain string OR an AsyncIterable<SDKUserMessage>
+ * (verified directly against the shipped SDK, @anthropic-ai/claude-agent-sdk@0.1.77,
+ * sdk.mjs) — the string branch is sugar that constructs exactly this one-message shape
+ * itself before writing it to the transport, and the iterable branch goes through the
+ * identical Query.streamInput(), which writes each yielded message then closes stdin
+ * once the iterable ends. A generator yielding one message and returning is therefore
+ * not a workaround; it is what the SDK already does for a plain string, generalized to
+ * carry image content — which the string form has no structural room for.
+ */
+export async function* singleUserMessage(content: ContentBlock[]): AsyncGenerator<unknown> {
+  yield {
+    type: 'user',
+    session_id: '',
+    message: { role: 'user', content },
+    parent_tool_use_id: null,
+  };
+}
+
+/** Images first, text last — matches formatClaudeContent()'s ordering. */
+export function buildImageContent(prompt: string, images: Array<{ mimeType: string; data: string }>): ContentBlock[] {
+  const blocks: ContentBlock[] = images.map((img) => ({
+    type: 'image',
+    source: { type: 'base64', media_type: img.mimeType, data: img.data },
+  }));
+  // Claude requires at least one content block; an image-only send still needs text.
+  blocks.push({ type: 'text', text: prompt || '(Image attached)' });
+  return blocks;
+}
+
+/**
+ * What `prompt` executeJob passes into sdk.query() — extracted so the branch
+ * decision (and its two shapes) is directly testable without mocking the dynamic
+ * SDK import. Kept conditional on `images` rather than switching every job onto
+ * the generator form, to minimize the diff's blast radius on the far more common
+ * text-only case even though the underlying SDK mechanism is confirmed equivalent.
+ */
+export function buildSdkPrompt(
+  prompt: string,
+  images: Array<{ mimeType: string; data: string }> | undefined,
+): string | AsyncGenerator<unknown> {
+  if (images && images.length > 0) return singleUserMessage(buildImageContent(prompt, images));
+  return prompt;
+}
+
+/**
  * Execute a claimed job and stream its output through the sink. Returns the final
  * text. Real mode runs the Claude Agent SDK on the user's subscription; fake mode
  * emits a canned response so the queue plumbing can be verified without a login.
  */
 async function executeJob(cfg: AgentConfig, job: ClaimedJob, sink: EventSink): Promise<string> {
   const prompt = job.payload.prompt ?? `(${job.kind} job with empty prompt)`;
+  const images = job.payload.images;
 
   if (cfg.fake) {
     const canned = `Noesis local agent (fake mode) processed a "${job.kind}" job. Prompt was: ${prompt.slice(0, 80)}`;
@@ -224,7 +281,7 @@ async function executeJob(cfg: AgentConfig, job: ClaimedJob, sink: EventSink): P
   let terminalText = '';
   const allowedTools = clampAllowedTools(job.payload.allowedTools);
   const stream = sdk.query({
-    prompt,
+    prompt: buildSdkPrompt(prompt, images),
     options: {
       ...(job.payload.system ? { systemPrompt: job.payload.system } : {}),
       allowedTools,
