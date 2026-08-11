@@ -363,6 +363,14 @@ async function runJob(cfg: AgentConfig, job: ClaimedJob): Promise<void> {
   }
 }
 
+/**
+ * The daemon's startup banner line — pulled out of runAgentDaemon() so the printed
+ * version string is directly unit-testable without starting the real (infinite) loop.
+ */
+export function startupBanner(cfg: AgentConfig): string {
+  return `[noesis-agent] v${agentVersion()} started (concurrency=${cfg.concurrency}${cfg.fake ? ', FAKE mode' : ''}) → ${cfg.apiBaseUrl}`;
+}
+
 /** Run the daemon loop until aborted. */
 export async function runAgentDaemon(cfg: AgentConfig, signal?: AbortSignal): Promise<void> {
   // Footgun guard: keep billing on the subscription, not the metered API.
@@ -370,7 +378,7 @@ export async function runAgentDaemon(cfg: AgentConfig, signal?: AbortSignal): Pr
     console.error('[noesis-agent] WARNING: ANTHROPIC_API_KEY is set — unsetting it so the Claude Agent SDK uses your subscription, not the metered API.');
     delete process.env.ANTHROPIC_API_KEY;
   }
-  console.error(`[noesis-agent] started (concurrency=${cfg.concurrency}${cfg.fake ? ', FAKE mode' : ''}) → ${cfg.apiBaseUrl}`);
+  console.error(startupBanner(cfg));
 
   const workers = Array.from({ length: cfg.concurrency }, (_, i) => workerLoop(cfg, `worker-${i + 1}`, signal));
   await Promise.all(workers);
