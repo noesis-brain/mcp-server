@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { clampAllowedTools, clampMaxTurns, buildQueryOptions } from '../src/agent/runner.js';
+import { clampAllowedTools, clampMaxTurns, buildQueryOptions, buildCanUseTool } from '../src/agent/runner.js';
 
 /**
  * This is the SECURITY BOUNDARY for the local agent daemon.
@@ -124,8 +124,14 @@ describe('buildQueryOptions — the built-in tool set is always suppressed', () 
       const payload: Record<string, unknown> = {};
       fields.forEach(([k, v], i) => { if (mask & (1 << i)) payload[k] = v; });
       const opts = buildQueryOptions(payload as Parameters<typeof buildQueryOptions>[0], noMcp);
+      // Assert EVERY security-relevant option here, not just one of them. This loop has
+      // now caught the same defect three times, each on a field the previous fix forgot:
+      // `system`, then `prompt`/`images`/omission, then `canUseTool` keyed on `maxTurns`
+      // (which every real job carries, so the gate would vanish from 100% of traffic).
+      // Adding a security-relevant option to buildQueryOptions means adding it HERE.
       expect({ mask, tools: opts.tools }).toEqual({ mask, tools: [] });
       expect({ mask, has: 'tools' in opts }).toEqual({ mask, has: true });
+      expect({ mask, gate: typeof opts.canUseTool }).toEqual({ mask, gate: 'function' });
     }
   });
 
@@ -154,5 +160,68 @@ describe('buildQueryOptions — the built-in tool set is always suppressed', () 
   it('passes the composed system prompt through untouched, and omits it when absent', () => {
     expect(buildQueryOptions({ system: 'You are Nancy.' }, noMcp).systemPrompt).toBe('You are Nancy.');
     expect('systemPrompt' in buildQueryOptions({}, noMcp)).toBe(false);
+  });
+});
+
+/**
+ * The SECOND layer. `tools: []` depends on how the CLI handles `--tools ""`, which lives
+ * in a minified bundle we cannot audit; this callback is a gate the daemon owns outright.
+ * It must never widen past ALLOWED_TOOLS, and it must cover subagent calls — a `Task`
+ * subagent, not the main loop, performed the file reads in the 2026-08-14 incident.
+ */
+describe('buildCanUseTool — the daemon-owned permission gate', () => {
+  const silent = () => {};
+
+  it('allows exactly the four read-only Noesis lookups', async () => {
+    const gate = buildCanUseTool(silent);
+    for (const t of [
+      'mcp__noesis__search_notes',
+      'mcp__noesis__search_semantic',
+      'mcp__noesis__get_note',
+      'mcp__noesis__list_notes',
+    ]) {
+      expect({ t, behavior: (await gate(t, {})).behavior }).toEqual({ t, behavior: 'allow' });
+    }
+  });
+
+  it('denies every built-in that grants shell, file or network access', async () => {
+    const gate = buildCanUseTool(silent);
+    for (const t of ['Bash', 'Read', 'Write', 'Edit', 'Grep', 'Glob', 'Task', 'WebFetch', 'WebSearch', 'NotebookEdit']) {
+      const d = await gate(t, {});
+      expect({ t, behavior: d.behavior }).toEqual({ t, behavior: 'deny' });
+    }
+  });
+
+  it('denies the MUTATING Noesis tools even though they share the namespace', async () => {
+    const gate = buildCanUseTool(silent);
+    for (const t of ['mcp__noesis__pull_notes', 'mcp__noesis__sync_notes', 'mcp__noesis__add_root']) {
+      expect({ t, behavior: (await gate(t, {})).behavior }).toEqual({ t, behavior: 'deny' });
+    }
+  });
+
+  it('passes the original input through on allow, and names the tool on deny', async () => {
+    const gate = buildCanUseTool(silent);
+    const allow = await gate('mcp__noesis__get_note', { id: 42 });
+    expect(allow).toEqual({ behavior: 'allow', updatedInput: { id: 42 } });
+    const deny = await gate('Bash', { command: 'rm -rf /' });
+    expect(deny.behavior).toBe('deny');
+    expect((deny as { message: string }).message).toContain('Bash');
+  });
+
+  it('reports the agentID so SUBAGENT tool calls are observable, not just main-loop ones', async () => {
+    const seen: Array<[string, boolean, string | undefined]> = [];
+    const gate = buildCanUseTool((t, allowed, agentID) => seen.push([t, allowed, agentID]));
+    await gate('Bash', { command: 'ls' }, { agentID: 'agent-abc123' });
+    await gate('mcp__noesis__get_note', {}, { agentID: 'agent-abc123' });
+    expect(seen).toEqual([
+      ['Bash', false, 'agent-abc123'],
+      ['mcp__noesis__get_note', true, 'agent-abc123'],
+    ]);
+  });
+
+  it('is wired into every query, for every payload shape', () => {
+    const noMcp = () => ({});
+    expect(typeof buildQueryOptions({}, noMcp).canUseTool).toBe('function');
+    expect(typeof buildQueryOptions({ prompt: 'x', system: 'y' }, noMcp).canUseTool).toBe('function');
   });
 });

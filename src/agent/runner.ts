@@ -248,6 +248,47 @@ export function buildSdkPrompt(
   return prompt;
 }
 
+/** What the SDK expects back from a canUseTool decision. */
+type PermissionDecision =
+  | { behavior: 'allow'; updatedInput: Record<string, unknown> }
+  | { behavior: 'deny'; message: string };
+
+/**
+ * SECOND, INDEPENDENT LAYER on the tool boundary.
+ *
+ * `tools: []` below is the primary control, but it works by way of the CLI's `--tools ""`
+ * flag, whose handling lives in a minified `cli.js` we cannot audit. This callback is a
+ * gate we own outright: the SDK routes every permission request through it
+ * (`--permission-prompt-tool stdio`), and the request carries an `agentID`, so calls made
+ * by a spawned `Task` SUBAGENT are covered too — which matters, because a subagent, not
+ * the main loop, did the file reading in the 2026-08-14 incident.
+ *
+ * Deliberately reuses ALLOWED_TOOLS so the daemon has ONE definition of what may run.
+ *
+ * KNOWN LIMIT, measured not assumed: a permission-prompt tool is only consulted for calls
+ * that actually require permission, and Claude Code auto-approves the read-only built-ins.
+ * If those never reach this callback, `tools: []` is still doing all the work. See AC4 in
+ * LOOP-STATE.md for the measured result — do not claim defence-in-depth without it.
+ */
+export function buildCanUseTool(
+  onDecision: (toolName: string, allowed: boolean, agentID?: string) => void = logToolDecision,
+): (toolName: string, input?: unknown, ctx?: { agentID?: string }) => Promise<PermissionDecision> {
+  return async (toolName, input, ctx) => {
+    const allowed = ALLOWED_TOOLS.has(toolName);
+    onDecision(toolName, allowed, ctx?.agentID);
+    return allowed
+      ? { behavior: 'allow', updatedInput: (input ?? {}) as Record<string, unknown> }
+      : { behavior: 'deny', message: `Tool "${toolName}" is not permitted for a Noesis job.` };
+  };
+}
+
+/** Default sink: stderr, so the daemon log is the evidence for whether the gate ever fires. */
+function logToolDecision(toolName: string, allowed: boolean, agentID?: string): void {
+  console.error(
+    `[noesis-agent] canUseTool ${allowed ? 'ALLOW' : 'DENY'} ${toolName}${agentID ? ` (agent=${agentID})` : ''}`,
+  );
+}
+
 /**
  * The `options` object handed to sdk.query() — extracted, like buildSdkPrompt above, so
  * the tool boundary is asserted by a test instead of resting on a comment. `tools: []`
@@ -273,6 +314,8 @@ export function buildQueryOptions(
     // primitive. MCP tools travel a separate channel (`--mcp-config`) and are
     // unaffected: a `use_knowledge_base` Navi still calls search_notes (verified).
     tools: [],
+    // Independent second layer — see buildCanUseTool. Covers subagent (`Task`) calls too.
+    canUseTool: buildCanUseTool(),
     allowedTools,
     // Only spawn the Noesis MCP server when a tool actually survived clamping.
     ...(allowedTools.length > 0 ? { mcpServers: mcpServersFor() } : {}),
