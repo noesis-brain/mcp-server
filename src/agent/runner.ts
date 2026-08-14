@@ -249,6 +249,39 @@ export function buildSdkPrompt(
 }
 
 /**
+ * The `options` object handed to sdk.query() — extracted, like buildSdkPrompt above, so
+ * the tool boundary is asserted by a test instead of resting on a comment. `tools: []`
+ * is the security-relevant field: see the note at its assignment. Takes the MCP-server
+ * factory as an argument so a test can supply a stub instead of a real spawn config.
+ */
+export function buildQueryOptions(
+  payload: JobPayload,
+  mcpServersFor: () => Record<string, unknown>,
+): Record<string, unknown> {
+  const allowedTools = clampAllowedTools(payload.allowedTools);
+  return {
+    ...(payload.system ? { systemPrompt: payload.system } : {}),
+    // Suppress the SDK's built-in tool set entirely (`--tools ""`). Without it the CLI
+    // defaults to ALL built-ins — Bash, Read, Write, Edit, Grep, WebSearch — and
+    // ALLOWED_TOOLS above does NOT stop them: `allowedTools` is a PERMISSION allowlist,
+    // so unlisted tools are un-pre-approved, not absent, and their definitions still
+    // reach the model. Worse, the read-only built-ins need no approval at all, so they
+    // actually EXECUTE headless: on 2026-08-14 an English-coach Navi grepped this
+    // daemon's cwd and returned ~100 strings from the user's source tree (jobs 527/528);
+    // only the follow-up file Write stopped, at the permission gate. Unconditional by
+    // design — a server-supplied payload must never be able to ask for a filesystem
+    // primitive. MCP tools travel a separate channel (`--mcp-config`) and are
+    // unaffected: a `use_knowledge_base` Navi still calls search_notes (verified).
+    tools: [],
+    allowedTools,
+    // Only spawn the Noesis MCP server when a tool actually survived clamping.
+    ...(allowedTools.length > 0 ? { mcpServers: mcpServersFor() } : {}),
+    maxTurns: clampMaxTurns(payload.maxTurns),
+    includePartialMessages: true,
+  };
+}
+
+/**
  * Execute a claimed job and stream its output through the sink. Returns the final
  * text. Real mode runs the Claude Agent SDK on the user's subscription; fake mode
  * emits a canned response so the queue plumbing can be verified without a login.
@@ -279,17 +312,9 @@ async function executeJob(cfg: AgentConfig, job: ClaimedJob, sink: EventSink): P
   let finalText = '';
   let sawDelta = false;
   let terminalText = '';
-  const allowedTools = clampAllowedTools(job.payload.allowedTools);
   const stream = sdk.query({
     prompt: buildSdkPrompt(prompt, images),
-    options: {
-      ...(job.payload.system ? { systemPrompt: job.payload.system } : {}),
-      allowedTools,
-      // Only spawn the Noesis MCP server when a tool actually survived clamping.
-      ...(allowedTools.length > 0 ? { mcpServers: noesisMcpServers(cfg) } : {}),
-      maxTurns: clampMaxTurns(job.payload.maxTurns),
-      includePartialMessages: true,
-    },
+    options: buildQueryOptions(job.payload, () => noesisMcpServers(cfg)),
   });
   // With includePartialMessages the stream carries BOTH incremental `stream_event`
   // deltas AND a terminal `assistant` message holding the whole reply. Taking both

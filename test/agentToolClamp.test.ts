@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { clampAllowedTools, clampMaxTurns } from '../src/agent/runner.js';
+import { clampAllowedTools, clampMaxTurns, buildQueryOptions } from '../src/agent/runner.js';
 
 /**
  * This is the SECURITY BOUNDARY for the local agent daemon.
@@ -73,5 +73,86 @@ describe('clampMaxTurns — a server cannot burn the subscription in a tool loop
 
   it('passes a sane request through', () => {
     expect(clampMaxTurns(6)).toBe(6);
+  });
+});
+
+/**
+ * The OTHER half of the boundary, and the one that was missing until 2026-08-14.
+ *
+ * clampAllowedTools decides what is PRE-APPROVED; it never decided what EXISTS. With
+ * the SDK's `tools` option unset the CLI defaults to its whole built-in set, whose
+ * read-only members (Read/Grep/Glob) need no approval and therefore execute headless.
+ * A transform-only English-coach Navi used them to grep the daemon's cwd and return
+ * ~100 strings from the user's source tree (real jobs 527/528). `tools: []` is what
+ * closes that, and it must stay unconditional — no payload field may re-open it.
+ */
+describe('buildQueryOptions — the built-in tool set is always suppressed', () => {
+  const noMcp = () => ({});
+
+  it('sets tools to an empty array for a bare payload', () => {
+    expect(buildQueryOptions({}, noMcp).tools).toEqual([]);
+  });
+
+  // PRODUCTION-SHAPED payload: a real composed chat job carries `prompt` (required) and
+  // `system` (the Navi persona) — the shape of incident jobs 527/528.
+  it('still suppresses built-ins on a production-shaped payload (system + MCP tools)', () => {
+    const opts = buildQueryOptions(
+      { prompt: 'refine this', system: 'You are Nancy.', allowedTools: ['mcp__noesis__get_note'], maxTurns: 6 },
+      noMcp,
+    );
+    expect(opts.tools).toEqual([]);
+    expect(opts.allowedTools).toEqual(['mcp__noesis__get_note']);
+    expect(opts.systemPrompt).toBe('You are Nancy.');
+  });
+
+  // The invariant is "ALWAYS `[]`, for EVERY payload" — so prove it over the whole field
+  // space rather than over hand-picked shapes. Two review rounds died to this: the first
+  // suite pinned `tools` only on payloads with no `system`, the second only on payloads
+  // with `system` — both missed `prompt`, which is REQUIRED and truthy on every real job
+  // (`agentJobChat.ts` always sets it), so a mutation keyed on it would leak built-ins on
+  // 100% of jobs. Enumerating shapes loses that race every time a field is added to
+  // `JobPayload`; the power set does not.
+  it('emits tools: [] for every combination of JobPayload fields present/absent', () => {
+    const fields: Array<[string, unknown]> = [
+      ['prompt', 'refine this'],
+      ['system', 'You are Nancy.'],
+      ['allowedTools', ['mcp__noesis__get_note']],
+      ['maxTurns', 6],
+      ['images', [{ mimeType: 'image/png', data: 'AAAA' }]],
+    ];
+    for (let mask = 0; mask < 1 << fields.length; mask++) {
+      const payload: Record<string, unknown> = {};
+      fields.forEach(([k, v], i) => { if (mask & (1 << i)) payload[k] = v; });
+      const opts = buildQueryOptions(payload as Parameters<typeof buildQueryOptions>[0], noMcp);
+      expect({ mask, tools: opts.tools }).toEqual({ mask, tools: [] });
+      expect({ mask, has: 'tools' in opts }).toEqual({ mask, has: true });
+    }
+  });
+
+  it('cannot be re-opened by a hostile payload naming built-ins', () => {
+    const opts = buildQueryOptions({ system: 'persona', allowedTools: ['Bash', 'Read', 'Write'] }, noMcp);
+    expect(opts.tools).toEqual([]);
+    expect(opts.allowedTools).toEqual([]);
+  });
+
+  // `JobPayload` is a compile-time interface with no runtime schema validation, so a
+  // server-supplied payload can carry arbitrary extra fields. A `tools` key must never
+  // reach the SDK — the function's stated invariant is that a payload can never ask for
+  // a filesystem primitive.
+  it('ignores a tools field smuggled in by the payload', () => {
+    const hostile = { system: 'persona', tools: ['Bash', 'Read'] } as unknown as Parameters<typeof buildQueryOptions>[0];
+    expect(buildQueryOptions(hostile, noMcp).tools).toEqual([]);
+  });
+
+  it('spawns the MCP server only when a tool survived clamping', () => {
+    const withMcp = () => ({ noesis: { command: 'node' } });
+    expect(buildQueryOptions({ allowedTools: ['Bash'] }, withMcp).mcpServers).toBeUndefined();
+    expect(buildQueryOptions({ allowedTools: ['mcp__noesis__get_note'] }, withMcp).mcpServers)
+      .toEqual({ noesis: { command: 'node' } });
+  });
+
+  it('passes the composed system prompt through untouched, and omits it when absent', () => {
+    expect(buildQueryOptions({ system: 'You are Nancy.' }, noMcp).systemPrompt).toBe('You are Nancy.');
+    expect('systemPrompt' in buildQueryOptions({}, noMcp)).toBe(false);
   });
 });
