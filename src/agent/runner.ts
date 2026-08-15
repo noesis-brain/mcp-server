@@ -265,10 +265,26 @@ type PermissionDecision =
  *
  * Deliberately reuses ALLOWED_TOOLS so the daemon has ONE definition of what may run.
  *
- * KNOWN LIMIT, measured not assumed: a permission-prompt tool is only consulted for calls
- * that actually require permission, and Claude Code auto-approves the read-only built-ins.
- * If those never reach this callback, `tools: []` is still doing all the work. See AC4 in
- * LOOP-STATE.md for the measured result — do not claim defence-in-depth without it.
+ * DO NOT DELETE THIS AS DEAD CODE. It is the ONLY daemon-owned control over MCP tools.
+ * `tools: []` governs the SDK's BUILT-IN set and nothing else; the Noesis MCP server we
+ * spawn registers ~55 tools, and their definitions are not filtered by `allowedTools`, so
+ * the model can see and attempt every one of them — including `pull_notes`, which writes
+ * to an arbitrary local path, plus `add_root`, `sync_notes`, `trash_note`, `move_note`.
+ * For those, this callback is the whole boundary.
+ *
+ * MEASURED (30 runs, 2026-08-15), correcting an earlier comment that said the opposite:
+ * the gate DOES fire — it denied `mcp__noesis__list_roots` and `mcp__noesis__list_codebases`
+ * in real traffic, and the model received `is_error` results naming the refusal. An earlier
+ * 2-job sample saw zero firings and wrongly concluded the gate was inert; a permission tool
+ * is simply not consulted for calls that are already pre-approved, and that sample happened
+ * to exercise only pre-approved tools.
+ *
+ * KNOWN GAP, stated rather than glossed: the SDK's cache-warming sidechain
+ * (`isSidechain: true`) is a real model turn that emits genuine `Bash`/`Glob` calls against
+ * the daemon's cwd, with only the RESULT stubbed. `tools: []` does not reach it and this
+ * callback is never consulted there. Nothing executes — but that is Claude Code internal
+ * behaviour we neither own nor test, which is why the daemon is rooted at a neutral cwd
+ * (`scripts/start-agent.sh`), so the warmup probes an empty directory, not a source tree.
  */
 export function buildCanUseTool(
   /**
