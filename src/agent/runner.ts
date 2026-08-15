@@ -271,10 +271,21 @@ type PermissionDecision =
  * LOOP-STATE.md for the measured result — do not claim defence-in-depth without it.
  */
 export function buildCanUseTool(
+  /**
+   * The tools permitted for THIS job — i.e. the output of `clampAllowedTools`, not the
+   * module-wide `ALLOWED_TOOLS`. Required, deliberately: an earlier version closed over
+   * `ALLOWED_TOOLS` and so turned a per-job clamp into a union. `clampAllowedTools`
+   * narrows to (what the server asked for ∩ ALLOWED_TOOLS); the gate then re-allowed all
+   * four regardless, so a job clamped to `get_note` could still execute `search_semantic`.
+   * The sets happen to coincide for chat today, which is exactly why it would have gone
+   * unnoticed until the first job kind with a narrower allowlist.
+   */
+  permitted: Iterable<string>,
   onDecision: (toolName: string, allowed: boolean, agentID?: string) => void = logToolDecision,
 ): (toolName: string, input?: unknown, ctx?: { agentID?: string }) => Promise<PermissionDecision> {
+  const permittedSet = new Set(permitted);
   return async (toolName, input, ctx) => {
-    const allowed = ALLOWED_TOOLS.has(toolName);
+    const allowed = permittedSet.has(toolName);
     onDecision(toolName, allowed, ctx?.agentID);
     return allowed
       ? { behavior: 'allow', updatedInput: (input ?? {}) as Record<string, unknown> }
@@ -315,7 +326,7 @@ export function buildQueryOptions(
     // unaffected: a `use_knowledge_base` Navi still calls search_notes (verified).
     tools: [],
     // Independent second layer — see buildCanUseTool. Covers subagent (`Task`) calls too.
-    canUseTool: buildCanUseTool(),
+    canUseTool: buildCanUseTool(allowedTools),
     allowedTools,
     // Only spawn the Noesis MCP server when a tool actually survived clamping.
     ...(allowedTools.length > 0 ? { mcpServers: mcpServersFor() } : {}),
@@ -324,14 +335,46 @@ export function buildQueryOptions(
   };
 }
 
+/** The prompt text for a job, with the fallback used when a payload carries none. */
+export function resolveJobPrompt(payload: JobPayload, kindLabel: string): string {
+  return payload.prompt ?? `(${kindLabel} job with empty prompt)`;
+}
+
+/** The minimum of the Agent SDK this daemon uses — enough for a test to substitute a fake. */
+export interface SdkLike {
+  query(args: { prompt: unknown; options: Record<string, unknown> }): AsyncIterable<unknown>;
+}
+
+/**
+ * The ONE place the SDK is invoked. Exported so a test can pass a fake `sdk` and assert
+ * what actually reaches `query()`.
+ *
+ * This exists because of a real gap: the suite pinned `buildQueryOptions` with a
+ * power-set mutation battery, but NOTHING pinned the call. Restoring the pre-fix inline
+ * options literal here — deleting `tools: []` and `canUseTool` outright — reverted the
+ * entire tool boundary with all 79 tests still green. The builder being correct is
+ * worthless if the caller stops using it, so both the seam below and the source-fitness
+ * test in `agentToolClamp.test.ts` guard this.
+ */
+export function runSdkQuery(
+  sdk: SdkLike,
+  payload: JobPayload,
+  kindLabel: string,
+  mcpServersFor: () => Record<string, unknown>,
+): AsyncIterable<unknown> {
+  return sdk.query({
+    prompt: buildSdkPrompt(resolveJobPrompt(payload, kindLabel), payload.images),
+    options: buildQueryOptions(payload, mcpServersFor),
+  });
+}
+
 /**
  * Execute a claimed job and stream its output through the sink. Returns the final
  * text. Real mode runs the Claude Agent SDK on the user's subscription; fake mode
  * emits a canned response so the queue plumbing can be verified without a login.
  */
 async function executeJob(cfg: AgentConfig, job: ClaimedJob, sink: EventSink): Promise<string> {
-  const prompt = job.payload.prompt ?? `(${job.kind} job with empty prompt)`;
-  const images = job.payload.images;
+  const prompt = resolveJobPrompt(job.payload, job.kind);
 
   if (cfg.fake) {
     const canned = `Noesis local agent (fake mode) processed a "${job.kind}" job. Prompt was: ${prompt.slice(0, 80)}`;
@@ -355,10 +398,7 @@ async function executeJob(cfg: AgentConfig, job: ClaimedJob, sink: EventSink): P
   let finalText = '';
   let sawDelta = false;
   let terminalText = '';
-  const stream = sdk.query({
-    prompt: buildSdkPrompt(prompt, images),
-    options: buildQueryOptions(job.payload, () => noesisMcpServers(cfg)),
-  });
+  const stream = runSdkQuery(sdk, job.payload, job.kind, () => noesisMcpServers(cfg));
   // With includePartialMessages the stream carries BOTH incremental `stream_event`
   // deltas AND a terminal `assistant` message holding the whole reply. Taking both
   // would emit the answer twice, so deltas win and the terminal message is only a

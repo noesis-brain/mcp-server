@@ -1,5 +1,8 @@
 import { describe, it, expect } from 'vitest';
-import { clampAllowedTools, clampMaxTurns, buildQueryOptions, buildCanUseTool } from '../src/agent/runner.js';
+import { readFileSync, readdirSync } from 'node:fs';
+import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { clampAllowedTools, clampMaxTurns, buildQueryOptions, buildCanUseTool, runSdkQuery } from '../src/agent/runner.js';
 
 /**
  * This is the SECURITY BOUNDARY for the local agent daemon.
@@ -171,9 +174,10 @@ describe('buildQueryOptions — the built-in tool set is always suppressed', () 
  */
 describe('buildCanUseTool — the daemon-owned permission gate', () => {
   const silent = () => {};
+  const ALL4 = ['mcp__noesis__search_notes', 'mcp__noesis__search_semantic', 'mcp__noesis__get_note', 'mcp__noesis__list_notes'];
 
   it('allows exactly the four read-only Noesis lookups', async () => {
-    const gate = buildCanUseTool(silent);
+    const gate = buildCanUseTool(ALL4, silent);
     for (const t of [
       'mcp__noesis__search_notes',
       'mcp__noesis__search_semantic',
@@ -185,7 +189,7 @@ describe('buildCanUseTool — the daemon-owned permission gate', () => {
   });
 
   it('denies every built-in that grants shell, file or network access', async () => {
-    const gate = buildCanUseTool(silent);
+    const gate = buildCanUseTool(ALL4, silent);
     for (const t of ['Bash', 'Read', 'Write', 'Edit', 'Grep', 'Glob', 'Task', 'WebFetch', 'WebSearch', 'NotebookEdit']) {
       const d = await gate(t, {});
       expect({ t, behavior: d.behavior }).toEqual({ t, behavior: 'deny' });
@@ -193,14 +197,14 @@ describe('buildCanUseTool — the daemon-owned permission gate', () => {
   });
 
   it('denies the MUTATING Noesis tools even though they share the namespace', async () => {
-    const gate = buildCanUseTool(silent);
+    const gate = buildCanUseTool(ALL4, silent);
     for (const t of ['mcp__noesis__pull_notes', 'mcp__noesis__sync_notes', 'mcp__noesis__add_root']) {
       expect({ t, behavior: (await gate(t, {})).behavior }).toEqual({ t, behavior: 'deny' });
     }
   });
 
   it('passes the original input through on allow, and names the tool on deny', async () => {
-    const gate = buildCanUseTool(silent);
+    const gate = buildCanUseTool(ALL4, silent);
     const allow = await gate('mcp__noesis__get_note', { id: 42 });
     expect(allow).toEqual({ behavior: 'allow', updatedInput: { id: 42 } });
     const deny = await gate('Bash', { command: 'rm -rf /' });
@@ -210,7 +214,7 @@ describe('buildCanUseTool — the daemon-owned permission gate', () => {
 
   it('reports the agentID so SUBAGENT tool calls are observable, not just main-loop ones', async () => {
     const seen: Array<[string, boolean, string | undefined]> = [];
-    const gate = buildCanUseTool((t, allowed, agentID) => seen.push([t, allowed, agentID]));
+    const gate = buildCanUseTool(ALL4, (t, allowed, agentID) => seen.push([t, allowed, agentID]));
     await gate('Bash', { command: 'ls' }, { agentID: 'agent-abc123' });
     await gate('mcp__noesis__get_note', {}, { agentID: 'agent-abc123' });
     expect(seen).toEqual([
@@ -219,9 +223,141 @@ describe('buildCanUseTool — the daemon-owned permission gate', () => {
     ]);
   });
 
+  // The gate must be the INTERSECTION (what this job was clamped to), not the UNION of
+  // everything the daemon could ever allow. An earlier version closed over the module-wide
+  // ALLOWED_TOOLS, so a job clamped to one tool could still execute the other three. Chat
+  // happens to request all four today, which is exactly why this would have gone unnoticed.
+  it('allows only what THIS job was clamped to, not all of ALLOWED_TOOLS', async () => {
+    const opts = buildQueryOptions({ prompt: 'x', allowedTools: ['mcp__noesis__get_note'] }, () => ({}));
+    const gate = opts.canUseTool as (t: string, i?: unknown) => Promise<{ behavior: string }>;
+    expect((await gate('mcp__noesis__get_note', {})).behavior).toBe('allow');
+    for (const other of ['mcp__noesis__search_notes', 'mcp__noesis__search_semantic', 'mcp__noesis__list_notes']) {
+      expect({ other, behavior: (await gate(other, {})).behavior }).toEqual({ other, behavior: 'deny' });
+    }
+  });
+
+  // The gate must be fed the CLAMPED list, never the raw payload. Feeding it
+  // `payload.allowedTools` would let a hostile server re-approve exactly what
+  // clampAllowedTools exists to strip — `Bash`, `pull_notes` — through the second layer,
+  // defeating the first. A mutant doing this survived until this test existed.
+  it('is fed the clamped list, so a hostile payload cannot re-approve stripped tools', async () => {
+    const opts = buildQueryOptions(
+      { prompt: 'x', allowedTools: ['Bash', 'mcp__noesis__pull_notes', 'mcp__noesis__get_note'] },
+      () => ({}),
+    );
+    expect(opts.allowedTools).toEqual(['mcp__noesis__get_note']); // clamp stripped the rest
+    const gate = opts.canUseTool as (t: string, i?: unknown) => Promise<{ behavior: string }>;
+    for (const stripped of ['Bash', 'mcp__noesis__pull_notes']) {
+      expect({ stripped, behavior: (await gate(stripped, {})).behavior }).toEqual({ stripped, behavior: 'deny' });
+    }
+    expect((await gate('mcp__noesis__get_note', {})).behavior).toBe('allow');
+  });
+
+  // A job with nothing clamped in spawns no MCP server, so the correct gate denies all.
+  it('denies everything when the job was clamped to no tools at all', async () => {
+    const opts = buildQueryOptions({ prompt: 'x' }, () => ({}));
+    const gate = opts.canUseTool as (t: string, i?: unknown) => Promise<{ behavior: string }>;
+    for (const t of ['mcp__noesis__get_note', 'Bash', 'Read']) {
+      expect({ t, behavior: (await gate(t, {})).behavior }).toEqual({ t, behavior: 'deny' });
+    }
+  });
+
   it('is wired into every query, for every payload shape', () => {
     const noMcp = () => ({});
     expect(typeof buildQueryOptions({}, noMcp).canUseTool).toBe('function');
     expect(typeof buildQueryOptions({ prompt: 'x', system: 'y' }, noMcp).canUseTool).toBe('function');
+  });
+});
+
+/**
+ * THE CALL SITE, not just the builders.
+ *
+ * The previous suite pinned `buildQueryOptions` with a power-set mutation battery and
+ * still let the entire fix be reverted: nothing asserted that `executeJob` USES it, so
+ * restoring the pre-fix inline options literal removed `tools: []` and `canUseTool` with
+ * all 79 tests green. A correct builder nobody calls protects nothing.
+ *
+ * Two layers, because a unit test alone cannot pin a call site:
+ *  1. a runtime seam (`runSdkQuery`) a fake SDK can capture, and
+ *  2. a source-fitness assertion that `executeJob` delegates instead of hand-rolling.
+ */
+describe('runSdkQuery — what actually reaches sdk.query()', () => {
+  const capture = () => {
+    const seen: { args?: { prompt: unknown; options: Record<string, unknown> } } = {};
+    const sdk = {
+      query(args: { prompt: unknown; options: Record<string, unknown> }) {
+        seen.args = args;
+        return (async function* () { /* no messages */ })();
+      },
+    };
+    return { sdk, seen };
+  };
+
+  it('hands the SDK tools: [] and a canUseTool gate on a production-shaped payload', () => {
+    const { sdk, seen } = capture();
+    runSdkQuery(sdk, { prompt: 'refine this', system: 'persona', allowedTools: ['mcp__noesis__get_note'], maxTurns: 6 }, 'chat', () => ({}));
+    expect(seen.args!.options.tools).toEqual([]);
+    expect(typeof seen.args!.options.canUseTool).toBe('function');
+    expect(seen.args!.prompt).toBe('refine this');
+  });
+
+  it('suppresses built-ins for every job kind, including the non-chat kinds', () => {
+    for (const kind of ['chat', 'skim-read', 'enhance-metadata', 'study-note']) {
+      const { sdk, seen } = capture();
+      runSdkQuery(sdk, { prompt: 'x' }, kind, () => ({}));
+      expect({ kind, tools: seen.args!.options.tools }).toEqual({ kind, tools: [] });
+      expect({ kind, gate: typeof seen.args!.options.canUseTool }).toEqual({ kind, gate: 'function' });
+    }
+  });
+
+  it('falls back to a labelled prompt when the payload carries none', () => {
+    const { sdk, seen } = capture();
+    runSdkQuery(sdk, {}, 'study-note', () => ({}));
+    expect(seen.args!.prompt).toBe('(study-note job with empty prompt)');
+    expect(seen.args!.options.tools).toEqual([]);
+  });
+
+  it('still suppresses built-ins on the image path (generator prompt)', () => {
+    const { sdk, seen } = capture();
+    runSdkQuery(sdk, { prompt: 'caption', images: [{ mimeType: 'image/png', data: 'AAAA' }] }, 'chat', () => ({}));
+    expect(seen.args!.options.tools).toEqual([]);
+    expect(typeof (seen.args!.prompt as { next?: unknown }).next).toBe('function'); // generator, not a string
+  });
+});
+
+describe('source fitness — executeJob may not hand-roll SDK options', () => {
+  const stripComments = (t: string) =>
+    t.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '');
+  // Count call sites across the WHOLE source tree, not one hard-coded path: asserting on
+  // `runner.ts` alone reports "the boundary broke" if someone legitimately extracts
+  // runSdkQuery into its own module. Comments are stripped first — this file documents
+  // `sdk.query()` in three doc blocks, and a naive match counted those as calls.
+  const SRC_DIR = fileURLToPath(new URL('../src', import.meta.url));
+  const ALL_SRC = readdirSync(SRC_DIR, { recursive: true, encoding: 'utf8' })
+    .filter((f) => f.endsWith('.ts'))
+    .map((f) => stripComments(readFileSync(join(SRC_DIR, f), 'utf8')))
+    .join('\n');
+  const SRC = stripComments(readFileSync(fileURLToPath(new URL('../src/agent/runner.ts', import.meta.url)), 'utf8'));
+
+  it('calls sdk.query in exactly one place in the whole tree, and it uses the builders', () => {
+    expect(ALL_SRC.match(/sdk\.query\(/g) ?? []).toHaveLength(1);
+    expect(ALL_SRC).toMatch(/return sdk\.query\(\{/);
+    expect(ALL_SRC).toMatch(/options: buildQueryOptions\(/);
+  });
+
+  it('executeJob delegates to runSdkQuery rather than calling the SDK itself', () => {
+    const exec = SRC.slice(SRC.indexOf('async function executeJob'));
+    expect(exec.includes('async function executeJob')).toBe(true);
+    expect(exec).not.toMatch(/sdk\.query\(/);
+    // Pin the ARGUMENTS, not just the delegation. Passing a doctored payload here —
+    // `{...job.payload, allowedTools: [...ALLOWED_TOOLS]}` — re-creates the exact union
+    // defect INC-2 removed, one frame above the seam, with the whole suite green.
+    expect(exec).toMatch(/runSdkQuery\(sdk, job\.payload, job\.kind/);
+  });
+
+  it('requires an explicit permitted set — no default that silently restores the union', () => {
+    // A default (`permitted: Iterable<string> = ALLOWED_TOOLS`) makes arity 1 and quietly
+    // reinstates the widening for any caller that forgets the argument.
+    expect(buildCanUseTool.length).toBe(1);
   });
 });
