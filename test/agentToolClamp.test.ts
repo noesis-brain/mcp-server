@@ -24,6 +24,21 @@ describe('clampAllowedTools — the daemon-side allowlist', () => {
     expect(clampAllowedTools(ok)).toEqual(ok);
   });
 
+  // Cardinality, not just membership. The tests below enumerate names they expect to be
+  // REJECTED, so the allowlist could be widened with any name nobody thought to enumerate
+  // (`mcp__noesis__delete_navi`, `create_navi`, `LS`, …) and stay green. The MCP server
+  // registers ~55 tools; a 6-name deny list is not a boundary. Pin the size.
+  it('permits exactly four tools — the set cannot be widened unnoticed', () => {
+    const everyRealTool = [
+      'mcp__noesis__search_notes', 'mcp__noesis__search_semantic', 'mcp__noesis__get_note',
+      'mcp__noesis__list_notes', 'mcp__noesis__list_roots', 'mcp__noesis__list_codebases',
+      'mcp__noesis__delete_navi', 'mcp__noesis__create_navi', 'mcp__noesis__update_relations',
+      'mcp__noesis__pull_notes', 'mcp__noesis__sync_notes', 'mcp__noesis__add_root',
+      'Bash', 'Read', 'Write', 'Edit', 'Glob', 'Grep', 'LS', 'Task', 'WebFetch', 'WebSearch',
+    ];
+    expect(clampAllowedTools(everyRealTool)).toHaveLength(4);
+  });
+
   it('drops built-in tools that would grant shell, file or network access', () => {
     const attack = ['Bash', 'Write', 'Edit', 'Read', 'WebFetch', 'Task', 'NotebookEdit', 'Bash(rm -rf /)'];
     expect(clampAllowedTools(attack)).toEqual([]);
@@ -151,6 +166,25 @@ describe('buildQueryOptions — the built-in tool set is always suppressed', () 
   it('ignores a tools field smuggled in by the payload', () => {
     const hostile = { system: 'persona', tools: ['Bash', 'Read'] } as unknown as Parameters<typeof buildQueryOptions>[0];
     expect(buildQueryOptions(hostile, noMcp).tools).toEqual([]);
+  });
+
+  // ABSENCE is never asserted by a "does it contain X" test. Adding
+  // `permissionMode: 'bypassPermissions'` or `allowDangerouslySkipPermissions: true` —
+  // both real SDK options that map to CLI flags — would hand the model everything back
+  // while every other assertion here stayed green. Pin the exact key set instead, so any
+  // new option must be added here deliberately.
+  it('emits exactly the expected option keys — no permission escape hatch can be slipped in', () => {
+    const withTools = buildQueryOptions(
+      { prompt: 'x', system: 'p', allowedTools: ['mcp__noesis__get_note'], maxTurns: 6 },
+      () => ({ noesis: { command: 'node' } }),
+    );
+    expect(Object.keys(withTools).sort()).toEqual(
+      ['allowedTools', 'canUseTool', 'includePartialMessages', 'maxTurns', 'mcpServers', 'systemPrompt', 'tools'],
+    );
+    const bare = buildQueryOptions({ prompt: 'x' }, () => ({ noesis: { command: 'node' } }));
+    expect(Object.keys(bare).sort()).toEqual(
+      ['allowedTools', 'canUseTool', 'includePartialMessages', 'maxTurns', 'tools'],
+    );
   });
 
   it('spawns the MCP server only when a tool survived clamping', () => {

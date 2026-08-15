@@ -93,35 +93,59 @@ kill_matching() {
   return 0
 }
 
-# The package directory backing a running daemon, so we can read its version and check
-# whether its compiled output carries the fix.
+# `$1 >= $2` for plain x.y.z versions.
+version_ge() {
+  [ "$(printf '%s\n%s\n' "$2" "$1" | sort -t. -k1,1n -k2,2n -k3,3n | head -1)" = "$2" ]
+}
+
+# The package directory backing a running daemon. Extracted WITHOUT a `[^ ]*` path regex:
+# that could not cross a space, so an install under "/Users/x/My Repos/..." resolved to the
+# wrong directory, was graded UNKNOWN, and the assert below killed a perfectly good daemon.
 pkg_dir_for_pid() {
-  local pid="$1" cmd js
+  local pid="$1" cmd path
   cmd="$(ps -o command= -p "$pid" 2>/dev/null || true)"
-  js="$(printf '%s' "$cmd" | grep -oE '/[^ ]*/dist/index\.js' || true)"
-  if [ -n "$js" ]; then dirname "$(dirname "$js")"; return; fi
-  # npx-installed bin: .../node_modules/.bin/noesis-mcp -> the package root
-  js="$(printf '%s' "$cmd" | grep -oE '/[^ ]*/node_modules/\.bin/noesis-mcp' || true)"
-  if [ -n "$js" ]; then
-    printf '%s/@noesis-brain/mcp-server' "$(dirname "$(dirname "$js")")"; return
-  fi
+  case "$cmd" in *" agent") cmd="${cmd% agent}" ;; *) ;; esac
+  path="${cmd#* }"                       # drop the interpreter, keep the (possibly spaced) path
+  case "$path" in
+    */dist/index.js) dirname "$(dirname "$path")"; return ;;
+    */node_modules/.bin/noesis-mcp)
+      printf '%s/@noesis-brain/mcp-server' "$(dirname "$(dirname "$path")")"; return ;;
+  esac
   printf ''
 }
 
-# Prints "<version> <FIXED|UNFIXED|UNKNOWN>" for a pid.
+# Comments are copied verbatim into dist (tsconfig sets no `removeComments`), and this
+# codebase DOCUMENTS both markers heavily — `tools: []` occurs on 6 lines of the compiled
+# output, only ONE of which is code. Grepping the raw file therefore certified a build with
+# the boundary deleted as FIXED, which made the whole assurance layer theatre. Strip
+# comments before looking for code.
+strip_js_comments() { perl -0pe 's{/\*.*?\*/}{}gs; s{^[[:space:]]*//.*$}{}gm' "$1" 2>/dev/null || true; }
+
+# Prints "<version> <FIXED|UNFIXED(reason)|PARENT>" for a pid.
+#
+# TWO INDEPENDENT SIGNALS, both required:
+#   - the package version is >= MIN_FIXED_VERSION (the same signal the backend's
+#     MIN_TOOL_AGENT_VERSION gate uses), and
+#   - the compiled output actually contains both halves of the fix, comments removed.
+# An earlier version compared neither: MIN_FIXED_VERSION was assigned and never used, and
+# the content check matched documentation. "v2.1.5 FIXED" was two non-facts side by side.
 describe_pid() {
-  local pid="$1" dir ver fixed
+  local pid="$1" dir ver stripped ver_ok=0 code_ok=0
   dir="$(pkg_dir_for_pid "$pid")"
-  if [ -z "$dir" ] || [ ! -f "$dir/package.json" ]; then echo "? UNKNOWN"; return; fi
-  ver="$(node -e "process.stdout.write(String(require('$dir/package.json').version||'?'))" 2>/dev/null || echo '?')"
-  # The fix is two things; require BOTH so a half-applied build is not reported clean.
-  if grep -q 'tools: \[\]' "$dir/dist/agent/runner.js" 2>/dev/null \
-     && grep -q 'canUseTool' "$dir/dist/agent/runner.js" 2>/dev/null; then
-    fixed=FIXED
-  else
-    fixed=UNFIXED
+  # No package dir = the `npm exec` wrapper, not a daemon. Its child is graded separately;
+  # counting the parent as "unknown, therefore exposed" cried wolf on every healthy npx
+  # launch, which is the mode that becomes correct once the fix is published.
+  if [ -z "$dir" ] || [ ! -f "$dir/package.json" ]; then echo "- PARENT"; return; fi
+  ver="$(node -e "process.stdout.write(String(require('$dir/package.json').version||'0.0.0'))" 2>/dev/null || echo '0.0.0')"
+  version_ge "$ver" "$MIN_FIXED_VERSION" && ver_ok=1
+  if [ -f "$dir/dist/agent/runner.js" ]; then
+    stripped="$(strip_js_comments "$dir/dist/agent/runner.js")"
+    if printf '%s' "$stripped" | grep -q 'tools: \[\]' \
+       && printf '%s' "$stripped" | grep -q 'canUseTool:'; then code_ok=1; fi
   fi
-  echo "$ver $fixed"
+  if [ "$ver_ok" = 1 ] && [ "$code_ok" = 1 ]; then echo "$ver FIXED"
+  elif [ "$ver_ok" = 0 ]; then echo "$ver UNFIXED(v<$MIN_FIXED_VERSION)"
+  else echo "$ver UNFIXED(code)"; fi
 }
 
 # --status: the one command that answers "is my machine exposed right now?".
@@ -129,12 +153,19 @@ if [ "$MODE" = "--status" ]; then
   exposed=0 total=0
   while read -r pid; do
     [ -z "$pid" ] && continue
-    total=$((total + 1))
     read -r ver state <<<"$(describe_pid "$pid")"
+    if [ "$state" = "PARENT" ]; then
+      printf '  pid %-7s %-10s (npm exec wrapper — its child is graded below)\n' "$pid" "$state"
+      continue
+    fi
+    total=$((total + 1))
     printf '  pid %-7s v%-8s %s\n' "$pid" "$ver" "$state"
     [ "$state" = "FIXED" ] || exposed=$((exposed + 1))
   done < <(pids_matching)
   [ "$total" -eq 0 ] && echo "  no daemon running"
+  # Honest about what this can and cannot see, rather than implying a clean bill of health.
+  echo "  (grades the package on disk, for this user's processes only; a daemon started"
+  echo "   before a rebuild may still be running older code in memory)"
   if [ "$exposed" -gt 0 ]; then
     echo "[start-agent] EXPOSED: $exposed of $total daemon process(es) lack the tool boundary." >&2
     echo "              They can read your filesystem. Run: $(basename "$0") --local" >&2
@@ -142,6 +173,26 @@ if [ "$MODE" = "--status" ]; then
   fi
   echo "[start-agent] ok — $total daemon process(es), all carry the fix."
   exit 0
+fi
+
+# CHECK BEFORE KILLING. The published build is what the default mode is about to install,
+# so verify it is new enough BEFORE tearing down a working daemon. Without this the default
+# path was a guaranteed outage while the fix was unpublished: kill everything (including a
+# healthy fixed daemon) -> install an unfixed one -> assert fails -> kill it -> exit 1,
+# leaving the machine with NO daemon and subscription chat dead.
+if [ "$MODE" = "" ]; then
+  published="$(npm view @noesis-brain/mcp-server dist-tags.latest 2>/dev/null || true)"
+  if [ -z "$published" ]; then
+    echo "[start-agent] Could not reach npm to check the published version; refusing to" >&2
+    echo "              tear down a running daemon on a guess. Use --local." >&2
+    exit 1
+  fi
+  if ! version_ge "$published" "$MIN_FIXED_VERSION"; then
+    echo "[start-agent] Published @latest is v$published, which is older than v$MIN_FIXED_VERSION" >&2
+    echo "              and lacks the tool boundary. NOT touching the running daemon." >&2
+    echo "              Publish $MIN_FIXED_VERSION, or start this checkout: $(basename "$0") --local" >&2
+    exit 1
+  fi
 fi
 
 echo "[start-agent] stopping existing daemons..."
@@ -221,9 +272,16 @@ read -r ver state <<<"$(describe_pid "$started")"
 if [ "$state" != "FIXED" ]; then
   echo "[start-agent] ERROR: started daemon pid $started is v$ver ($state) — it lacks the" >&2
   echo "              tool boundary and can read your filesystem. Stopping it." >&2
-  kill -TERM "$started" 2>/dev/null || true
+  # Both passes over the whole pattern set, not just this pid: killing the child alone
+  # leaves the `npm exec` parent to respawn it — which is the exact failure this script's
+  # own header describes, and it would have happened right after printing "Stopping it."
+  kill_matching -TERM >&2
+  sleep 2
+  kill_matching -KILL >&2
   sleep 1
-  kill -KILL "$started" 2>/dev/null || true
+  if [ "$(count_matching)" -gt 0 ]; then
+    echo "              WARNING: $(count_matching) process(es) survived; run --status." >&2
+  fi
   echo "              Publish $MIN_FIXED_VERSION or newer, or start the local build:" >&2
   echo "              $(basename "$0") --local" >&2
   exit 1
