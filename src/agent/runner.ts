@@ -248,14 +248,149 @@ export function buildSdkPrompt(
   return prompt;
 }
 
+/** What the SDK expects back from a canUseTool decision. */
+type PermissionDecision =
+  | { behavior: 'allow'; updatedInput: Record<string, unknown> }
+  | { behavior: 'deny'; message: string };
+
+/**
+ * SECOND, INDEPENDENT LAYER on the tool boundary.
+ *
+ * `tools: []` below is the primary control, but it works by way of the CLI's `--tools ""`
+ * flag, whose handling lives in a minified `cli.js` we cannot audit. This callback is a
+ * gate we own outright: the SDK routes every permission request through it
+ * (`--permission-prompt-tool stdio`), and the request carries an `agentID`, so calls made
+ * by a spawned `Task` SUBAGENT are covered too — which matters, because a subagent, not
+ * the main loop, did the file reading in the 2026-08-14 incident.
+ *
+ * Deliberately reuses ALLOWED_TOOLS so the daemon has ONE definition of what may run.
+ *
+ * DO NOT DELETE THIS AS DEAD CODE. It is the ONLY daemon-owned control over MCP tools.
+ * `tools: []` governs the SDK's BUILT-IN set and nothing else; the Noesis MCP server we
+ * spawn registers ~55 tools, and their definitions are not filtered by `allowedTools`, so
+ * the model can see and attempt every one of them — including `pull_notes`, which writes
+ * to an arbitrary local path, plus `add_root`, `sync_notes`, `trash_note`, `move_note`.
+ * For those, this callback is the whole boundary.
+ *
+ * MEASURED (30 runs, 2026-08-15), correcting an earlier comment that said the opposite:
+ * the gate DOES fire — it denied `mcp__noesis__list_roots` and `mcp__noesis__list_codebases`
+ * in real traffic, and the model received `is_error` results naming the refusal. An earlier
+ * 2-job sample saw zero firings and wrongly concluded the gate was inert; a permission tool
+ * is simply not consulted for calls that are already pre-approved, and that sample happened
+ * to exercise only pre-approved tools.
+ *
+ * KNOWN GAP, stated rather than glossed: the SDK's cache-warming sidechain
+ * (`isSidechain: true`) is a real model turn that emits genuine `Bash`/`Glob` calls against
+ * the daemon's cwd, with only the RESULT stubbed. `tools: []` does not reach it and this
+ * callback is never consulted there. Nothing executes — but that is Claude Code internal
+ * behaviour we neither own nor test, which is why the daemon is rooted at a neutral cwd
+ * (`scripts/start-agent.sh`), so the warmup probes an empty directory, not a source tree.
+ */
+export function buildCanUseTool(
+  /**
+   * The tools permitted for THIS job — i.e. the output of `clampAllowedTools`, not the
+   * module-wide `ALLOWED_TOOLS`. Required, deliberately: an earlier version closed over
+   * `ALLOWED_TOOLS` and so turned a per-job clamp into a union. `clampAllowedTools`
+   * narrows to (what the server asked for ∩ ALLOWED_TOOLS); the gate then re-allowed all
+   * four regardless, so a job clamped to `get_note` could still execute `search_semantic`.
+   * The sets happen to coincide for chat today, which is exactly why it would have gone
+   * unnoticed until the first job kind with a narrower allowlist.
+   */
+  permitted: Iterable<string>,
+  onDecision: (toolName: string, allowed: boolean, agentID?: string) => void = logToolDecision,
+): (toolName: string, input?: unknown, ctx?: { agentID?: string }) => Promise<PermissionDecision> {
+  const permittedSet = new Set(permitted);
+  return async (toolName, input, ctx) => {
+    const allowed = permittedSet.has(toolName);
+    onDecision(toolName, allowed, ctx?.agentID);
+    return allowed
+      ? { behavior: 'allow', updatedInput: (input ?? {}) as Record<string, unknown> }
+      : { behavior: 'deny', message: `Tool "${toolName}" is not permitted for a Noesis job.` };
+  };
+}
+
+/** Default sink: stderr, so the daemon log is the evidence for whether the gate ever fires. */
+function logToolDecision(toolName: string, allowed: boolean, agentID?: string): void {
+  console.error(
+    `[noesis-agent] canUseTool ${allowed ? 'ALLOW' : 'DENY'} ${toolName}${agentID ? ` (agent=${agentID})` : ''}`,
+  );
+}
+
+/**
+ * The `options` object handed to sdk.query() — extracted, like buildSdkPrompt above, so
+ * the tool boundary is asserted by a test instead of resting on a comment. `tools: []`
+ * is the security-relevant field: see the note at its assignment. Takes the MCP-server
+ * factory as an argument so a test can supply a stub instead of a real spawn config.
+ */
+export function buildQueryOptions(
+  payload: JobPayload,
+  mcpServersFor: () => Record<string, unknown>,
+): Record<string, unknown> {
+  const allowedTools = clampAllowedTools(payload.allowedTools);
+  return {
+    ...(payload.system ? { systemPrompt: payload.system } : {}),
+    // Suppress the SDK's built-in tool set entirely (`--tools ""`). Without it the CLI
+    // defaults to ALL built-ins — Bash, Read, Write, Edit, Grep, WebSearch — and
+    // ALLOWED_TOOLS above does NOT stop them: `allowedTools` is a PERMISSION allowlist,
+    // so unlisted tools are un-pre-approved, not absent, and their definitions still
+    // reach the model. Worse, the read-only built-ins need no approval at all, so they
+    // actually EXECUTE headless: on 2026-08-14 an English-coach Navi grepped this
+    // daemon's cwd and returned ~100 strings from the user's source tree (jobs 527/528);
+    // only the follow-up file Write stopped, at the permission gate. Unconditional by
+    // design — a server-supplied payload must never be able to ask for a filesystem
+    // primitive. MCP tools travel a separate channel (`--mcp-config`) and are
+    // unaffected: a `use_knowledge_base` Navi still calls search_notes (verified).
+    tools: [],
+    // Independent second layer — see buildCanUseTool. Covers subagent (`Task`) calls too.
+    canUseTool: buildCanUseTool(allowedTools),
+    allowedTools,
+    // Only spawn the Noesis MCP server when a tool actually survived clamping.
+    ...(allowedTools.length > 0 ? { mcpServers: mcpServersFor() } : {}),
+    maxTurns: clampMaxTurns(payload.maxTurns),
+    includePartialMessages: true,
+  };
+}
+
+/** The prompt text for a job, with the fallback used when a payload carries none. */
+export function resolveJobPrompt(payload: JobPayload, kindLabel: string): string {
+  return payload.prompt ?? `(${kindLabel} job with empty prompt)`;
+}
+
+/** The minimum of the Agent SDK this daemon uses — enough for a test to substitute a fake. */
+export interface SdkLike {
+  query(args: { prompt: unknown; options: Record<string, unknown> }): AsyncIterable<unknown>;
+}
+
+/**
+ * The ONE place the SDK is invoked. Exported so a test can pass a fake `sdk` and assert
+ * what actually reaches `query()`.
+ *
+ * This exists because of a real gap: the suite pinned `buildQueryOptions` with a
+ * power-set mutation battery, but NOTHING pinned the call. Restoring the pre-fix inline
+ * options literal here — deleting `tools: []` and `canUseTool` outright — reverted the
+ * entire tool boundary with all 79 tests still green. The builder being correct is
+ * worthless if the caller stops using it, so both the seam below and the source-fitness
+ * test in `agentToolClamp.test.ts` guard this.
+ */
+export function runSdkQuery(
+  sdk: SdkLike,
+  payload: JobPayload,
+  kindLabel: string,
+  mcpServersFor: () => Record<string, unknown>,
+): AsyncIterable<unknown> {
+  return sdk.query({
+    prompt: buildSdkPrompt(resolveJobPrompt(payload, kindLabel), payload.images),
+    options: buildQueryOptions(payload, mcpServersFor),
+  });
+}
+
 /**
  * Execute a claimed job and stream its output through the sink. Returns the final
  * text. Real mode runs the Claude Agent SDK on the user's subscription; fake mode
  * emits a canned response so the queue plumbing can be verified without a login.
  */
 async function executeJob(cfg: AgentConfig, job: ClaimedJob, sink: EventSink): Promise<string> {
-  const prompt = job.payload.prompt ?? `(${job.kind} job with empty prompt)`;
-  const images = job.payload.images;
+  const prompt = resolveJobPrompt(job.payload, job.kind);
 
   if (cfg.fake) {
     const canned = `Noesis local agent (fake mode) processed a "${job.kind}" job. Prompt was: ${prompt.slice(0, 80)}`;
@@ -279,18 +414,7 @@ async function executeJob(cfg: AgentConfig, job: ClaimedJob, sink: EventSink): P
   let finalText = '';
   let sawDelta = false;
   let terminalText = '';
-  const allowedTools = clampAllowedTools(job.payload.allowedTools);
-  const stream = sdk.query({
-    prompt: buildSdkPrompt(prompt, images),
-    options: {
-      ...(job.payload.system ? { systemPrompt: job.payload.system } : {}),
-      allowedTools,
-      // Only spawn the Noesis MCP server when a tool actually survived clamping.
-      ...(allowedTools.length > 0 ? { mcpServers: noesisMcpServers(cfg) } : {}),
-      maxTurns: clampMaxTurns(job.payload.maxTurns),
-      includePartialMessages: true,
-    },
-  });
+  const stream = runSdkQuery(sdk, job.payload, job.kind, () => noesisMcpServers(cfg));
   // With includePartialMessages the stream carries BOTH incremental `stream_event`
   // deltas AND a terminal `assistant` message holding the whole reply. Taking both
   // would emit the answer twice, so deltas win and the terminal message is only a
