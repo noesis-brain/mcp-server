@@ -2157,14 +2157,18 @@ export function registerTools(server: McpServer, services: ToolServices): void {
    */
   server.tool(
     'update_relations',
-    'Update document relations. Without relations: returns note + other notes for analysis. With relations: updates and creates inverse relations.',
+    "Update document relations. Without `relations`: returns the note, its CURRENT relations, and other notes for analysis. With `relations`: REPLACES the note's entire relation set — send the complete desired set, not just additions, or the omitted ones are deleted. Read the current set first (`get_note`, or this tool with no `relations`) and union your additions into it. Relations are stored one-way on this note; the app derives backlinks, so no inverse is written on the target.",
     {
       note_id: z.number().describe('The note ID to update relations for'),
       relations: z.array(z.object({
-        type: z.enum(['references', 'implements', 'extends', 'supersedes']).describe('Relation type'),
+        // Mirrors SUGGESTABLE_RELATION_TYPES in the backend
+        // (src/backend/services/aiTasks/relations/infer.ts) — the source of truth for what
+        // the app stores. 'related' is what the web UI and POST /:id/relations/accept write;
+        // omitting it here made an MCP write silently destroy links it could not recreate.
+        type: z.enum(['related', 'references', 'implements', 'extends', 'supersedes']).describe('Relation type'),
         target_id: z.number().describe('Target note ID'),
         context: z.string().optional().describe('Optional context explaining the relation')
-      })).optional().describe('Relations to set (omit to get notes for analysis)')
+      })).optional().describe('The COMPLETE relation set to store (omit to get notes for analysis)')
     },
     async (args) => {
       const { note_id, relations } = args;
@@ -2172,9 +2176,8 @@ export function registerTools(server: McpServer, services: ToolServices): void {
       // If relations provided, update them
       if (relations !== undefined) {
         const result = await client.updateRelations(note_id, relations);
-        let message = `✅ Updated relations for note ${note_id}\n\n`;
-        message += `- Relations set: ${relations.length}\n`;
-        message += `- Inverse relations created: ${result.inversesCreated}\n\n`;
+        let message = `✅ Replaced the relation set for note ${note_id}\n\n`;
+        message += `- Relations now stored: ${result.updated}\n\n`;
 
         if (relations.length > 0) {
           message += `**Relations:**\n`;
@@ -2251,14 +2254,16 @@ export function registerTools(server: McpServer, services: ToolServices): void {
   // Register get_relation_graph tool
   server.tool(
     'get_relation_graph',
-    'Traverse the relation graph from a starting note, following relation links up to N hops deep. Returns all reachable notes with their depth and the relation that led to them.',
+    'Traverse the relation graph from a starting note up to N hops deep, in BOTH directions — notes this one links to AND notes that link to it. Returns every reachable note with its depth and one relation that led to it. An empty result means the note genuinely has no neighbours, not merely that it links to nothing.',
     {
       note_id: z.number().describe('Starting note ID'),
-      depth: z.number().min(1).max(4).optional().describe('Maximum traversal depth (default: 2, max: 4)')
+      // Bounded by MAX_DEPTH in the backend's services/graphService.ts. Advertising 4 while
+      // the server clamped to 3 would have been a silently broken promise.
+      depth: z.number().min(1).max(3).optional().describe('Maximum traversal depth (default: 2, max: 3)')
     },
     async (args) => {
       const { note_id, depth = 2 } = args;
-      const results = await client.getRelationGraph(note_id, Math.min(Math.max(depth, 1), 4));
+      const results = await client.getRelationGraph(note_id, Math.min(Math.max(depth, 1), 3));
 
       if (results.length === 0) {
         return {
@@ -2282,7 +2287,10 @@ export function registerTools(server: McpServer, services: ToolServices): void {
         output += `\n--- Depth ${d} ---\n`;
         for (const n of notes) {
           const desc = n.description ? `\n  ${n.description.substring(0, 120)}${n.description.length > 120 ? '...' : ''}` : '';
-          output += `- **${n.title}** [ID: ${n.id}] via ${n.relation_type} from note ${n.from_id}\n  ${n.file_path}${desc}\n`;
+          // from_id/relation_type name ONE of possibly several edges; a node can be reached
+          // by more than one, so treat the attribution as a hint and never assume it exists.
+          const via = n.relation_type && n.from_id ? ` via ${n.relation_type} from note ${n.from_id}` : '';
+          output += `- **${n.title}** [ID: ${n.id}]${via}\n  ${n.file_path ?? '(path unavailable)'}${desc}\n`;
         }
       }
 

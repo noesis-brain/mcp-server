@@ -1079,16 +1079,21 @@ export class NoesisClient {
     }
   }
 
+  /**
+   * REPLACES the note's whole relation set (the route clears the column, then writes).
+   * No inverse relation is created on the target — backlinks are derived from the
+   * one-way arrays, so there is nothing to write on the other side.
+   */
   async updateRelations(
     id: number,
     relations: Array<{ type: string; target_id: number; context?: string }>
-  ): Promise<{ updated: number; inversesCreated: number }> {
+  ): Promise<{ updated: number }> {
     const result = await this.request<{ success: boolean; updated: number }>(
       'PUT',
       `/api/mcp/notes/${id}/relations`,
       { relations }
     );
-    return { updated: result.updated || relations.length, inversesCreated: 0 };
+    return { updated: result.updated ?? relations.length };
   }
 
   async moveNote(
