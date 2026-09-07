@@ -10,6 +10,7 @@
  * instead of reading whole files, cache by (size, mtime), and stop at a time budget.
  */
 import * as fs from 'fs';
+import * as os from 'os';
 import * as path from 'path';
 import * as readline from 'readline';
 import { claudeConfigDir, projectsDir, normalizeCwd, type ClaudeSessionRef } from './claudeSessions.js';
@@ -240,6 +241,9 @@ export function matchSessions(
       id: sessionId,
       cwd: normalizeCwd(e.cwd || ''),
       last_active: e.lastActive || new Date(e.mtimeMs).toISOString(),
+      // The index only ever scans THIS machine's ~/.claude/projects, so anything it finds is
+      // resumable here by construction.
+      machine_name: os.hostname(),
       ...(e.title ? { title: e.title } : {}),
       ...(e.branch ? { branch: e.branch } : {}),
       confidence,

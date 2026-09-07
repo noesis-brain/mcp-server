@@ -103,6 +103,23 @@ describe('upsertSessionFrontmatter', () => {
     expect(second).not.toContain('2026-09-04T15:05:18.741Z');
   });
 
+  it('records the machine name, and a machine change is NOT swallowed by the time guard', () => {
+    const onA = { ...REF, machine_name: 'CCHENGLT2' };
+    const first = upsertSessionFrontmatter('---\ntitle: t\n---\n# Doc\n', onA);
+    expect(first).toContain('machine_name: CCHENGLT2');
+
+    // Same session id, same clock, different machine. The 5-minute no-op guard must NOT treat
+    // this as unchanged: a Claude Code session lives in ~/.claude/projects on ONE machine, so
+    // which machine an entry came from is exactly what tells the reader it is unresumable here.
+    const onB = { ...REF, machine_name: 'OTHER-LAPTOP' };
+    const second = upsertSessionFrontmatter(first, onB);
+    expect(second).not.toBe(first);
+    expect(second).toContain('OTHER-LAPTOP');
+
+    // ...but re-stamping the identical ref is still a byte-identical no-op.
+    expect(upsertSessionFrontmatter(second, onB)).toBe(second);
+  });
+
   it('accumulates distinct sessions, newest first, without duplicating the block', () => {
     const one = upsertSessionFrontmatter('---\ntitle: t\n---\n# Doc\n', OTHER);
     const two = upsertSessionFrontmatter(one, REF);

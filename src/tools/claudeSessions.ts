@@ -17,6 +17,13 @@ export interface ClaudeSessionRef {
   id: string;
   cwd: string;
   last_active: string;
+  /**
+   * Hostname of the machine the session ran on. A Claude Code session lives in
+   * ~/.claude/projects on exactly ONE machine, so without this a note synced from another
+   * laptop hands you a `--resume` command that cannot work there. Reuses the `machineName`
+   * convention already used for sync_logs.machine_name.
+   */
+  machine_name?: string;
   title?: string;
   branch?: string;
 }
@@ -179,7 +186,7 @@ export function currentSessionRef(explicitId?: string): { ref: ClaudeSessionRef;
     // the only two things `--resume` actually needs, so still stamp — and say what happened.
     const fallbackCwd = process.env.CLAUDE_PROJECT_DIR || process.cwd();
     return {
-      ref: { id, cwd: normalizeCwd(fallbackCwd), last_active: new Date().toISOString() },
+      ref: { id, cwd: normalizeCwd(fallbackCwd), last_active: new Date().toISOString(), machine_name: os.hostname() },
       note: 'transcript not found — recorded cwd from CLAUDE_PROJECT_DIR/process.cwd() and last_active from the clock',
     };
   }
@@ -193,6 +200,7 @@ export function currentSessionRef(explicitId?: string): { ref: ClaudeSessionRef;
         id,
         cwd: normalizeCwd(process.env.CLAUDE_PROJECT_DIR || process.cwd()),
         last_active: new Date().toISOString(),
+        machine_name: os.hostname(),
       },
       note: `transcript unreadable (${(e as Error).message})`,
     };
@@ -202,6 +210,7 @@ export function currentSessionRef(explicitId?: string): { ref: ClaudeSessionRef;
     id,
     cwd: normalizeCwd(meta.cwd || process.env.CLAUDE_PROJECT_DIR || process.cwd()),
     last_active: meta.last_active || new Date().toISOString(),
+    machine_name: os.hostname(),
   };
   if (meta.title) ref.title = meta.title;
   if (meta.branch) ref.branch = meta.branch;
@@ -229,6 +238,7 @@ function sameRefs(a: ClaudeSessionRef[], b: ClaudeSessionRef[]): boolean {
   return a.every((x, i) => {
     const y = b[i];
     return x.id === y.id && x.cwd === y.cwd && x.last_active === y.last_active
+      && (x.machine_name || '') === (y.machine_name || '')
       && (x.title || '') === (y.title || '') && (x.branch || '') === (y.branch || '');
   });
 }
@@ -274,7 +284,11 @@ export function upsertSessionFrontmatter(content: string, ref: ClaudeSessionRef)
   if (prior) {
     const drift = new Date(ref.last_active).getTime() - new Date(prior.last_active).getTime();
     // Same session, same folder, and the clock barely moved — nothing worth rewriting the file for.
+    // A machine change must never be swallowed by the time guard: the same session id carrying a
+    // different hostname means the note moved between machines, and that is exactly the fact the
+    // reader needs to know the entry is not resumable here.
     if (Number.isFinite(drift) && drift < LAST_ACTIVE_REFRESH_MS && prior.cwd === ref.cwd
+        && (prior.machine_name || '') === (ref.machine_name || '')
         && (prior.title || '') === (ref.title || '')) {
       return content;
     }
