@@ -14,6 +14,8 @@ import { formatRootsList } from '../resolve/rootsFormat.js';
 import type { SyncResult, SyncStatus, BidirectionalSyncResult } from '../types/index.js';
 import { initEmbeddingService, generateEmbedding, generateEmbeddingsBatch } from '../services/embedding.js';
 import { SyncStateManager, determineSyncDirection } from './SyncStateManager.js';
+import { currentSessionRef, upsertSessionFrontmatter, type ClaudeSessionRef } from './claudeSessions.js';
+import { buildIndex, matchSessions } from './sessionIndex.js';
 import { registerNaviTools } from './navis.js';
 import { registerBacklogTools } from './backlog.js';
 import { registerExamTools } from './exam.js';
@@ -1095,6 +1097,86 @@ export function registerTools(server: McpServer, services: ToolServices): void {
     }
   );
 
+  // Register find_claude_sessions_for_note tool
+  server.tool(
+    'find_claude_sessions_for_note',
+    "Recover which Claude Code sessions worked on a note, by scanning this machine's session transcripts for mentions of the note's path. Returns each session's id, folder and last-active time, plus a ready-to-run `claude --resume` command. Use this to backfill notes that predate automatic session stamping, or whenever the user asks 'which session wrote this note / can I resume it'. READ-ONLY by default (plan-mode safe): it only writes when apply is true, which stamps the results into the note's `claude_sessions:` frontmatter. Results are cached in an incremental index, so the first run is the slow one.",
+    {
+      note: z.string().describe('Absolute path to the note (.md) on this machine. A relative path or bare filename also works but matches more weakly.'),
+      since: z.string().optional().describe('ISO date; ignore transcripts older than this. Defaults to 90 days ago — widen it to search further back.'),
+      apply: z.boolean().optional().describe("Write the matches into the note's `claude_sessions:` frontmatter (default: false). Leave false in plan mode."),
+      timeBudgetMs: z.number().optional().describe('Stop indexing after this many ms and report partial progress (default: 20000). Re-run to continue where it stopped.')
+    },
+    async (args) => {
+      const { note, since, apply = false, timeBudgetMs } = args;
+
+      const notePath = expandHome(note);
+      const absolutePath = path.isAbsolute(notePath) ? normalizePath(notePath) : undefined;
+      const defaultSince = new Date(Date.now() - 90 * 24 * 60 * 60 * 1000);
+      const sinceDate = since ? new Date(since) : defaultSince;
+
+      const build = await buildIndex({
+        since: Number.isNaN(sinceDate.getTime()) ? defaultSince : sinceDate,
+        timeBudgetMs,
+      });
+      const matches = matchSessions(build.index, {
+        absolutePath,
+        relativePath: absolutePath ? undefined : normalizePath(notePath),
+      });
+
+      const lines: string[] = [];
+      lines.push(`**Claude Code sessions for** \`${normalizePath(notePath)}\``);
+      lines.push('');
+      lines.push(`Indexed ${build.scanned} new + ${build.reused} cached of ${build.total} transcripts` +
+        (build.skippedOld > 0 ? ` (${build.skippedOld} older than the cutoff)` : '') + '.');
+      if (build.truncated) {
+        lines.push('');
+        lines.push('⚠️ Time budget reached — the index is partial. Re-run to continue where it stopped.');
+      }
+      lines.push('');
+
+      if (matches.length === 0) {
+        lines.push('No sessions mention this note.');
+        lines.push('');
+        lines.push('That is expected when the work happened on another machine (transcripts are local), ' +
+          'longer ago than the cutoff, or before this note had its current path.');
+        return { content: [{ type: 'text', text: lines.join('\n') }] };
+      }
+
+      for (const m of matches) {
+        const when = m.last_active ? m.last_active.replace('T', ' ').replace(/\..*$/, ' UTC') : 'unknown';
+        lines.push(`- **${m.title || `Session ${m.id.slice(0, 8)}`}** — ${when}` +
+          (m.confidence !== 'absolute' ? `  _(${m.confidence} match — weaker)_` : ''));
+        lines.push(`  \`cd "${m.cwd}" && claude --resume ${m.id}\``);
+      }
+
+      if (apply) {
+        try {
+          const content = fs.readFileSync(notePath, 'utf-8');
+          let updated = content;
+          // Oldest first so the newest ends up at the head of the list after each merge.
+          for (const m of [...matches].reverse()) {
+            if (!m.cwd) continue;
+            const { confidence, ...ref } = m;
+            updated = upsertSessionFrontmatter(updated, ref);
+          }
+          if (updated !== content) {
+            fs.writeFileSync(notePath, updated, 'utf-8');
+            lines.push('', `✅ Wrote ${matches.length} session(s) into the note's frontmatter. Run \`sync_notes\` to push it.`);
+          } else {
+            lines.push('', 'Note frontmatter already lists these sessions — nothing to write.');
+          }
+        } catch (e) {
+          lines.push('', `⚠️ Could not update the note: ${(e as Error).message}`);
+        }
+      } else {
+        lines.push('', '_Read-only. Pass `apply: true` to write these into the note\'s frontmatter._');
+      }
+
+      return { content: [{ type: 'text', text: lines.join('\n') }] };
+    }
+  );
+
   // Register list_edited_online_notes tool
   server.tool(
     'list_edited_online_notes',
@@ -1191,10 +1273,16 @@ export function registerTools(server: McpServer, services: ToolServices): void {
       dryRun: z.boolean().optional().describe('Preview changes without syncing (default: false)'),
       force: z.boolean().optional().describe('Force re-sync even if file hash is unchanged. Useful for regenerating AI metadata on existing files (default: false)'),
       regenerateMetadata: z.boolean().optional().describe('Regenerate all metadata using AI, overwriting existing values. Use when you want AI to improve/replace current title, description, and keywords (default: false)'),
-      moveNewToNoesis: z.boolean().optional().describe('Move new local-only files to .noesis folder before syncing. Keeps ad-hoc notes separate from project files (default: false)')
+      moveNewToNoesis: z.boolean().optional().describe('Move new local-only files to .noesis folder before syncing. Keeps ad-hoc notes separate from project files (default: false)'),
+      stampSession: z.enum(['auto', 'always', 'never']).optional().describe("Record the calling Claude Code session (id + folder + last-active) in the note's `claude_sessions:` frontmatter, so the note can be traced back to the conversation that wrote it and resumed with `claude --resume`. 'auto' (default) stamps only on a real push; 'never' disables it; 'always' stamps even an otherwise-unchanged file, which turns that sync into a push."),
+      sessionId: z.string().optional().describe('Override the session id to record. Defaults to CLAUDE_CODE_SESSION_ID, which Claude Code injects into every MCP server it spawns. Use this only when that value is known to be wrong — e.g. after /clear, which rotates the id without respawning the MCP server.')
     },
     async (args) => {
-      const { root, files, dryRun = false, force = false, regenerateMetadata = false, moveNewToNoesis = false } = args;
+      const { root, files, dryRun = false, force = false, regenerateMetadata = false, moveNewToNoesis = false, stampSession = 'auto', sessionId } = args;
+
+      // Resolved once per sync run, not per file: two bounded transcript reads (~300 KB total).
+      const resolvedSession = stampSession === 'never' ? null : currentSessionRef(sessionId);
+      const sessionRef = resolvedSession?.ref ?? null;
 
       // Get roots for sync
       let roots = await client.getRootsForSync();
@@ -1269,7 +1357,7 @@ export function registerTools(server: McpServer, services: ToolServices): void {
 
       // Handle specific files sync mode (push-only for specific files)
       if (files && files.length > 0) {
-        return await syncSpecificFiles(files, dryRun, client, force, regenerateMetadata);
+        return await syncSpecificFiles(files, dryRun, client, force, regenerateMetadata, stampSession, sessionId);
       }
 
       // Filter to specific root if requested
@@ -1465,11 +1553,16 @@ export function registerTools(server: McpServer, services: ToolServices): void {
                 result.pushed.created++;
               } else {
                 const metadata = parseYamlFrontmatter(localFile.content);
-                await client.upsertNote(localFile, metadata, { force, regenerateMetadata });
-                if (localFile.hash) stateMgr.setBaseline(
+                const s = stampForPush(
+                  localFile.path || path.join(syncRoot.path, relativePath),
+                  localFile.content, localFile.hash || '', localFile.size, localFile.mtime,
+                  sessionRef, dryRun
+                );
+                await client.upsertNote({ ...localFile, content: s.content, hash: s.hash }, metadata, { force, regenerateMetadata });
+                if (s.hash) stateMgr.setBaseline(
                   relativePath,
-                  { hash: localFile.hash, lastSyncedAt: new Date().toISOString() },
-                  localFile.content
+                  { hash: s.hash, lastSyncedAt: new Date().toISOString() },
+                  s.content
                 );
                 result.details.push({ file: relativePath, action: 'pushed_create' });
                 result.pushed.created++;
@@ -1633,22 +1726,24 @@ export function registerTools(server: McpServer, services: ToolServices): void {
                       result.errors.push(`Skipped push for ${relativePath}: merge would drop ${lost}% of content (${localFile.content.length}->${enrichedContent.length} bytes). Left unchanged to avoid data loss.`);
                     } else {
                       const enrichedHash = NoesisClient.computeHash(enrichedContent);
+                      const localPath = path.join(syncRoot.path, relativePath);
+                      // Stamp AFTER updateFrontmatter — see the per-file branch for why.
+                      const s = stampForPush(localPath, enrichedContent, enrichedHash, localFile.size, localFile.mtime, sessionRef, dryRun);
                       const mergedFile: LocalFile = {
                         ...localFile,
-                        content: enrichedContent,
-                        hash: enrichedHash
+                        content: s.content,
+                        hash: s.hash
                       };
                       // preserveMetadata=true: keep cloud's AI-generated title/description/keywords
                       await client.upsertNote(mergedFile, metadata, { force: true, regenerateMetadata, preserveMetadata: true });
 
                       // Write enriched content back to local file
-                      const localPath = path.join(syncRoot.path, relativePath);
-                      fs.writeFileSync(localPath, enrichedContent, 'utf-8');
+                      fs.writeFileSync(localPath, s.content, 'utf-8');
 
                       stateMgr.setBaseline(
                         relativePath,
-                        { hash: enrichedHash, lastSyncedAt: new Date().toISOString() },
-                        enrichedContent
+                        { hash: s.hash, lastSyncedAt: new Date().toISOString() },
+                        s.content
                       );
                       result.details.push({ file: relativePath, action: 'pushed_update', reason: 'merged' });
                       result.pushed.updated++;
@@ -3262,13 +3357,54 @@ export function adaptCloudNote(n: Note, relativePath: string, hash: string): Clo
  * @param force - If true, bypass hash check and always re-sync (useful for metadata regeneration)
  * @param regenerateMetadata - If true, backend AI regenerates all metadata fields, overwriting existing values
  */
+/**
+ * Stamp the calling Claude Code session into a note that is about to be PUSHED, writing the
+ * result back to disk so local, cloud and the sync baseline all agree on the same bytes.
+ *
+ * Returns the caller's values unchanged — and touches nothing — when the stamp is a no-op, which
+ * is the common case: `upsertSessionFrontmatter` returns the original string unless this session
+ * is new to the note or its last_active has moved by more than a few minutes. That guard is what
+ * keeps a repeat sync from turning "skipped (unchanged)" into a full push plus a version snapshot.
+ */
+function stampForPush(
+  filePath: string,
+  content: string,
+  hash: string,
+  size: number | undefined,
+  mtime: Date | undefined,
+  ref: ClaudeSessionRef | null,
+  dryRun: boolean
+): { content: string; hash: string; size: number; mtime: Date } {
+  // Callers that already hold real stat values pass them through untouched on the no-op path;
+  // the full-root callers do not use size/mtime from the result, so a stat here is the only
+  // place they would ever be needed.
+  const passthrough = () => ({
+    content,
+    hash,
+    size: size ?? Buffer.byteLength(content, 'utf-8'),
+    mtime: mtime ?? new Date(),
+  });
+  if (!ref || dryRun) return passthrough();
+  const stamped = upsertSessionFrontmatter(content, ref);
+  if (stamped === content) return passthrough();
+  fs.writeFileSync(filePath, stamped, 'utf-8');
+  const st = fs.statSync(filePath);
+  return { content: stamped, hash: NoesisClient.computeHash(stamped), size: st.size, mtime: st.mtime };
+}
+
 export async function syncSpecificFiles(
   filePaths: string[],
   dryRun: boolean,
   client: NoesisClient,
   force: boolean = false,
-  regenerateMetadata: boolean = false
+  regenerateMetadata: boolean = false,
+  stampSession: 'auto' | 'always' | 'never' = 'auto',
+  sessionId?: string
 ): Promise<{ content: Array<{ type: 'text'; text: string }>; isError?: boolean }> {
+  // Resolved once per sync run: ~300 KB of bounded transcript reads, not once per file.
+  const resolved = stampSession === 'never' ? null : currentSessionRef(sessionId);
+  const sessionRef = resolved?.ref ?? null;
+  const sessionNote = resolved?.note;
   // Use bidirectional sync result type
   const result: BidirectionalSyncResult = {
     pushed: { created: 0, updated: 0 },
@@ -3441,13 +3577,14 @@ export async function syncSpecificFiles(
           result.pushed.created++;
         } else {
           const project = detectProjectForFile(normalizedPath, matchingRoot.path);
+          const s = stampForPush(normalizedPath, localContent, localHash, stats.size, stats.mtime, sessionRef, dryRun);
           const localFile: LocalFile = {
             path: normalizedPath,
             relativePath,
-            content: localContent,
-            hash: localHash,
-            mtime: stats.mtime,
-            size: stats.size,
+            content: s.content,
+            hash: s.hash,
+            mtime: s.mtime,
+            size: s.size,
             rootId: matchingRoot.id,
             rootName: matchingRoot.name,
             project
@@ -3455,8 +3592,8 @@ export async function syncSpecificFiles(
           await client.upsertNote(localFile, localMetadata, { force, regenerateMetadata });
           stateMgr.setBaseline(
             relativePath,
-            { hash: localHash, lastSyncedAt: new Date().toISOString() },
-            localContent
+            { hash: s.hash, lastSyncedAt: new Date().toISOString() },
+            s.content
           );
           result.details.push({ file: relativePath, action: 'pushed_create' });
           result.pushed.created++;
@@ -3512,13 +3649,14 @@ export async function syncSpecificFiles(
               result.pushed.updated++;
             } else {
               const project = detectProjectForFile(normalizedPath, matchingRoot.path);
+              const s = stampForPush(normalizedPath, localContent, localHash, stats.size, stats.mtime, sessionRef, dryRun);
               const localFile: LocalFile = {
                 path: normalizedPath,
                 relativePath,
-                content: localContent,
-                hash: localHash,
-                mtime: stats.mtime,
-                size: stats.size,
+                content: s.content,
+                hash: s.hash,
+                mtime: s.mtime,
+                size: s.size,
                 rootId: matchingRoot.id,
                 rootName: matchingRoot.name,
                 project
@@ -3633,13 +3771,17 @@ export async function syncSpecificFiles(
               result.errors.push(`Skipped push for ${relativePath}: merge would drop ${lost}% of content (${localContent.length}->${enrichedContent.length} bytes). Left unchanged to avoid data loss.`);
             } else {
               const enrichedHash = NoesisClient.computeHash(enrichedContent);
+              // Stamp AFTER updateFrontmatter, never before: updateFrontmatter rewrites the
+              // frontmatter line-by-line and ends by dropping blank lines, so running it over a
+              // freshly-stamped block would reflow work we just did.
+              const s = stampForPush(normalizedPath, enrichedContent, enrichedHash, stats.size, stats.mtime, sessionRef, dryRun);
               const localFile: LocalFile = {
                 path: normalizedPath,
                 relativePath,
-                content: enrichedContent,
-                hash: enrichedHash,
-                mtime: stats.mtime,
-                size: stats.size,
+                content: s.content,
+                hash: s.hash,
+                mtime: s.mtime,
+                size: s.size,
                 rootId: matchingRoot.id,
                 rootName: matchingRoot.name,
                 project
@@ -3648,12 +3790,14 @@ export async function syncSpecificFiles(
               await client.upsertNote(localFile, localMetadata, { force: true, regenerateMetadata, preserveMetadata: true });
 
               // Write enriched content back to local file
-              fs.writeFileSync(normalizedPath, enrichedContent, 'utf-8');
+              fs.writeFileSync(normalizedPath, s.content, 'utf-8');
 
+              // Baseline must be the STAMPED bytes — the ones now on disk. Recording the
+              // pre-stamp content here would make the next sync see a phantom local edit.
               stateMgr.setBaseline(
                 relativePath,
-                { hash: enrichedHash, lastSyncedAt: new Date().toISOString() },
-                enrichedContent
+                { hash: s.hash, lastSyncedAt: new Date().toISOString() },
+                s.content
               );
               result.details.push({ file: relativePath, action: 'pushed_update', reason: 'merged' });
               result.pushed.updated++;

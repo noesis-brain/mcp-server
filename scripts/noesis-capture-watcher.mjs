@@ -141,11 +141,19 @@ function findById(id) {
 }
 // Map the current working directory to its Claude Code project dir and return
 // the most-recently-modified transcript's session id (i.e. THIS session). Mirrors
-// Claude Code's cwd->project-dir encoding (":" "\" "/" "_" all become "-"). Used
-// by --print-self so the /noesis-capture skill can pass --self and never capture
-// its own controller session.
+const SESSION_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+// Claude Code's cwd->project-dir encoding: EVERY character outside [A-Za-z0-9-] becomes
+// "-". The old form listed only [:\/_], which silently mis-encoded any path containing a
+// dot or a space (e.g. ~/.noesis-agent). Used by --print-self so the /noesis-capture skill
+// can pass --self and never capture its own controller session.
+//
+// CLAUDE_CODE_SESSION_ID wins when present: Claude Code injects it into every MCP server
+// and hook it spawns, and it is exact. The directory scan is a fallback, and it is a GUESS --
+// "newest transcript" can pick a concurrent session running in another repo.
 function selfSessionId() {
-  const name = process.cwd().replace(/[:\\/_]/g, '-');
+  const fromEnv = (process.env.CLAUDE_CODE_SESSION_ID || '').trim();
+  if (SESSION_ID_RE.test(fromEnv)) return fromEnv;
+  const name = process.cwd().replace(/[^A-Za-z0-9-]/g, '-');
   let d = path.join(PROJECTS, name);
   if (!fs.existsSync(d)) {
     const fc = name[0] || '';
@@ -159,14 +167,18 @@ function selfSessionId() {
   const newest = files.reduce((a, b) => (statMtime(a) >= statMtime(b) ? a : b));
   return path.basename(newest).replace(/\.jsonl$/i, '');
 }
-// All top-level session transcripts (depth 1) — excludes subagent/workflow files.
+// All top-level session transcripts (depth 1). TWO filters, both load-bearing: depth 1
+// skips the newer <session-id>/subagents/ layout, and the UUID test drops the LEGACY
+// agent-<hex>.jsonl subagent files, which sit as SIBLINGS of real sessions (~1,500 on a
+// working machine) and were previously all returned as sessions with a bogus sessionId
+// like "agent-a0065ea" — which is what made resolveByName's fallback scan mostly waste.
 function topLevelTranscripts() {
   const out = [];
   for (const dir of projectDirs()) {
     let ents;
     try { ents = fs.readdirSync(dir, { withFileTypes: true }); } catch { continue; }
     for (const e of ents) {
-      if (e.isFile() && e.name.endsWith('.jsonl')) {
+      if (e.isFile() && e.name.endsWith('.jsonl') && SESSION_ID_RE.test(e.name.slice(0, -6))) {
         const p = path.join(dir, e.name);
         out.push({ path: p, sessionId: e.name.slice(0, -6), mtime: statMtime(p) });
       }
