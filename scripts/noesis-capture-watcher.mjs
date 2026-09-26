@@ -107,7 +107,9 @@ const stripImageRefs = (s) =>
 // Neutralize bare HTML tags so literal "<details>", "<summary>", "<system-reminder>"
 // etc. in transcript data don't get interpreted as HTML by the Markdown renderer.
 // Only for PLAIN-TEXT data fields (never inside code spans / fenced blocks).
-const esc = (s) => String(s == null ? '' : s).replace(/</g, '&lt;').replace(/>/g, '&gt;');
+// Also escapes `&` (so a literal `&lt;` stays literal) and `\` (so a Windows path
+// like `tools\<script>` or `C:\_build` keeps its backslashes).
+const esc = (s) => String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/\\/g, '\\\\');
 
 function pad2(n) { return String(n).padStart(2, '0'); }
 function localStamp(d) {
@@ -282,6 +284,24 @@ function resolve(sessionArg) {
 }
 
 // ---------------------------------------------------------------- conversion
+//
+// Note layout. The Noesis Contents panel nests its outline strictly by `#` level
+// (md-manager src/frontend/src/components/TableOfContents.tsx, extractHeaders), so
+// the heading levels below ARE the note's structure:
+//
+//   # <ai-title> — Capture         directly under the frontmatter, so Noesis strips it
+//   ## N. <human message>          one per message the human wrote: the first TOC level
+//   ### Working process            round 1 of the reply: narration + tool steps
+//   ### Answer                     round 1's closing text
+//   ### Follow-up K — <trigger>    a later round of the same request (a background task
+//   #### Working process             finished, a scheduled wakeup fired, the usage limit
+//   #### Answer                      reset, …)
+//
+// Only human messages open a section. Everything else in the transcript — skill
+// bodies, caveats, local commands, queue bookkeeping, task notifications, wakeups,
+// rewound branches — is folded into a round or dropped. Claude's own headings are
+// flattened (narration, plans) or shifted below their Answer heading, so they can
+// never outrank the outline above.
 
 function buildResultMap(entries) {
   const map = new Map();
@@ -290,6 +310,19 @@ function buildResultMap(entries) {
     if (e.type === 'user' && Array.isArray(content)) {
       for (const b of content) {
         if (b && b.type === 'tool_result' && b.tool_use_id) map.set(b.tool_use_id, b);
+      }
+    }
+  }
+  return map;
+}
+
+function buildToolNameMap(entries) {
+  const map = new Map();
+  for (const e of entries) {
+    const content = e.message?.content;
+    if (e.type === 'assistant' && Array.isArray(content)) {
+      for (const b of content) {
+        if (b && b.type === 'tool_use' && b.id) map.set(b.id, b.name);
       }
     }
   }
@@ -334,19 +367,9 @@ function frontmatter(meta) {
 
 function resultText(res) {
   const c = res?.content;
-  if (typeof c === 'string') return stripNulBytes(stripCmdNoise(stripAnsi(c)));
-  if (Array.isArray(c)) return stripNulBytes(stripCmdNoise(stripAnsi(c.filter((b) => b && b.type === 'text').map((b) => b.text).join(' '))));
+  if (typeof c === 'string') return stripCmdNoise(stripAnsi(stripNulBytes(c)));
+  if (Array.isArray(c)) return stripCmdNoise(stripAnsi(stripNulBytes(c.filter((b) => b && b.type === 'text').map((b) => b.text).join(' '))));
   return '';
-}
-
-function firstWords(s, n) {
-  const words = oneLine(s).replace(/[#>*`_~|]/g, '').split(' ').filter(Boolean);
-  const head = words.slice(0, n).join(' ');
-  return words.length > n ? `${head}…` : head;
-}
-
-function blockquote(text) {
-  return text.split('\n').map((l) => (l.length ? `> ${l}` : '>')).join('\n');
 }
 
 // Returns the exact CommonMark closing fence needed to balance `text` if it ends
@@ -389,25 +412,60 @@ function truncateSafely(text, maxLen) {
   return closer ? `${cut}\n${closer}` : cut;
 }
 
+function closeOpenFence(text) {
+  const closer = unterminatedFenceCloser(text);
+  return closer ? `${text}\n${closer}` : text;
+}
+
+// Markdown syntax is stripped so a heading reads as plain text; `<` and `>` are
+// kept (as a pair) and escaped by esc() where the words are used.
+function firstWords(s, n) {
+  const words = oneLine(s).replace(/[#*`_~|]/g, '').split(' ').filter(Boolean);
+  const head = words.slice(0, n).join(' ');
+  return words.length > n ? `${head}…` : head;
+}
+
+function blockquote(text) {
+  return text.split('\n').map((l) => (l.length ? `> ${l}` : '>')).join('\n');
+}
+
+// Transcript text that no human wrote: harness reminders, background-task
+// notifications, slash-command plumbing (a prompt command's <command-name> /
+// <command-args> is parsed before this check), local-command caveats and output,
+// shell-mode output, memory-mode input and MCP resource pushes.
+const INJECTION_PREFIXES = [
+  '<system-reminder', '[SYSTEM NOTIFICATION', '<task-notification', '<command-', '<local-command-',
+  '<bash-stdout', '<bash-stderr', '<user-memory-input', '<mcp-resource-update', '<mcp-polling-update',
+  'Caveat:',
+];
 function isSystemInjection(text) {
-  const t = text.trimStart();
-  return t.startsWith('<system-reminder') || t.startsWith('[SYSTEM NOTIFICATION') ||
-         t.startsWith('<task-notification') || t.startsWith('<command-') ||
-         t.startsWith('<local-command-stdout') || t.startsWith('Caveat:');
+  const t = String(text == null ? '' : text).trimStart();
+  return INJECTION_PREFIXES.some((p) => t.startsWith(p));
+}
+
+// Inline code that survives backticks inside it — PowerShell's escape character, or
+// a shell `$(…)` written with backticks: the fence is one backtick longer than the
+// longest run inside, padded with a space when the text starts or ends with one.
+function codeSpan(text) {
+  const s = String(text == null ? '' : text);
+  if (!s) return '';
+  const fence = '`'.repeat(Math.max(0, ...(s.match(/`+/g) || []).map((run) => run.length)) + 1);
+  const pad = /^`|`$/.test(s) || /^ [\s\S]* $/.test(s) ? ' ' : '';
+  return `${fence}${pad}${s}${pad}${fence}`;
 }
 
 function summarizeToolUse(name, input) {
   input = input || {};
   const t = (s, n = 160) => oneLine(s).slice(0, n);
   switch (name) {
-    case 'Read': return `Read \`${input.file_path || ''}\``;
+    case 'Read': return `Read ${codeSpan(input.file_path)}`;
     case 'Edit': case 'Write': case 'MultiEdit':
-      return `${name} \`${input.file_path || ''}\``;
-    case 'NotebookEdit': return `NotebookEdit \`${input.notebook_path || ''}\``;
-    case 'Bash': return `Bash: \`${t(input.command || '', 160)}\``;
-    case 'PowerShell': return `PowerShell: \`${t(input.command || '', 160)}\``;
-    case 'Glob': return `Glob \`${input.pattern || ''}\``;
-    case 'Grep': return `Grep \`${input.pattern || ''}\``;
+      return `${name} ${codeSpan(input.file_path)}`;
+    case 'NotebookEdit': return `NotebookEdit ${codeSpan(input.notebook_path)}`;
+    case 'Bash': return `Bash: ${codeSpan(t(input.command || '', 160))}`;
+    case 'PowerShell': return `PowerShell: ${codeSpan(t(input.command || '', 160))}`;
+    case 'Glob': return `Glob ${codeSpan(input.pattern)}`;
+    case 'Grep': return `Grep ${codeSpan(input.pattern)}`;
     case 'Task': case 'Agent':
       return `Agent (${input.subagent_type || 'agent'}): ${t(input.description || '')}`;
     case 'WebFetch': return `WebFetch ${input.url || ''}`;
@@ -417,7 +475,7 @@ function summarizeToolUse(name, input) {
       const keys = Object.keys(input);
       if (!keys.length) return name;
       // Wrap raw JSON in a code span so any `<` inside is HTML-safe and reads as code.
-      return `${name}: \`${t(JSON.stringify(input), 120)}\``;
+      return `${name}: ${codeSpan(t(JSON.stringify(input), 120))}`;
     }
   }
 }
@@ -439,12 +497,37 @@ function parseAnswers(res) {
   return map;
 }
 
-function renderDecisionBlock(toolUse, resultMap) {
+// A tool result the human produced by declining the call. `feedback` is what they
+// typed at the permission prompt — their own words, so it opens a new section.
+const REJECTION_PREFIX = "The user doesn't want to proceed with this tool use";
+function parseRejection(res) {
+  if (!res || !res.is_error) return null;
+  const txt = resultText(res);
+  if (!txt.startsWith(REJECTION_PREFIX)) return null;
+  const at = txt.indexOf('the user said:');
+  if (at < 0) return { feedback: null };
+  const feedback = txt.slice(at + 'the user said:'.length)
+    .replace(/\n+Note: The user's next message may contain a correction or preference\.[\s\S]*$/, '')
+    .trim();
+  return { feedback: feedback && feedback !== 'Denied by user' ? feedback : null };
+}
+
+function rejectedToolLabel(name) {
+  if (name === 'ExitPlanMode') return 'plan';
+  if (name === 'AskUserQuestion') return 'question';
+  if (name === 'Edit' || name === 'Write' || name === 'MultiEdit' || name === 'NotebookEdit') return 'edit';
+  if (name === 'Bash' || name === 'PowerShell') return 'command';
+  return name ? `${name} call` : 'tool call';
+}
+
+function renderDecisionBlock(toolUse, resultMap, level) {
   const qs = Array.isArray(toolUse.input?.questions) ? toolUse.input.questions : [];
-  const answers = parseAnswers(resultMap.get(toolUse.id));
+  const res = resultMap.get(toolUse.id);
+  const rejection = parseRejection(res);
+  const answers = parseAnswers(res);
   const lines = [];
   for (const q of qs) {
-    lines.push(`#### Decision — ${esc(oneLine(q.header)) || 'Question'}`);
+    lines.push(`${'#'.repeat(level)} Decision — ${esc(oneLine(q.header)) || 'Question'}`);
     lines.push(`> ${esc(oneLine(q.question))}`);
     const ans = answers.get(q.question);
     const opts = Array.isArray(q.options) ? q.options : [];
@@ -455,9 +538,12 @@ function renderDecisionBlock(toolUse, resultMap) {
       const desc = opt.description ? ` — ${esc(oneLine(opt.description))}` : '';
       lines.push(`- ${label}${desc}${chosen ? '  **(chosen)**' : ''}`);
     }
+    lines.push(''); // else the Chosen line continues the last option's list item
     if (ans != null) {
       const custom = !opts.some(isChosen);
       lines.push(`**Chosen:** ${esc(ans)}${custom ? ' _(custom)_' : ''}`);
+    } else if (rejection) {
+      lines.push(`**Chosen:** _(declined${rejection.feedback ? ' — see the next message' : ''})_`);
     } else {
       lines.push(`**Chosen:** _(pending)_`);
     }
@@ -466,98 +552,615 @@ function renderDecisionBlock(toolUse, resultMap) {
   return lines.join('\n');
 }
 
-function renderPlanBlock(toolUse, resultMap) {
-  const res = resultMap.get(toolUse.id);
-  const txt = res ? resultText(res) : '';
-  const lines = ['- **Plan submitted for approval (ExitPlanMode)**'];
-  if (txt && txt.trim()) {
-    const body = txt
-      .replace(/<\/details>/gi, '&lt;/details&gt;')   // never let an inner tag close our wrapper
-      .replace(/^(#{1,6})\s+(.*)$/gm, '**$2**');       // demote headings so they don't pollute the note outline
-    const capped = truncateSafely(body, 12000);
-    lines.push('', '<details>', '<summary>Plan / approval</summary>', '', capped, '', '</details>', '');
-  } else {
-    lines.push('  - ↳ _(awaiting approval)_');
+// Calls fn(line, prev) for every line OUTSIDE fenced code (``` / ~~~, the rules of
+// unterminatedFenceCloser) and returns the rebuilt text; fenced lines pass through
+// untouched. fn may return an array to replace one line with several.
+function mapOutsideFences(text, fn) {
+  const out = [];
+  let openChar = '';
+  let openLen = 0;
+  let prev = '';
+  for (const line of String(text).split('\n')) {
+    const m = /^(`{3,}|~{3,})(.*)$/.exec(line.trim());
+    let fenced = openChar !== '';
+    if (m && !openChar) {
+      openChar = m[1][0];
+      openLen = m[1].length;
+      fenced = true;
+    } else if (m && m[1][0] === openChar && m[1].length >= openLen && m[2].trim() === '') {
+      openChar = '';
+      openLen = 0;
+    }
+    if (fenced) {
+      out.push(line);
+    } else {
+      const r = fn(line, prev);
+      if (Array.isArray(r)) out.push(...r);
+      else out.push(r);
+    }
+    prev = line;
   }
+  return out.join('\n');
+}
+
+const ATX_HEADING_RE = /^ {0,3}(#{1,6})[ \t]+(.+?)(?:[ \t]+#+)?[ \t]*$/;
+
+// Narration and plan bodies: headings become bold text, so the outline keeps only
+// the sections this renderer creates. Each stays its own paragraph — Claude writes
+// text right under a heading, and without the blank lines that text would run into
+// the bold line.
+function flattenHeadings(text) {
+  return mapOutsideFences(text, (line) => {
+    const m = ATX_HEADING_RE.exec(line);
+    return m ? ['', `**${m[2].replace(/\*\*/g, '')}**`, ''] : line;
+  });
+}
+
+function minHeadingLevel(text) {
+  let min = 7;
+  mapOutsideFences(text, (line) => {
+    const m = ATX_HEADING_RE.exec(line);
+    if (m) min = Math.min(min, m[1].length);
+    return line;
+  });
+  return min;
+}
+
+// Answer text keeps its own structure, one level below its Answer heading.
+function shiftHeadings(text, delta) {
+  if (!delta) return text;
+  return mapOutsideFences(text, (line) => {
+    const m = ATX_HEADING_RE.exec(line);
+    return m ? `${'#'.repeat(Math.min(6, Math.max(1, m[1].length + delta)))} ${m[2]}` : line;
+  });
+}
+
+// Claude's markdown, made safe for the outline:
+//  - a `---` / `***` / `___` rule becomes <hr>: the Contents panel lists bare rules as
+//    divider rows, and `---` right under a line of text is a setext H2;
+//  - a `===` underline is detached from the text above it (a setext H1);
+//  - a line opening with <details>, <summary> or <hN> is escaped: the panel reads those
+//    as collapsibles and headings, and an unbalanced one re-levels everything after it.
+const RULE_RE = /^ {0,3}(?:-{3,}|\*{3,}|_{3,})[ \t]*$/;
+const SETEXT_H1_RE = /^ {0,3}=+[ \t]*$/;
+const OUTLINE_TAG_RE = /^<\/?(?:details|summary|h[1-6])\b/i;
+function neutralizeOutline(text) {
+  return mapOutsideFences(text, (line, prev) => {
+    if (RULE_RE.test(line)) return ['', '<hr>', ''];
+    if (SETEXT_H1_RE.test(line) && prev.trim()) return ['', line];
+    if (OUTLINE_TAG_RE.test(line.trim())) return line.replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    return line;
+  });
+}
+
+// The owner's English-coaching block (their global CLAUDE.md), which Claude prints
+// at the start or end of a reply: a ─── divider, a quote of the message, a `Better:`
+// rewrite and up to two bullets. It coaches the human message, so it is lifted to
+// sit under that message, minus the divider and the repeated quote. Parsed line by
+// line: the first line that does not fit ends the block, and the text around it
+// stays as it was. A block with nothing to refine (a parenthetical placeholder) is dropped.
+const REFINEMENT_DIVIDER_RE = /^─{10,}[ \t]+English refinement[ \t]*$/;
+function extractRefinements(text) {
+  const lines = String(text).split('\n');
+  const keep = [];
+  const blocks = [];
+  let openChar = '';
+  let openLen = 0;
+  for (let i = 0; i < lines.length; i++) {
+    const t = lines[i].trim();
+    const f = /^(`{3,}|~{3,})(.*)$/.exec(t);
+    if (f && !openChar) {
+      openChar = f[1][0];
+      openLen = f[1].length;
+    } else if (f && f[1][0] === openChar && f[1].length >= openLen && f[2].trim() === '') {
+      openChar = '';
+      openLen = 0;
+    }
+    if (f || openChar || !REFINEMENT_DIVIDER_RE.test(t)) {
+      keep.push(lines[i]);
+      continue;
+    }
+    let j = i + 1;
+    while (j < lines.length && !lines[j].trim()) j++;
+    while (j < lines.length && lines[j].trimStart().startsWith('>')) j++;
+    while (j < lines.length && !lines[j].trim()) j++;
+    const next = j < lines.length ? lines[j].trim() : '';
+    if (next.startsWith('`Better:')) {
+      const block = { better: next, bullets: [] };
+      let k = j + 1;
+      while (k < lines.length && !lines[k].trim()) k++;
+      while (k < lines.length && block.bullets.length < 2 && /^- ".*" -> "/.test(lines[k].trim())) {
+        block.bullets.push(lines[k].trim());
+        k++;
+      }
+      blocks.push(block);
+      i = (block.bullets.length ? k : j + 1) - 1;
+    } else if (/^[*_]?\(.*\)[*_]?$/.test(next)) {
+      i = j; // a placeholder: *(No new user message this turn…)*, (slash command — no prose to refine)
+    } else {
+      keep.push(lines[i]);
+    }
+  }
+  return { text: keep.join('\n').replace(/\n{3,}/g, '\n\n').trim(), blocks };
+}
+
+// Applies fn to the parts of one line that are NOT inline code spans (a backtick
+// run closed by a run of the same length); the spans themselves pass through.
+function mapOutsideCodeSpans(line, fn) {
+  let out = '';
+  let i = 0;
+  while (i < line.length) {
+    const open = line.indexOf('`', i);
+    if (open < 0) { out += fn(line.slice(i)); break; }
+    out += fn(line.slice(i, open));
+    let run = 1;
+    while (line[open + run] === '`') run++;
+    let close = -1;
+    for (let k = line.indexOf('`', open + run); k >= 0; ) {
+      let r = 1;
+      while (line[k + r] === '`') r++;
+      if (r === run) { close = k; break; }
+      k = line.indexOf('`', k + r);
+    }
+    if (close < 0) { out += line.slice(open, open + run); i = open + run; continue; }
+    out += line.slice(open, close + run);
+    i = close + run;
+  }
+  return out;
+}
+
+// A `</details>` in a plan's prose would close the plan's collapsible early, so it
+// is escaped there. Code spans and fenced code render as text and are left alone —
+// escaping them would show `&lt;/details&gt;` to the reader.
+function escapeClosingDetails(text) {
+  return mapOutsideFences(text, (line) => mapOutsideCodeSpans(line, (s) => s.replace(/<\/details>/gi, '&lt;/details&gt;')));
+}
+
+// The plan as finally decided: the approved text when the human approved it (it
+// carries any edits they made in the approval dialog), else the plan as submitted.
+function planOutcome(toolUse, resultMap) {
+  const submitted = String(toolUse.input?.plan || '');
+  const res = resultMap.get(toolUse.id);
+  if (!res) return { status: 'awaiting approval', body: submitted };
+  if (parseRejection(res)) return { status: 'rejected', body: submitted };
+  const txt = resultText(res);
+  if (!txt.startsWith('User has approved your plan')) {
+    return { status: res.is_error ? 'failed' : 'submitted', body: submitted || txt };
+  }
+  const m = /## Approved Plan( \(edited by user\))?:\n([\s\S]*)$/.exec(txt);
+  return { status: m && m[1] ? 'approved (edited by the user)' : 'approved', body: m ? m[2] : submitted };
+}
+
+// Collapsible as before, but opened by a heading that repeats the summary text:
+// Noesis then lists that heading (not the summary) in the outline at its own
+// level and moves it into the summary bar. Its renderer looks only two lines past
+// <summary> for the heading, hence exactly one blank line between them.
+function renderPlanBlock(toolUse, resultMap, level) {
+  const { status, body } = planOutcome(toolUse, resultMap);
+  const title = `Plan — ${status}`;
+  const clean = escapeClosingDetails(flattenHeadings(neutralizeOutline(lf(body).trim())));
+  return [
+    '<details>', `<summary>${title}</summary>`, '', `${'#'.repeat(level)} ${title}`, '',
+    clean ? truncateSafely(clean, 12000) : '_(no plan text)_', '', '</details>',
+  ].join('\n');
+}
+
+function renderStep(toolUse, resultMap) {
+  const res = resultMap.get(toolUse.id);
+  const lines = [`- **${toolUse.name}** — ${summarizeToolUse(toolUse.name, toolUse.input)}`];
+  const rejection = parseRejection(res);
+  if (rejection) {
+    lines.push(`  - ↳ rejected by the user${rejection.feedback ? ' — see the next message' : ''}`);
+    return lines.join('\n');
+  }
+  // Echo-result tools: the tool-use line already names the target, so the
+  // success result is noise — a cat -n file preview for Read, a "… updated
+  // successfully (file state is current …)" confirmation for the writers.
+  // Drop it on success; keep it on error (e.g. "File does not exist",
+  // "String to replace not found"). Outcome-bearing tools (Bash/PowerShell,
+  // Grep, Glob, Web*) keep their result — that result IS the point of the step.
+  const echoTool = toolUse.name === 'Read' || toolUse.name === 'Edit' || toolUse.name === 'Write'
+                || toolUse.name === 'MultiEdit' || toolUse.name === 'NotebookEdit';
+  const r = summarizeToolResult(res);
+  if (r && !(echoTool && !res?.is_error)) lines.push(`  - ↳ ${r}`);
   return lines.join('\n');
 }
 
-function renderUserPrompt(turn, text, entry, queued = false) {
-  const clean = stripImageRefs(text);
-  const imageOnly = !clean;
-  const heading = imageOnly ? '(image)' : (firstWords(clean, 9) || '(empty)');
-  const ts = tsStamp(entry.timestamp);
-  const body = imageOnly ? '_(image attachment)_' : truncateSafely(clean, 3000);
-  const parts = [`### ${turn}. ${heading}`];
-  const meta = [ts, queued ? '_(queued while working)_' : ''].filter(Boolean).join(' · ');
-  if (meta) parts.push(`*${meta}*`);
-  parts.push('', blockquote(body), '');
-  return parts.join('\n');
+// Text pasted on Windows arrives with CRLF. CommonMark treats a lone CR as a line end,
+// but this renderer's line rules (headings, fences, rules) would miss it — normalize.
+const lf = (s) => String(s == null ? '' : s).replace(/\r\n?/g, '\n');
+
+function userText(content) {
+  if (typeof content === 'string') return lf(content);
+  if (!Array.isArray(content)) return '';
+  return lf(content.filter((b) => b && b.type === 'text' && typeof b.text === 'string').map((b) => b.text).join('\n\n'));
+}
+
+function countImages(content) {
+  return Array.isArray(content) ? content.filter((b) => b && b.type === 'image').length : 0;
+}
+
+const isInterrupt = (text) => /^\[Request interrupted by user/.test(String(text).trim());
+
+function taskSummary(text) {
+  const m = /<summary>([\s\S]*?)<\/summary>/.exec(String(text));
+  return m ? oneLine(m[1]) : '';
+}
+
+// A slash command as typed: <command-name>/X</command-name> … <command-args>A</command-args>.
+function parseCommandPrompt(text) {
+  const t = String(text);
+  const name = /<command-name>\s*\/?([^<]*?)\s*<\/command-name>/.exec(t);
+  if (!name || !name[1]) return null;
+  const args = /<command-args>([\s\S]*?)<\/command-args>/.exec(t);
+  return { name: name[1], args: args ? args[1].trim() : '' };
+}
+
+// A command that never reaches Claude (/effort, /model, …) is followed by its own
+// <local-command-stdout|stderr>; a prompt command (a skill, a custom command) is
+// followed by its expanded body (isMeta) and then Claude's reply.
+function isLocalCommand(entries, i) {
+  for (let j = i + 1; j < entries.length && j <= i + 25; j++) {
+    const e = entries[j];
+    if (e.type === 'assistant') return false;
+    if (e.type !== 'user' || e.isMeta) continue;
+    return userText(e.message?.content).trimStart().startsWith('<local-command-');
+  }
+  return false;
+}
+
+// A user entry that a human typed as a prompt (the shape the rewind check compares).
+function isPromptEntry(e) {
+  if (e.type !== 'user' || e.isMeta || e.isSidechain || e.isCompactSummary) return false;
+  const content = e.message?.content;
+  if (Array.isArray(content) && content.some((b) => b && b.type === 'tool_result')) return false;
+  const text = userText(content);
+  if (parseCommandPrompt(text)) return true;
+  if (isInterrupt(text) || isSystemInjection(text)) return false;
+  return !!stripImageRefs(text) || countImages(content) > 0;
+}
+
+// The conversation as it stands: drops subagent (sidechain) entries, and branches
+// the human rewound. Rewinding or editing an earlier message (Esc Esc) leaves the
+// old branch in the file, and the new message is its SIBLING (same parentUuid) — so
+// a prompt with a later sibling prompt is abandoned, with everything under it.
+function pruneEntries(entries) {
+  const live = entries.filter((e) => !e.isSidechain);
+  const lastByParent = new Map();
+  for (const e of live) {
+    if (e.uuid && e.parentUuid && isPromptEntry(e)) lastByParent.set(e.parentUuid, e.uuid);
+  }
+  const abandoned = new Set();
+  for (const e of live) {
+    if (e.uuid && e.parentUuid && isPromptEntry(e) && lastByParent.get(e.parentUuid) !== e.uuid) abandoned.add(e.uuid);
+  }
+  if (!abandoned.size) return live;
+  const parentOf = new Map();
+  for (const e of live) if (e.uuid) parentOf.set(e.uuid, e.parentUuid || null);
+  const memo = new Map();
+  const isAbandoned = (uuid) => {
+    const path = [];
+    let u = uuid;
+    let result = false;
+    while (u && path.length <= parentOf.size) {
+      if (memo.has(u)) { result = memo.get(u); break; }
+      if (abandoned.has(u)) { result = true; break; }
+      path.push(u);
+      u = parentOf.get(u);
+    }
+    for (const p of path) memo.set(p, result);
+    return result;
+  };
+  return live.filter((e) => !e.uuid || !isAbandoned(e.uuid));
+}
+
+// Human messages typed while Claude works wait in a queue until Claude can take
+// them. Replays the queue bookkeeping and returns those still waiting.
+function pendingQueuedPrompts(entries) {
+  const queue = [];
+  for (const e of entries) {
+    if (e.type !== 'queue-operation') continue;
+    const content = typeof e.content === 'string' ? e.content : '';
+    if (e.operation === 'enqueue') queue.push(content);
+    else if (e.operation === 'dequeue') queue.shift();
+    else if (e.operation === 'remove') {
+      const at = queue.indexOf(content);
+      if (at >= 0) queue.splice(at, 1);
+      else queue.shift();
+    }
+  }
+  return queue.filter((t) => stripImageRefs(t) && !isSystemInjection(t));
+}
+
+// Claude Code 2.1+ writes a turn_duration / stop_hook_summary marker when a turn
+// ends; without one, the latest turn is still running. Older CLIs never write them.
+function turnMarkersExpected(entries) {
+  let version = '';
+  for (const e of entries) {
+    if (e.type === 'system' && (e.subtype === 'turn_duration' || e.subtype === 'stop_hook_summary')) return true;
+    if (typeof e.version === 'string' && e.version) version = e.version;
+  }
+  const m = /^(\d+)\.(\d+)/.exec(version);
+  return !!m && (Number(m[1]) > 2 || (Number(m[1]) === 2 && Number(m[2]) >= 1));
+}
+
+// One pass over the transcript: sections (one per human message), each split into
+// rounds (one per uninterrupted agent run), each round a list of items.
+function collectSections(entries, resultMap) {
+  const toolNames = buildToolNameMap(entries);
+  const live = pruneEntries(entries);
+  const sections = [];
+  let cur = null;
+  let round = null;
+  let turnEnded = false;      // a turn-end marker arrived after Claude's last output
+  let trigger = null;         // what woke Claude up for the next round
+  let wakeupPending = false;  // scheduled_task_fire seen; the next user entry is its prompt
+  let commandSection = null;  // a just-opened command section, until its isMeta body passes
+
+  const openRound = (label) => {
+    round = { trigger: label, items: [], ended: false };
+    cur.rounds.push(round);
+  };
+  const openSection = (prompt) => {
+    cur = { prompt, rounds: [], refinement: null };
+    sections.push(cur);
+    openRound(null);
+    turnEnded = false;
+    trigger = null;
+    wakeupPending = false;
+    commandSection = null;
+  };
+  const ensureSection = () => { if (!cur) openSection(null); };
+  const addMarker = (md) => {
+    ensureSection();
+    round.items.push({ kind: 'marker', md });
+  };
+  const endTurn = () => {
+    if (!cur) return;
+    turnEnded = true;
+    round.ended = true;
+  };
+  const addInterrupt = () => {
+    ensureSection();
+    const last = round.items[round.items.length - 1];
+    if (!(last && last.kind === 'step' && last.rejected)) round.items.push({ kind: 'marker', md: '_Interrupted by the user._' });
+    endTurn();
+  };
+
+  for (let i = 0; i < live.length; i++) {
+    const e = live[i];
+    const content = e.message?.content;
+
+    if (e.type === 'system') {
+      if (e.subtype === 'turn_duration' || e.subtype === 'stop_hook_summary') endTurn();
+      else if (e.subtype === 'scheduled_task_fire') wakeupPending = true;
+      continue;
+    }
+
+    if (e.type === 'attachment') {
+      const a = e.attachment || {};
+      if (a.type === 'queued_command') {
+        const text = userText(a.prompt);
+        const human = a.commandMode === 'prompt' && (!a.origin || a.origin.kind === 'human');
+        if (human && (stripImageRefs(text) || countImages(a.prompt)) && !isSystemInjection(text)) {
+          // Typed while Claude was working; this is where it actually reached Claude.
+          openSection({ text, ts: e.timestamp, images: countImages(a.prompt), meta: ['sent while Claude was working'] });
+        } else if (text.trimStart().startsWith('<task-notification')) {
+          const s = taskSummary(text);
+          addMarker(`_Background task finished${s ? `: ${esc(s)}` : ''}._`);
+        }
+      } else if (a.type === 'hook_blocking_error' && a.hookEvent === 'Stop' && turnEnded) {
+        trigger = trigger || 'a Stop hook kept Claude working';
+      }
+      continue;
+    }
+
+    if (e.type === 'user') {
+      if (Array.isArray(content) && content.some((b) => b && b.type === 'tool_result')) {
+        for (const b of content) {
+          if (b && b.type === 'tool_result') {
+            const rejection = parseRejection(b);
+            if (rejection && rejection.feedback) {
+              openSection({
+                text: rejection.feedback, ts: e.timestamp, images: 0,
+                meta: [`reply to a rejected ${rejectedToolLabel(toolNames.get(b.tool_use_id))}`],
+              });
+            }
+          } else if (b && b.type === 'text' && isInterrupt(b.text)) {
+            addInterrupt();
+          }
+        }
+        continue;
+      }
+      const raw = userText(content);
+      const images = countImages(content);
+      if (e.isMeta) {
+        if (wakeupPending) {
+          trigger = `scheduled wakeup: ${firstWords(stripImageRefs(raw), 6)}`;
+          wakeupPending = false;
+        } else if (/^Your claude\.ai usage limit has reset/.test(raw.trim())) {
+          trigger = 'resumed after the usage limit reset';
+        } else if (commandSection && commandSection === cur && images) {
+          cur.prompt.images += images; // a prompt command's images ride on its expanded body
+        }
+        continue;
+      }
+      if (e.isCompactSummary) {
+        addMarker('_Context compacted here — Claude continued from a summary of the conversation above._');
+        continue;
+      }
+      if (isInterrupt(raw)) { addInterrupt(); continue; }
+      if (raw.trimStart().startsWith('<task-notification')) {
+        const s = firstWords(taskSummary(raw), 12);
+        trigger = `background task finished${s ? `: ${s}` : ''}`;
+        continue;
+      }
+      if (raw.trimStart().startsWith('<bash-input>')) {
+        const cmd = /<bash-input>([\s\S]*?)<\/bash-input>/.exec(raw);
+        addMarker(`_Ran in the shell: \`${oneLine(cmd ? cmd[1] : '').slice(0, 160)}\`_`);
+        continue;
+      }
+      const command = parseCommandPrompt(raw);
+      if (command) {
+        if (isLocalCommand(live, i)) continue;
+        const text = `/${command.name}${command.args ? ` ${command.args}` : ''}`;
+        if (wakeupPending) {
+          trigger = `scheduled wakeup: ${firstWords(text, 6)}`;
+          wakeupPending = false;
+          continue;
+        }
+        openSection({ text, ts: e.timestamp, images, meta: [], isCommand: true });
+        commandSection = cur;
+        continue;
+      }
+      if (typeof content === 'string' && isSystemInjection(content)) continue;
+      const text = lf(typeof content === 'string' ? content
+        : (Array.isArray(content) ? content : [])
+          .filter((b) => b && b.type === 'text' && typeof b.text === 'string' && !isSystemInjection(b.text))
+          .map((b) => b.text).join('\n\n'));
+      if (!stripImageRefs(text) && !images) continue;
+      if (wakeupPending) {
+        trigger = `scheduled wakeup: ${firstWords(stripImageRefs(text), 6)}`;
+        wakeupPending = false;
+        continue;
+      }
+      openSection({ text, ts: e.timestamp, images, meta: [] });
+      continue;
+    }
+
+    if (e.type === 'assistant' && Array.isArray(content)) {
+      if (e.message?.model === '<synthetic>') {
+        // Harness-written: API errors, "You've hit your session limit", "No response requested."
+        const t = oneLine(userText(content));
+        if (!t || t === 'No response requested.') continue;
+        if (trigger) {
+          // Woken up (e.g. by a finished background task) straight into an error:
+          // the wake-up still gets its own round.
+          ensureSection();
+          openRound(trigger);
+          trigger = null;
+          turnEnded = false;
+        }
+        addMarker(`_${esc(t)}_`);
+        continue;
+      }
+      const blocks = content.filter((b) => b && ((b.type === 'text' && b.text && b.text.trim()) || b.type === 'tool_use'));
+      if (!blocks.length) continue; // thinking-only entries
+      ensureSection();
+      if (turnEnded || trigger) {
+        if (round.items.length || trigger) openRound(trigger || 'continued');
+        turnEnded = false;
+        trigger = null;
+      }
+      wakeupPending = false;
+      commandSection = null;
+      for (const b of blocks) {
+        if (b.type === 'text') round.items.push({ kind: 'text', text: lf(b.text).trim() });
+        else if (b.name === 'AskUserQuestion') round.items.push({ kind: 'decision', use: b });
+        else if (b.name === 'ExitPlanMode') round.items.push({ kind: 'plan', use: b });
+        else round.items.push({ kind: 'step', use: b, rejected: !!parseRejection(resultMap.get(b.id)) });
+      }
+    }
+  }
+
+  // A command section that got no reply and is followed by another section was a
+  // local command whose output never showed up — not a prompt.
+  return sections.filter((s, i) => !(s.prompt && s.prompt.isCommand && i < sections.length - 1
+    && s.rounds.every((r) => !r.items.length)));
+}
+
+// Moves the section's first English-refinement block under its prompt and strips
+// the rest; text items left empty are dropped.
+function liftRefinements(section) {
+  for (const r of section.rounds) {
+    for (const it of r.items) {
+      if (it.kind !== 'text') continue;
+      const { text, blocks } = extractRefinements(it.text);
+      it.text = text;
+      if (!section.refinement && blocks.length) section.refinement = blocks[0];
+    }
+    r.items = r.items.filter((it) => it.kind !== 'text' || it.text);
+  }
+}
+
+// A message is quoted as written: a heading, rule or raw tag the human pasted into it
+// stays text inside the quote instead of becoming a heading or collapsible in the note.
+// Code blocks are quoted untouched.
+function plainQuoteText(text) {
+  return mapOutsideFences(neutralizeOutline(text), (line) => line.replace(/^( {0,3})(#{1,6})(?=[ \t]|$)/, '$1\\$2'));
+}
+
+function renderPromptHeader(num, section) {
+  const p = section.prompt;
+  const clean = stripImageRefs(p.text);
+  const heading = clean ? (firstWords(clean, 9) || '(empty)') : '(image)';
+  const meta = [tsStamp(p.ts), ...p.meta, p.images ? `${p.images} image${p.images === 1 ? '' : 's'}` : ''].filter(Boolean);
+  const lines = [`## ${num}. ${esc(heading)}`];
+  if (meta.length) lines.push(`*${meta.join(' · ')}*`);
+  lines.push('', blockquote(clean ? plainQuoteText(truncateSafely(clean, 3000)) : '_(image attachment)_'), '');
+  const ref = section.refinement;
+  if (ref) lines.push(ref.better, '', ...ref.bullets, '');
+  return lines.join('\n');
+}
+
+// A round splits at its last tool step: what came before is the working process,
+// the text after it is the answer. A round that is still running has no answer yet.
+function renderRound(r, base, running, resultMap) {
+  const items = r.items;
+  let lastWork = -1;
+  items.forEach((it, i) => { if (it.kind === 'step' || it.kind === 'decision' || it.kind === 'plan') lastWork = i; });
+  const tail = items.slice(lastWork + 1);
+  const split = !running && tail.some((it) => it.kind === 'text') ? lastWork + 1 : items.length;
+  const heading = '#'.repeat(base);
+  const chunks = [];
+  const work = items.slice(0, split);
+  if (work.length) {
+    chunks.push({ md: `${heading} Working process` });
+    for (const it of work) {
+      if (it.kind === 'text') chunks.push({ md: closeOpenFence(flattenHeadings(neutralizeOutline(it.text))) });
+      else if (it.kind === 'step') chunks.push({ md: renderStep(it.use, resultMap), step: true });
+      else if (it.kind === 'decision') chunks.push({ md: renderDecisionBlock(it.use, resultMap, base + 1) });
+      else if (it.kind === 'plan') chunks.push({ md: renderPlanBlock(it.use, resultMap, base + 1) });
+      else chunks.push({ md: it.md });
+    }
+  }
+  const answer = items.slice(split);
+  if (answer.length) {
+    chunks.push({ md: `${heading} Answer` });
+    const min = Math.min(7, ...answer.filter((it) => it.kind === 'text').map((it) => minHeadingLevel(it.text)));
+    const delta = min <= 6 ? base + 1 - min : 0;
+    for (const it of answer) {
+      chunks.push({ md: it.kind === 'text' ? closeOpenFence(shiftHeadings(neutralizeOutline(it.text), delta)) : it.md });
+    }
+  }
+  // Consecutive tool steps stay one tight list; everything else is its own block.
+  return chunks.map((c, i) => (i && c.step && chunks[i - 1].step ? '' : '\n') + c.md).join('\n').trim();
 }
 
 function render(entries, meta) {
   const resultMap = buildResultMap(entries);
+  const sections = collectSections(entries, resultMap);
+  const markers = turnMarkersExpected(entries);
   const out = [];
-  out.push(frontmatter(meta));
-  out.push(`# ${meta.title}`, '');
+  out.push(`${frontmatter(meta)}# ${meta.title}`, '');
   out.push(`> Live capture of source session \`${meta.sessionId}\`. Auto-generated — do not edit by hand.`, '');
-  out.push('## Conversation', '');
 
-  let turn = 0;
-  for (const e of entries) {
-    const content = e.message?.content;
-    if (e.type === 'user') {
-      if (typeof content === 'string') {
-        if (!isSystemInjection(content)) { turn++; out.push(renderUserPrompt(turn, content, e)); }
-      } else if (Array.isArray(content)) {
-        const hasToolResult = content.some((b) => b?.type === 'tool_result');
-        if (!hasToolResult) {
-          const texts = content
-            .filter((b) => b?.type === 'text' && b.text && !isSystemInjection(b.text))
-            .map((b) => b.text);
-          if (texts.length) { turn++; out.push(renderUserPrompt(turn, texts.join('\n\n'), e)); }
-        }
-        // tool_result blocks are folded into the assistant tool_use rendering below
-      }
-    } else if (e.type === 'queue-operation' && e.operation === 'enqueue') {
-      // Messages the user sent while the agent was working are persisted here,
-      // NOT as `user` entries. Render real ones; skip task-notification plumbing.
-      const text = typeof e.content === 'string' ? e.content : '';
-      if (text.trim() && !isSystemInjection(text)) {
-        turn++;
-        out.push(renderUserPrompt(turn, text, e, true));
-      }
-    } else if (e.type === 'assistant' && Array.isArray(content)) {
-      let emitted = false;
-      for (const b of content) {
-        if (b.type === 'text') {
-          if (b.text && b.text.trim()) { out.push(b.text.trim(), ''); emitted = true; }
-        } else if (b.type === 'thinking') {
-          // omitted (readable depth)
-        } else if (b.type === 'tool_use') {
-          if (b.name === 'AskUserQuestion') out.push(renderDecisionBlock(b, resultMap));
-          else if (b.name === 'ExitPlanMode') out.push(renderPlanBlock(b, resultMap));
-          else {
-            out.push(`- **${b.name}** — ${summarizeToolUse(b.name, b.input)}`);
-            const res = resultMap.get(b.id);
-            // Echo-result tools: the tool-use line already names the target, so the
-            // success result is noise — a cat -n file preview for Read, a "… updated
-            // successfully (file state is current …)" confirmation for the writers.
-            // Drop it on success; keep it on error (e.g. "File does not exist",
-            // "String to replace not found"). Outcome-bearing tools (Bash/PowerShell,
-            // Grep, Glob, Web*) keep their result — that result IS the point of the step.
-            const echoTool = b.name === 'Read' || b.name === 'Edit' || b.name === 'Write'
-                          || b.name === 'MultiEdit' || b.name === 'NotebookEdit';
-            const r = summarizeToolResult(res);
-            if (r && !(echoTool && !res?.is_error)) out.push(`  - ↳ ${r}`);
-          }
-          emitted = true;
-        }
-      }
-      if (emitted) out.push('');
-    }
+  let num = 0;
+  sections.forEach((s, si) => {
+    liftRefinements(s);
+    out.push(s.prompt ? renderPromptHeader(++num, s) : '## Session start\n');
+    let followUps = 0;
+    s.rounds.forEach((r, ri) => {
+      if (!r.items.length) return;
+      const running = markers && !r.ended && si === sections.length - 1 && ri === s.rounds.length - 1;
+      if (ri > 0) out.push(`### Follow-up ${++followUps} — ${esc(r.trigger || 'continued')}`, '');
+      out.push(renderRound(r, ri > 0 ? 4 : 3, running, resultMap), '');
+    });
+  });
+
+  for (const text of pendingQueuedPrompts(entries)) {
+    out.push(`_Queued, not yet seen by Claude: “${esc(oneLine(stripImageRefs(text)).slice(0, 300))}”_`, '');
   }
-
   return `${out.join('\n').replace(/\n{3,}/g, '\n\n').trimEnd()}\n`;
 }
 
