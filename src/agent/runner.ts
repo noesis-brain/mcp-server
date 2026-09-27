@@ -16,6 +16,7 @@
 
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
+import { checkWebFetchUrl, webFetchEnvWarnings, type UrlVerdict } from './webGuard.js';
 
 const POLL_INTERVAL_MS = 2000;      // idle poll cadence
 const CHUNK_FLUSH_MS = 500;         // batch streamed deltas before POST /events
@@ -73,6 +74,17 @@ const ALLOWED_TOOLS = new Set([
   'mcp__noesis__list_notes',
 ]);
 
+/**
+ * Claude Code built-ins a server may request: network-only, no filesystem access. This is
+ * the ONLY route by which the SDK's `tools` option is ever non-empty (see buildQueryOptions).
+ *
+ * A separate list from ALLOWED_TOOLS on purpose, and never pre-approved: every call goes
+ * through buildCanUseTool, where a WebFetch URL must pass webGuard, because this daemon
+ * runs on the user's own machine and "fetch http://192.168.1.1" would reach their LAN.
+ * The backend asks for these only for a Navi whose Web Search toggle is on.
+ */
+const ALLOWED_WEB_TOOLS = ['WebFetch', 'WebSearch'] as const;
+
 /** Highest turn budget a server may request; a tool loop otherwise burns the subscription. */
 const MAX_TURNS_CEILING = 12;
 
@@ -83,6 +95,12 @@ export function clampAllowedTools(raw: unknown): string[] {
   const dropped = (raw as unknown[]).length - kept.length;
   if (dropped > 0) console.error(`[noesis-agent] dropped ${dropped} tool name(s) not on the read-only allowlist`);
   return kept;
+}
+
+/** The web built-ins this job asked for, in a fixed order. Nothing else can come out. */
+export function clampWebTools(raw: unknown): string[] {
+  if (!Array.isArray(raw)) return [];
+  return ALLOWED_WEB_TOOLS.filter((t) => raw.includes(t));
 }
 
 /** Clamp the server-requested turn budget into a sane range. */
@@ -256,14 +274,16 @@ type PermissionDecision =
 /**
  * SECOND, INDEPENDENT LAYER on the tool boundary.
  *
- * `tools: []` below is the primary control, but it works by way of the CLI's `--tools ""`
- * flag, whose handling lives in a minified `cli.js` we cannot audit. This callback is a
+ * The `tools` option below (`[]`, or at most the two web tools) is the primary control, but
+ * it works by way of the CLI's `--tools` flag, whose handling lives in a minified `cli.js`
+ * we cannot audit. This callback is a
  * gate we own outright: the SDK routes every permission request through it
  * (`--permission-prompt-tool stdio`), and the request carries an `agentID`, so calls made
  * by a spawned `Task` SUBAGENT are covered too — which matters, because a subagent, not
  * the main loop, did the file reading in the 2026-08-14 incident.
  *
- * Deliberately reuses ALLOWED_TOOLS so the daemon has ONE definition of what may run.
+ * Deliberately fed from ALLOWED_TOOLS / ALLOWED_WEB_TOOLS (via the per-job clamps) so the
+ * daemon has ONE definition of what may run.
  *
  * DO NOT DELETE THIS AS DEAD CODE. It is the ONLY daemon-owned control over MCP tools.
  * `tools: []` governs the SDK's BUILT-IN set and nothing else; the Noesis MCP server we
@@ -285,6 +305,13 @@ type PermissionDecision =
  * callback is never consulted there. Nothing executes — but that is Claude Code internal
  * behaviour we neither own nor test, which is why the daemon is rooted at a neutral cwd
  * (`scripts/start-agent.sh`), so the warmup probes an empty directory, not a source tree.
+ *
+ * WEB TOOLS: a permitted WebFetch is still refused unless its URL passes webGuard (public
+ * http(s) host only). The job's permitted set is checked FIRST, so a job never cleared
+ * for web cannot fetch even a public page. WebSearch needs no address check: the search
+ * runs on Anthropic's side, not from this machine. One exception the gate cannot see: the
+ * CLI itself pre-approves ~85 public documentation hosts for WebFetch and never asks. Those
+ * are public by definition, and executeJob logs every tool call from the stream anyway.
  */
 export function buildCanUseTool(
   /**
@@ -297,52 +324,79 @@ export function buildCanUseTool(
    * unnoticed until the first job kind with a narrower allowlist.
    */
   permitted: Iterable<string>,
-  onDecision: (toolName: string, allowed: boolean, agentID?: string) => void = logToolDecision,
+  onDecision: (toolName: string, allowed: boolean, agentID?: string, detail?: string) => void = logToolDecision,
+  checkUrl: (url: unknown) => Promise<UrlVerdict> = checkWebFetchUrl,
 ): (toolName: string, input?: unknown, ctx?: { agentID?: string }) => Promise<PermissionDecision> {
   const permittedSet = new Set(permitted);
   return async (toolName, input, ctx) => {
-    const allowed = permittedSet.has(toolName);
-    onDecision(toolName, allowed, ctx?.agentID);
-    return allowed
-      ? { behavior: 'allow', updatedInput: (input ?? {}) as Record<string, unknown> }
-      : { behavior: 'deny', message: `Tool "${toolName}" is not permitted for a Noesis job.` };
+    if (!permittedSet.has(toolName)) {
+      onDecision(toolName, false, ctx?.agentID);
+      return { behavior: 'deny', message: `Tool "${toolName}" is not permitted for a Noesis job.` };
+    }
+    const args = (input ?? {}) as Record<string, unknown>;
+    if (toolName === 'WebFetch') {
+      const verdict = await checkUrl(args.url);
+      if (!verdict.ok) {
+        onDecision(toolName, false, ctx?.agentID, `${String(args.url)} (${verdict.reason})`);
+        return {
+          behavior: 'deny',
+          message: `WebFetch refused: ${verdict.reason}. Only public internet addresses can be fetched.`,
+        };
+      }
+    }
+    onDecision(toolName, true, ctx?.agentID, toolCallDetail(toolName, args));
+    return { behavior: 'allow', updatedInput: args };
   };
 }
 
+/** The URL or query a web tool call is about, for the log; undefined for other tools. */
+function toolCallDetail(toolName: string, args: Record<string, unknown>): string | undefined {
+  const value = toolName === 'WebFetch' ? args.url : toolName === 'WebSearch' ? args.query : undefined;
+  return typeof value === 'string' ? value.slice(0, 300) : undefined;
+}
+
 /** Default sink: stderr, so the daemon log is the evidence for whether the gate ever fires. */
-function logToolDecision(toolName: string, allowed: boolean, agentID?: string): void {
+function logToolDecision(toolName: string, allowed: boolean, agentID?: string, detail?: string): void {
   console.error(
-    `[noesis-agent] canUseTool ${allowed ? 'ALLOW' : 'DENY'} ${toolName}${agentID ? ` (agent=${agentID})` : ''}`,
+    `[noesis-agent] canUseTool ${allowed ? 'ALLOW' : 'DENY'} ${toolName}${detail ? ` ${detail}` : ''}${agentID ? ` (agent=${agentID})` : ''}`,
   );
 }
 
 /**
  * The `options` object handed to sdk.query() — extracted, like buildSdkPrompt above, so
- * the tool boundary is asserted by a test instead of resting on a comment. `tools: []`
- * is the security-relevant field: see the note at its assignment. Takes the MCP-server
+ * the tool boundary is asserted by a test instead of resting on a comment. `tools` is the
+ * security-relevant field: see the note at its assignment. Takes the MCP-server
  * factory as an argument so a test can supply a stub instead of a real spawn config.
  */
 export function buildQueryOptions(
   payload: JobPayload,
   mcpServersFor: () => Record<string, unknown>,
 ): Record<string, unknown> {
-  const allowedTools = clampAllowedTools(payload.allowedTools);
+  const requested = Array.isArray(payload.allowedTools) ? payload.allowedTools : [];
+  const webTools = clampWebTools(requested);
+  // Web names have their own clamp; keeping them out of this one stops it logging them as
+  // "dropped" on every web job. What it keeps is unchanged: the four read-only lookups.
+  const allowedTools = clampAllowedTools(requested.filter((t) => !webTools.includes(t)));
   return {
     ...(payload.system ? { systemPrompt: payload.system } : {}),
-    // Suppress the SDK's built-in tool set entirely (`--tools ""`). Without it the CLI
-    // defaults to ALL built-ins — Bash, Read, Write, Edit, Grep, WebSearch — and
-    // ALLOWED_TOOLS above does NOT stop them: `allowedTools` is a PERMISSION allowlist,
-    // so unlisted tools are un-pre-approved, not absent, and their definitions still
-    // reach the model. Worse, the read-only built-ins need no approval at all, so they
-    // actually EXECUTE headless: on 2026-08-14 an English-coach Navi grepped this
-    // daemon's cwd and returned ~100 strings from the user's source tree (jobs 527/528);
-    // only the follow-up file Write stopped, at the permission gate. Unconditional by
-    // design — a server-supplied payload must never be able to ask for a filesystem
-    // primitive. MCP tools travel a separate channel (`--mcp-config`) and are
-    // unaffected: a `use_knowledge_base` Navi still calls search_notes (verified).
-    tools: [],
+    // Suppress the SDK's built-in tool set (`--tools <list>`) down to at most the two web
+    // tools. Without the option the CLI defaults to ALL built-ins — Bash, Read, Write,
+    // Edit, Grep, WebSearch — and ALLOWED_TOOLS above does NOT stop them: `allowedTools`
+    // is a PERMISSION allowlist, so unlisted tools are un-pre-approved, not absent, and
+    // their definitions still reach the model. Worse, the read-only built-ins need no
+    // approval at all, so they actually EXECUTE headless: on 2026-08-14 an English-coach
+    // Navi grepped this daemon's cwd and returned ~100 strings from the user's source tree
+    // (jobs 527/528); only the follow-up file Write stopped, at the permission gate.
+    // So this is `[]` for every job that did not ask for web, and never more than
+    // ALLOWED_WEB_TOOLS — network-only, no filesystem access. A server-supplied payload
+    // still can never ask for a filesystem primitive. MCP tools travel a separate channel
+    // (`--mcp-config`) and are unaffected: a `use_knowledge_base` Navi still calls
+    // search_notes (verified).
+    tools: webTools,
     // Independent second layer — see buildCanUseTool. Covers subagent (`Task`) calls too.
-    canUseTool: buildCanUseTool(allowedTools),
+    // Web tools are deliberately left out of `allowedTools` below (never pre-approved),
+    // so every WebFetch reaches this gate and its URL check.
+    canUseTool: buildCanUseTool([...allowedTools, ...webTools]),
     allowedTools,
     // Only spawn the Noesis MCP server when a tool actually survived clamping.
     ...(allowedTools.length > 0 ? { mcpServers: mcpServersFor() } : {}),
@@ -411,33 +465,107 @@ async function executeJob(cfg: AgentConfig, job: ClaimedJob, sink: EventSink): P
   const sdk: any = await import(sdkModule).catch(() => {
     throw new Error('Install @anthropic-ai/claude-agent-sdk to run the Noesis local agent (real mode).');
   });
+  const stream = runSdkQuery(sdk, job.payload, job.kind, () => noesisMcpServers(cfg));
+  return consumeAgentStream(stream, sink);
+}
+
+/**
+ * Appended when the SDK stops a run at maxTurns. Without it the saved reply would be only
+ * the narration that came before the tool calls ("let me check the official page…"), with
+ * nothing saying the answer was cut off.
+ */
+export const TURN_LIMIT_NOTE = '\n\n_(Stopped at the step limit before finishing. Ask me to continue.)_';
+
+/**
+ * Turn one SDK message stream into the reply text, pushing it to `out` as it arrives.
+ * Extracted from executeJob so these rules are testable against a fake stream:
+ *  - With includePartialMessages the stream carries BOTH incremental `stream_event` deltas
+ *    AND a terminal `assistant` message holding the whole reply. Taking both would emit the
+ *    answer twice, so deltas win and the terminal message is only a fallback for a stream
+ *    that produced none (older SDK, or partials unsupported).
+ *  - A multi-turn run (every web fetch or note lookup) gets a paragraph break between turns,
+ *    so narration does not run into the answer. Only when the next turn actually has text,
+ *    so a tool-only turn adds nothing.
+ *  - Every tool call is logged, including WebFetch calls to the hosts the CLI pre-approves
+ *    itself, which never reach canUseTool.
+ *  - Hitting maxTurns appends TURN_LIMIT_NOTE.
+ */
+export async function consumeAgentStream(
+  stream: AsyncIterable<unknown>,
+  out: { push(text: string): void; isClosed(): boolean },
+  logToolCall: (name: string, detail?: string) => void = logStreamToolCall,
+): Promise<string> {
   let finalText = '';
   let sawDelta = false;
   let terminalText = '';
-  const stream = runSdkQuery(sdk, job.payload, job.kind, () => noesisMcpServers(cfg));
-  // With includePartialMessages the stream carries BOTH incremental `stream_event`
-  // deltas AND a terminal `assistant` message holding the whole reply. Taking both
-  // would emit the answer twice, so deltas win and the terminal message is only a
-  // fallback for a stream that produced none (older SDK, or partials unsupported).
+  let breakPending = false;
+  let hitTurnLimit = false;
+  const emit = (text: string) => {
+    out.push(text);
+    finalText += text;
+  };
   for await (const message of stream) {
-    if (sink.isClosed()) break;
+    if (out.isClosed()) break;
+    if (isMessageStart(message)) {
+      if (finalText) breakPending = true;
+      continue;
+    }
     const delta = extractStreamDelta(message);
     if (delta) {
       sawDelta = true;
-      sink.push(delta);
-      finalText += delta;
+      if (breakPending) {
+        breakPending = false;
+        const gap = paragraphGap(finalText);
+        if (gap) emit(gap);
+      }
+      emit(delta);
       continue;
     }
+    for (const call of extractToolUses(message)) logToolCall(call.name, call.detail);
+    if (isTurnLimitResult(message)) hitTurnLimit = true;
     // Concatenate, don't overwrite: with tools the run is multi-turn, and a
     // stream that produced no deltas would otherwise keep only the LAST turn.
     const whole = extractTerminalText(message);
-    if (whole) terminalText += whole;
+    if (whole) terminalText += (terminalText ? paragraphGap(terminalText) : '') + whole;
   }
   if (!sawDelta && terminalText) {
-    sink.push(terminalText);
+    out.push(terminalText);
     finalText = terminalText;
   }
+  if (hitTurnLimit && !out.isClosed()) emit(finalText ? TURN_LIMIT_NOTE : TURN_LIMIT_NOTE.trimStart());
   return finalText;
+}
+
+/** What to insert after `text` so the next turn starts a new paragraph. */
+function paragraphGap(text: string): string {
+  if (text.endsWith('\n\n')) return '';
+  return text.endsWith('\n') ? '\n' : '\n\n';
+}
+
+/** The start of a new model turn: one `message_start` per assistant message. */
+function isMessageStart(message: unknown): boolean {
+  const m = message as Record<string, any> | null;
+  return m?.type === 'stream_event' && m.event?.type === 'message_start';
+}
+
+/** The SDK's terminal `result` when the run was stopped by maxTurns. */
+function isTurnLimitResult(message: unknown): boolean {
+  const m = message as Record<string, any> | null;
+  return m?.type === 'result' && m.subtype === 'error_max_turns';
+}
+
+/** Tool calls in a complete `assistant` message, with the URL or query each is about. */
+function extractToolUses(message: unknown): Array<{ name: string; detail?: string }> {
+  const m = message as Record<string, any> | null;
+  if (m?.type !== 'assistant' || !Array.isArray(m.message?.content)) return [];
+  return m.message.content
+    .filter((b: any) => b?.type === 'tool_use' && typeof b.name === 'string')
+    .map((b: any) => ({ name: b.name as string, detail: toolCallDetail(b.name, b.input ?? {}) }));
+}
+
+/** Default sink: stderr, next to the canUseTool lines. */
+function logStreamToolCall(name: string, detail?: string): void {
+  console.error(`[noesis-agent] tool_use ${name}${detail ? ` ${detail}` : ''}`);
 }
 
 /**
@@ -502,6 +630,7 @@ export async function runAgentDaemon(cfg: AgentConfig, signal?: AbortSignal): Pr
     console.error('[noesis-agent] WARNING: ANTHROPIC_API_KEY is set — unsetting it so the Claude Agent SDK uses your subscription, not the metered API.');
     delete process.env.ANTHROPIC_API_KEY;
   }
+  for (const warning of webFetchEnvWarnings(process.env)) console.error(warning);
   console.error(startupBanner(cfg));
 
   const workers = Array.from({ length: cfg.concurrency }, (_, i) => workerLoop(cfg, `worker-${i + 1}`, signal));

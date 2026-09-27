@@ -2,7 +2,8 @@ import { describe, it, expect } from 'vitest';
 import { readFileSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { clampAllowedTools, clampMaxTurns, buildQueryOptions, buildCanUseTool, runSdkQuery } from '../src/agent/runner.js';
+import { clampAllowedTools, clampWebTools, clampMaxTurns, buildQueryOptions, buildCanUseTool, runSdkQuery } from '../src/agent/runner.js';
+import type { UrlVerdict } from '../src/agent/webGuard.js';
 
 /**
  * This is the SECURITY BOUNDARY for the local agent daemon.
@@ -78,6 +79,38 @@ describe('clampAllowedTools — the daemon-side allowlist', () => {
   });
 });
 
+/**
+ * The web half of the allowlist (2.2.0). The only built-ins a server may ever ask for, and
+ * both are network-only: nothing here can read or write a file. Pinned by exact output, so
+ * the set cannot grow by a name nobody thought to list.
+ */
+describe('clampWebTools — the only built-ins a job may request', () => {
+  it('keeps WebFetch and WebSearch, in a fixed order, once each', () => {
+    expect(clampWebTools(['WebSearch', 'WebFetch', 'WebSearch'])).toEqual(['WebFetch', 'WebSearch']);
+    expect(clampWebTools(['WebFetch'])).toEqual(['WebFetch']);
+  });
+
+  it('never lets a filesystem, shell or subagent built-in through', () => {
+    const everyBuiltIn = ['Bash', 'Read', 'Write', 'Edit', 'MultiEdit', 'Glob', 'Grep', 'LS', 'Task', 'NotebookEdit', 'TodoWrite', 'KillShell', 'BashOutput'];
+    expect(clampWebTools(everyBuiltIn)).toEqual([]);
+    expect(clampWebTools([...everyBuiltIn, 'WebFetch', 'WebSearch'])).toEqual(['WebFetch', 'WebSearch']);
+  });
+
+  it('ignores Noesis tools (they belong to the other clamp) and every spoofed spelling', () => {
+    expect(clampWebTools([
+      'mcp__noesis__get_note', 'webfetch', 'WEBSEARCH', 'WebFetch ', ' WebSearch', 'WebFetch(domain:*)',
+      'WebFetch\nBash', 'Web*', '*', 'mcp__noesis__WebFetch',
+    ])).toEqual([]);
+  });
+
+  it('survives non-array and hostile shapes', () => {
+    expect(clampWebTools(undefined)).toEqual([]);
+    expect(clampWebTools('WebFetch')).toEqual([]);
+    expect(clampWebTools({ 0: 'WebFetch', length: 1 })).toEqual([]);
+    expect(clampWebTools([['WebFetch'], null, 7])).toEqual([]);
+  });
+});
+
 describe('clampMaxTurns — a server cannot burn the subscription in a tool loop', () => {
   it('caps an absurd request', () => {
     expect(clampMaxTurns(10_000)).toBe(12);
@@ -102,7 +135,9 @@ describe('clampMaxTurns — a server cannot burn the subscription in a tool loop
  * read-only members (Read/Grep/Glob) need no approval and therefore execute headless.
  * A transform-only English-coach Navi used them to grep the daemon's cwd and return
  * ~100 strings from the user's source tree (real jobs 527/528). `tools: []` is what
- * closes that, and it must stay unconditional — no payload field may re-open it.
+ * closes that. Since 2.2.0 a job may ask for the two network-only web built-ins (web
+ * Navis) — but no payload field may ever re-open a filesystem or shell built-in, and a
+ * job that did not ask for web still gets exactly `[]`.
  */
 describe('buildQueryOptions — the built-in tool set is always suppressed', () => {
   const noMcp = () => ({});
@@ -151,6 +186,45 @@ describe('buildQueryOptions — the built-in tool set is always suppressed', () 
       expect({ mask, has: 'tools' in opts }).toEqual({ mask, has: true });
       expect({ mask, gate: typeof opts.canUseTool }).toEqual({ mask, gate: 'function' });
     }
+  });
+
+  // The same power set for a WEB job. `tools` may hold only the web pair, never anything
+  // else, whatever else is present — and nothing at all when allowedTools is absent.
+  it('a web job gets at most WebFetch + WebSearch, for every combination of fields', () => {
+    const fields: Array<[string, unknown]> = [
+      ['prompt', 'compare these'],
+      ['system', 'You are Gemini.'],
+      ['allowedTools', ['mcp__noesis__get_note', 'WebFetch', 'WebSearch', 'Bash', 'Read']],
+      ['maxTurns', 12],
+      ['images', [{ mimeType: 'image/png', data: 'AAAA' }]],
+    ];
+    for (let mask = 0; mask < 1 << fields.length; mask++) {
+      const payload: Record<string, unknown> = {};
+      fields.forEach(([k, v], i) => { if (mask & (1 << i)) payload[k] = v; });
+      const opts = buildQueryOptions(payload as Parameters<typeof buildQueryOptions>[0], () => ({}));
+      const expected = 'allowedTools' in payload ? ['WebFetch', 'WebSearch'] : [];
+      expect({ mask, tools: opts.tools }).toEqual({ mask, tools: expected });
+      // Web tools are never PRE-approved — every call must reach canUseTool's URL check.
+      expect({ mask, preApproved: (opts.allowedTools as string[]).filter((t) => t.startsWith('Web')) }).toEqual({ mask, preApproved: [] });
+      expect({ mask, gate: typeof opts.canUseTool }).toEqual({ mask, gate: 'function' });
+    }
+  });
+
+  it('keeps web tools out of pre-approval and spawns no MCP server for a web-only job', () => {
+    const withMcp = () => ({ noesis: { command: 'node' } });
+    const webOnly = buildQueryOptions({ prompt: 'x', allowedTools: ['WebFetch', 'WebSearch'] }, withMcp);
+    expect(webOnly.tools).toEqual(['WebFetch', 'WebSearch']);
+    expect(webOnly.allowedTools).toEqual([]);
+    expect(webOnly.mcpServers).toBeUndefined();
+    const both = buildQueryOptions({ prompt: 'x', allowedTools: ['mcp__noesis__get_note', 'WebFetch'] }, withMcp);
+    expect(both.tools).toEqual(['WebFetch']);
+    expect(both.allowedTools).toEqual(['mcp__noesis__get_note']);
+    expect(both.mcpServers).toEqual({ noesis: { command: 'node' } });
+  });
+
+  it('ignores a smuggled tools field on a web job too', () => {
+    const hostile = { system: 'p', allowedTools: ['WebFetch'], tools: ['Bash', 'Read'] } as unknown as Parameters<typeof buildQueryOptions>[0];
+    expect(buildQueryOptions(hostile, () => ({})).tools).toEqual(['WebFetch']);
   });
 
   it('cannot be re-opened by a hostile payload naming built-ins', () => {
@@ -304,6 +378,75 @@ describe('buildCanUseTool — the daemon-owned permission gate', () => {
 });
 
 /**
+ * The gate for the two web built-ins. The daemon runs on the user's own machine, so a
+ * WebFetch the gate lets through is a request from inside their network.
+ */
+describe('buildCanUseTool — web tools', () => {
+  const silent = () => {};
+  type Gate = (t: string, i?: unknown) => Promise<{ behavior: string; message?: string; updatedInput?: unknown }>;
+  const verdictFor = (ok: boolean) => {
+    const calls: unknown[] = [];
+    const check = async (url: unknown): Promise<UrlVerdict> => {
+      calls.push(url);
+      return ok ? { ok: true, host: 'example.com' } : { ok: false, reason: 'it is private' };
+    };
+    return { check, calls };
+  };
+
+  it('allows a WebFetch whose URL passes the guard, passing the input through', async () => {
+    const { check, calls } = verdictFor(true);
+    const gate = buildCanUseTool(['WebFetch'], silent, check) as Gate;
+    const input = { url: 'https://www.benq.com/zh-tw/lighting/monitor-light/screenbar-pro.html', prompt: 'specs' };
+    expect(await gate('WebFetch', input)).toEqual({ behavior: 'allow', updatedInput: input });
+    expect(calls).toEqual([input.url]);
+  });
+
+  it('refuses a WebFetch whose URL fails the guard, and tells the model why', async () => {
+    const { check } = verdictFor(false);
+    const gate = buildCanUseTool(['WebFetch'], silent, check) as Gate;
+    const d = await gate('WebFetch', { url: 'http://192.168.1.1/', prompt: 'x' });
+    expect(d.behavior).toBe('deny');
+    expect(d.message).toContain('WebFetch refused: it is private');
+  });
+
+  // Permitted set FIRST: a job never cleared for web cannot fetch even a public page, and
+  // the URL check does not run at all (so it cannot be used to probe DNS either).
+  it('refuses WebFetch and WebSearch on a job not cleared for them, without checking the URL', async () => {
+    const { check, calls } = verdictFor(true);
+    const gate = buildCanUseTool(['mcp__noesis__get_note'], silent, check) as Gate;
+    expect((await gate('WebFetch', { url: 'https://example.com/' })).behavior).toBe('deny');
+    expect((await gate('WebSearch', { query: 'q' })).behavior).toBe('deny');
+    expect(calls).toEqual([]);
+  });
+
+  it('allows WebSearch when permitted — the search runs on Anthropic\'s side, not locally', async () => {
+    const gate = buildCanUseTool(['WebSearch'], silent, verdictFor(false).check) as Gate;
+    expect((await gate('WebSearch', { query: 'BenQ ScreenBar Pro 規格' })).behavior).toBe('allow');
+    expect((await gate('WebFetch', { url: 'https://example.com/' })).behavior).toBe('deny'); // not permitted
+  });
+
+  it('logs the URL or query with each decision', async () => {
+    const seen: Array<[string, boolean, string | undefined]> = [];
+    const gate = buildCanUseTool(['WebFetch', 'WebSearch'], (t, a, _id, detail) => seen.push([t, a, detail]), verdictFor(true).check) as Gate;
+    await gate('WebFetch', { url: 'https://example.com/a' });
+    await gate('WebSearch', { query: 'q' });
+    expect(seen).toEqual([['WebFetch', true, 'https://example.com/a'], ['WebSearch', true, 'q']]);
+  });
+
+  // The REAL guard, end to end through buildQueryOptions. IP literals need no DNS, so this
+  // exercises the production path without a network.
+  it('the options gate refuses private addresses with the real guard', async () => {
+    const opts = buildQueryOptions({ prompt: 'x', allowedTools: ['WebFetch', 'WebSearch'] }, () => ({}));
+    const gate = opts.canUseTool as Gate;
+    for (const url of ['http://127.0.0.1:5555/api/auth/me', 'http://169.254.169.254/latest/meta-data/', 'http://[::ffff:7f00:1]/', 'http://localhost.:5555/', 'file:///etc/passwd']) {
+      expect({ url, behavior: (await gate('WebFetch', { url, prompt: 'x' })).behavior }).toEqual({ url, behavior: 'deny' });
+    }
+    expect((await gate('Bash', { command: 'ls' })).behavior).toBe('deny');
+    expect((await gate('Read', { file_path: '/etc/passwd' })).behavior).toBe('deny');
+  });
+});
+
+/**
  * THE CALL SITE, not just the builders.
  *
  * The previous suite pinned `buildQueryOptions` with a power-set mutation battery and
@@ -349,6 +492,14 @@ describe('runSdkQuery — what actually reaches sdk.query()', () => {
     runSdkQuery(sdk, {}, 'study-note', () => ({}));
     expect(seen.args!.prompt).toBe('(study-note job with empty prompt)');
     expect(seen.args!.options.tools).toEqual([]);
+  });
+
+  it('hands a web job exactly the two web built-ins, and pre-approves only the Noesis tools', () => {
+    const { sdk, seen } = capture();
+    runSdkQuery(sdk, { prompt: 'compare', allowedTools: ['mcp__noesis__get_note', 'WebFetch', 'WebSearch', 'Bash'], maxTurns: 12 }, 'chat', () => ({}));
+    expect(seen.args!.options.tools).toEqual(['WebFetch', 'WebSearch']);
+    expect(seen.args!.options.allowedTools).toEqual(['mcp__noesis__get_note']);
+    expect(seen.args!.options.maxTurns).toBe(12);
   });
 
   it('still suppresses built-ins on the image path (generator prompt)', () => {

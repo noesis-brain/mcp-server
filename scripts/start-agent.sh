@@ -23,6 +23,7 @@
 #         ./scripts/start-agent.sh --local    # this checkout's dist/ (after npm run build)
 #         ./scripts/start-agent.sh --status   # report running daemons, exit 1 if any is unfixed
 #         ./scripts/start-agent.sh --stop     # stop everything, start nothing
+#         ./scripts/start-agent.sh --grade <package-dir>   # grade one build; touches no process
 
 set -euo pipefail
 
@@ -39,8 +40,11 @@ MIN_FIXED_VERSION="2.1.5"
 MODE="${1:-}"
 case "$MODE" in
   ''|--local|--stop|--status) ;;
+  --grade)
+    [ -n "${2:-}" ] || { echo "usage: $(basename "$0") --grade <package-dir>" >&2; exit 2; }
+    ;;
   *)
-    echo "usage: $(basename "$0") [--local | --status | --stop]" >&2
+    echo "usage: $(basename "$0") [--local | --status | --stop | --grade <package-dir>]" >&2
     # Deliberately NOT a silent fallback: a typo'd flag used to start the PUBLISHED build
     # instead of the local one — the same "wrong build served the job" signature.
     exit 2
@@ -121,7 +125,27 @@ pkg_dir_for_pid() {
 # comments before looking for code.
 strip_js_comments() { perl -0pe 's{/\*.*?\*/}{}gs; s{^[[:space:]]*//.*$}{}gm' "$1" 2>/dev/null || true; }
 
-# Prints "<version> <FIXED|UNFIXED(reason)|PARENT>" for a pid.
+# True when compiled runner.js (comments already stripped, on stdin) restricts the SDK's
+# built-in tools. Two accepted shapes:
+#   - `tools: []`              — 2.1.5 to 2.1.x: no built-ins at all;
+#   - `tools: webTools` built by `clampWebTools(` over the literal two-name list
+#                              — 2.2.0+: none, or at most WebFetch + WebSearch, which have
+#                                no filesystem access (web Navis; see runner.ts).
+# Recognising ONLY the first shape graded every 2.2.0 daemon UNFIXED and the assert at the
+# bottom then killed it: a guaranteed outage on the first restart after publishing.
+# The version floor stays 2.1.5 — the filesystem boundary is what this guards.
+has_tool_boundary() {
+  local code; code="$(cat)"
+  # Here-strings, not `printf | grep -q`: under pipefail an early-exiting grep can SIGPIPE
+  # the writer once the file outgrows the pipe buffer, turning a match into a failure.
+  grep -q 'canUseTool:' <<<"$code" || return 1
+  grep -q 'tools: \[\]' <<<"$code" && return 0
+  grep -q 'tools: webTools,' <<<"$code" \
+    && grep -q 'const webTools = clampWebTools(' <<<"$code" \
+    && grep -q "ALLOWED_WEB_TOOLS = \['WebFetch', 'WebSearch'\]" <<<"$code"
+}
+
+# Prints "<version> <FIXED|UNFIXED(reason)>" for a package directory.
 #
 # TWO INDEPENDENT SIGNALS, both required:
 #   - the package version is >= MIN_FIXED_VERSION (the same signal the backend's
@@ -129,24 +153,39 @@ strip_js_comments() { perl -0pe 's{/\*.*?\*/}{}gs; s{^[[:space:]]*//.*$}{}gm' "$
 #   - the compiled output actually contains both halves of the fix, comments removed.
 # An earlier version compared neither: MIN_FIXED_VERSION was assigned and never used, and
 # the content check matched documentation. "v2.1.5 FIXED" was two non-facts side by side.
-describe_pid() {
-  local pid="$1" dir ver stripped ver_ok=0 code_ok=0
-  dir="$(pkg_dir_for_pid "$pid")"
-  # No package dir = the `npm exec` wrapper, not a daemon. Its child is graded separately;
-  # counting the parent as "unknown, therefore exposed" cried wolf on every healthy npx
-  # launch, which is the mode that becomes correct once the fix is published.
-  if [ -z "$dir" ] || [ ! -f "$dir/package.json" ]; then echo "- PARENT"; return; fi
+describe_dir() {
+  local dir="$1" ver ver_ok=0 code_ok=0
   ver="$(node -e "process.stdout.write(String(require('$dir/package.json').version||'0.0.0'))" 2>/dev/null || echo '0.0.0')"
   version_ge "$ver" "$MIN_FIXED_VERSION" && ver_ok=1
   if [ -f "$dir/dist/agent/runner.js" ]; then
-    stripped="$(strip_js_comments "$dir/dist/agent/runner.js")"
-    if printf '%s' "$stripped" | grep -q 'tools: \[\]' \
-       && printf '%s' "$stripped" | grep -q 'canUseTool:'; then code_ok=1; fi
+    if strip_js_comments "$dir/dist/agent/runner.js" | has_tool_boundary; then code_ok=1; fi
   fi
   if [ "$ver_ok" = 1 ] && [ "$code_ok" = 1 ]; then echo "$ver FIXED"
   elif [ "$ver_ok" = 0 ]; then echo "$ver UNFIXED(v<$MIN_FIXED_VERSION)"
   else echo "$ver UNFIXED(code)"; fi
 }
+
+# Prints "<version> <FIXED|UNFIXED(reason)|PARENT>" for a pid.
+describe_pid() {
+  local dir
+  dir="$(pkg_dir_for_pid "$1")"
+  # No package dir = the `npm exec` wrapper, not a daemon. Its child is graded separately;
+  # counting the parent as "unknown, therefore exposed" cried wolf on every healthy npx
+  # launch, which is the mode that becomes correct once the fix is published.
+  if [ -z "$dir" ] || [ ! -f "$dir/package.json" ]; then echo "- PARENT"; return; fi
+  describe_dir "$dir"
+}
+
+# --grade <dir>: grade one package directory and touch no process. The test suite runs
+# this against a fresh compile of runner.ts, so a change the check above stops recognising
+# fails a test instead of killing every user's daemon on their next restart.
+if [ "$MODE" = "--grade" ]; then
+  grade_dir="$(cd "$2" && pwd)"
+  read -r ver state <<<"$(describe_dir "$grade_dir")"
+  echo "$ver $state"
+  if [ "$state" = "FIXED" ]; then exit 0; fi
+  exit 1
+fi
 
 # --status: the one command that answers "is my machine exposed right now?".
 if [ "$MODE" = "--status" ]; then
