@@ -17,17 +17,42 @@
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { checkWebFetchUrl, webFetchEnvWarnings, type UrlVerdict } from './webGuard.js';
+import { resolveIdentity, type DaemonIdentity } from './identity.js';
 
 const POLL_INTERVAL_MS = 2000;      // idle poll cadence
 const CHUNK_FLUSH_MS = 500;         // batch streamed deltas before POST /events
 const KEEPALIVE_MS = 30_000;        // hold the lease during quiet stretches (< server's 120s stale)
 const MAX_CONCURRENCY = 2;
 
+/**
+ * NOESIS_AGENT_FAKE: '1' (or 'canned') answers every job with canned text; 'rate_limit'
+ * and 'auth' replay what the Claude Agent SDK emits on a subscription usage limit / a
+ * revoked login, through the SAME stream handling as a real run, until
+ * NOESIS_AGENT_FAKE_RESET_MIN minutes after start — then they answer like 'canned'.
+ * For testing the server's fallback and recovery without spending real quota.
+ */
+export type FakeMode = 'canned' | 'rate_limit' | 'auth';
+
 export interface AgentConfig {
   apiBaseUrl: string;
   apiToken: string;
   concurrency: number;
-  fake: boolean; // NOESIS_AGENT_FAKE=1 → canned executor (queue-plumbing e2e, no Claude)
+  fake: boolean; // any NOESIS_AGENT_FAKE mode → no Claude login involved
+  fakeMode?: FakeMode;
+  fakeResetAt?: number; // epoch ms when a rate_limit/auth fake starts succeeding
+  fakeWordMs?: number; // delay between canned words (NOESIS_AGENT_FAKE_WORD_MS)
+}
+
+function parseFakeMode(raw: string | undefined): FakeMode | undefined {
+  const v = (raw || '').trim().toLowerCase();
+  if (v === '1' || v === 'canned') return 'canned';
+  if (v === 'rate_limit' || v === 'auth') return v;
+  return undefined;
+}
+
+function nonNegative(raw: string | undefined, fallback: number): number {
+  const n = Number(raw);
+  return raw !== undefined && raw !== '' && Number.isFinite(n) && n >= 0 ? n : fallback;
 }
 
 export function resolveAgentConfig(): AgentConfig {
@@ -39,7 +64,16 @@ export function resolveAgentConfig(): AgentConfig {
   let concurrency = parseInt(process.env.NOESIS_AGENT_CONCURRENCY || '1', 10);
   if (!Number.isFinite(concurrency) || concurrency < 1) concurrency = 1;
   if (concurrency > MAX_CONCURRENCY) concurrency = MAX_CONCURRENCY;
-  return { apiBaseUrl, apiToken, concurrency, fake: process.env.NOESIS_AGENT_FAKE === '1' };
+  const fakeMode = parseFakeMode(process.env.NOESIS_AGENT_FAKE);
+  return {
+    apiBaseUrl,
+    apiToken,
+    concurrency,
+    fake: fakeMode !== undefined,
+    fakeMode,
+    fakeResetAt: Date.now() + nonNegative(process.env.NOESIS_AGENT_FAKE_RESET_MIN, 3) * 60_000,
+    fakeWordMs: nonNegative(process.env.NOESIS_AGENT_FAKE_WORD_MS, 15),
+  };
 }
 
 interface ClaimedJob {
@@ -148,8 +182,25 @@ export function agentVersion(): string {
   }
 }
 
+let identity: DaemonIdentity | null = null;
+
+/** This process's machine identity, resolved once (daemonId is stable; bootId is per process). */
+function daemonIdentity(): DaemonIdentity {
+  identity ??= resolveIdentity();
+  return identity;
+}
+
+/**
+ * What every claim sends. The server keeps one health record per machine (daemonId), tells
+ * a restart from a second process by bootId, and shows label/platform in Settings. Older
+ * servers read only workerId + agentVersion and ignore the rest.
+ */
+export function claimBody(workerId: string, id: DaemonIdentity): Record<string, unknown> {
+  return { workerId, agentVersion: agentVersion(), daemonId: id.daemonId, bootId: id.bootId, label: id.label, platform: id.platform };
+}
+
 async function claim(cfg: AgentConfig, workerId: string): Promise<ClaimedJob | null> {
-  const res = await api(cfg, '/api/agent/jobs/claim', { workerId, agentVersion: agentVersion() });
+  const res = await api(cfg, '/api/agent/jobs/claim', claimBody(workerId, daemonIdentity()));
   if (!res.ok) return null;
   const data = (await res.json()) as { job: ClaimedJob | null };
   return data.job ?? null;
@@ -447,13 +498,13 @@ async function executeJob(cfg: AgentConfig, job: ClaimedJob, sink: EventSink): P
   const prompt = resolveJobPrompt(job.payload, job.kind);
 
   if (cfg.fake) {
-    const canned = `Noesis local agent (fake mode) processed a "${job.kind}" job. Prompt was: ${prompt.slice(0, 80)}`;
-    for (const word of canned.split(' ')) {
-      if (sink.isClosed()) break;
-      sink.push(word + ' ');
-      await new Promise((r) => setTimeout(r, 15));
-    }
-    return canned;
+    const fake = fakeSdk(cfg.fakeMode ?? 'canned', {
+      kind: job.kind,
+      promptText: prompt,
+      resetAt: cfg.fakeResetAt ?? 0,
+      wordMs: cfg.fakeWordMs ?? 15,
+    });
+    return consumeAgentStream(runSdkQuery(fake, job.payload, job.kind, () => ({})), sink);
   }
 
   // Real path: the Agent SDK uses the ambient Claude Code subscription login.
@@ -500,33 +551,61 @@ export async function consumeAgentStream(
   let terminalText = '';
   let breakPending = false;
   let hitTurnLimit = false;
+  // An API failure (usage limit, revoked login, …) arrives as an assistant message
+  // carrying `error`, then a result with is_error, then the CLI exits 1 and the SDK
+  // throws a bare "Claude Code process exited with code 1". Keep the failure's own text
+  // and code — the server routes on them — and never let it become the reply.
+  let apiError: { code: string; text: string; resetsAt?: number } | null = null;
+  let failedResultText: string | null = null;
+  let succeeded = false;
   const emit = (text: string) => {
     out.push(text);
     finalText += text;
   };
-  for await (const message of stream) {
-    if (out.isClosed()) break;
-    if (isMessageStart(message)) {
-      if (finalText) breakPending = true;
-      continue;
-    }
-    const delta = extractStreamDelta(message);
-    if (delta) {
-      sawDelta = true;
-      if (breakPending) {
-        breakPending = false;
-        const gap = paragraphGap(finalText);
-        if (gap) emit(gap);
+  const failure = (): AgentRunError | null => {
+    if (apiError) return new AgentRunError(apiError.text, apiError.code, apiError.resetsAt);
+    if (failedResultText !== null) return new AgentRunError(failedResultText || 'Claude run failed', 'unknown');
+    return null;
+  };
+  try {
+    for await (const message of stream) {
+      if (out.isClosed()) break;
+      const err = extractApiError(message);
+      if (err) {
+        apiError = err;
+        continue;
       }
-      emit(delta);
-      continue;
+      const outcome = resultOutcome(message);
+      if (outcome?.isError) failedResultText = outcome.text;
+      else if (outcome) succeeded = true;
+      if (isMessageStart(message)) {
+        if (finalText) breakPending = true;
+        continue;
+      }
+      const delta = extractStreamDelta(message);
+      if (delta) {
+        sawDelta = true;
+        if (breakPending) {
+          breakPending = false;
+          const gap = paragraphGap(finalText);
+          if (gap) emit(gap);
+        }
+        emit(delta);
+        continue;
+      }
+      for (const call of extractToolUses(message)) logToolCall(call.name, call.detail);
+      if (isTurnLimitResult(message)) hitTurnLimit = true;
+      // Concatenate, don't overwrite: with tools the run is multi-turn, and a
+      // stream that produced no deltas would otherwise keep only the LAST turn.
+      const whole = extractTerminalText(message);
+      if (whole) terminalText += (terminalText ? paragraphGap(terminalText) : '') + whole;
     }
-    for (const call of extractToolUses(message)) logToolCall(call.name, call.detail);
-    if (isTurnLimitResult(message)) hitTurnLimit = true;
-    // Concatenate, don't overwrite: with tools the run is multi-turn, and a
-    // stream that produced no deltas would otherwise keep only the LAST turn.
-    const whole = extractTerminalText(message);
-    if (whole) terminalText += (terminalText ? paragraphGap(terminalText) : '') + whole;
+  } catch (e) {
+    throw failure() ?? e;
+  }
+  if (!succeeded) {
+    const f = failure();
+    if (f) throw f;
   }
   if (!sawDelta && terminalText) {
     out.push(terminalText);
@@ -534,6 +613,34 @@ export async function consumeAgentStream(
   }
   if (hitTurnLimit && !out.isClosed()) emit(finalText ? TURN_LIMIT_NOTE : TURN_LIMIT_NOTE.trimStart());
   return finalText;
+}
+
+/** A Claude API failure the daemon reports with its own text and SDK error code. */
+export class AgentRunError extends Error {
+  constructor(message: string, readonly code: string, readonly resetsAt?: number) {
+    super(message);
+    this.name = 'AgentRunError';
+  }
+}
+
+/** An assistant message the SDK marked as an API failure (`error` set), or null. */
+function extractApiError(message: unknown): { code: string; text: string; resetsAt?: number } | null {
+  const m = message as Record<string, any> | null;
+  if (m?.type !== 'assistant' || typeof m.error !== 'string' || !m.error) return null;
+  const text = extractTerminalText(m) || `Claude API error (${m.error})`;
+  const resetsAt = [m.resetsAt, m.message?.resetsAt, m.quotaLimits?.resetsAt, m.rateLimit?.resetsAt].find(
+    (v) => typeof v === 'number' && Number.isFinite(v) && v > 0,
+  );
+  return { code: m.error, text, ...(resetsAt ? { resetsAt } : {}) };
+}
+
+/** A terminal `result` message: did the run fail, and with what text? Null for anything else. */
+function resultOutcome(message: unknown): { isError: boolean; text: string } | null {
+  const m = message as Record<string, any> | null;
+  if (m?.type !== 'result') return null;
+  if (m.is_error !== true) return { isError: false, text: '' };
+  const text = typeof m.result === 'string' ? m.result : Array.isArray(m.errors) ? m.errors.join('; ') : '';
+  return { isError: true, text };
 }
 
 /** What to insert after `text` so the next turn starts a new paragraph. */
@@ -597,6 +704,75 @@ function extractTerminalText(message: unknown): string {
   return '';
 }
 
+/** The /complete body for a failed job: the message, plus the SDK's code when known. */
+export function completionErrorBody(lease: string, err: unknown): Record<string, unknown> {
+  const body: Record<string, unknown> = { lease, error: err instanceof Error ? err.message : String(err) };
+  if (err instanceof AgentRunError) {
+    body.errorCode = err.code;
+    if (err.resetsAt) body.resetsAt = err.resetsAt;
+  }
+  return body;
+}
+
+export interface FakeSdkOptions {
+  kind: string;
+  promptText: string;
+  /** Epoch ms after which rate_limit/auth answer like 'canned'. */
+  resetAt: number;
+  wordMs: number;
+  /** End a failing run by throwing, as the real SDK does when the CLI exits 1 (default true). */
+  throwAtEnd?: boolean;
+  now?: () => number;
+  timeZone?: string;
+}
+
+/**
+ * A stand-in for the Agent SDK that emits the message sequences a real run does, so the
+ * fake modes exercise consumeAgentStream exactly like real traffic.
+ */
+export function fakeSdk(mode: FakeMode, opts: FakeSdkOptions): SdkLike {
+  return { query: () => fakeStream(mode, opts) };
+}
+
+async function* fakeStream(mode: FakeMode, opts: FakeSdkOptions): AsyncGenerator<unknown> {
+  const now = (opts.now ?? Date.now)();
+  if (mode !== 'canned' && now < opts.resetAt) {
+    const text = mode === 'rate_limit'
+      ? `You've hit your session limit · resets ${formatResetLikeCli(opts.resetAt, opts.timeZone, now)}`
+      : 'OAuth token revoked · Please run /login';
+    yield { type: 'system', subtype: 'init' };
+    yield { type: 'assistant', message: { content: [{ type: 'text', text }] }, error: mode === 'rate_limit' ? 'rate_limit' : 'authentication_failed' };
+    yield { type: 'result', subtype: 'success', is_error: true, result: text };
+    if (opts.throwAtEnd !== false) throw new Error('Claude Code process exited with code 1');
+    return;
+  }
+  const canned = `Noesis local agent (fake mode) processed a "${opts.kind}" job. Prompt was: ${opts.promptText.slice(0, 80)}`;
+  yield { type: 'stream_event', event: { type: 'message_start', message: {} } };
+  const words = canned.split(' ');
+  for (let i = 0; i < words.length; i++) {
+    yield { type: 'stream_event', event: { type: 'content_block_delta', delta: { type: 'text_delta', text: (i ? ' ' : '') + words[i] } } };
+    if (opts.wordMs > 0) await new Promise((r) => setTimeout(r, opts.wordMs));
+  }
+  yield { type: 'assistant', message: { content: [{ type: 'text', text: canned }] } };
+  yield { type: 'result', subtype: 'success', is_error: false, result: canned };
+}
+
+/**
+ * A reset time the way the Claude CLI prints it in its limit message: "3pm (Zone)",
+ * "3:07pm (Zone)", or "Oct 12, 3pm (Zone)" when more than a day away — minutes, no seconds.
+ */
+export function formatResetLikeCli(atMs: number, timeZone?: string, nowMs: number = Date.now()): string {
+  const zone = timeZone || Intl.DateTimeFormat().resolvedOptions().timeZone;
+  const parts = new Intl.DateTimeFormat('en-US', {
+    timeZone: zone, month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit', hour12: true,
+  }).formatToParts(new Date(atMs));
+  const get = (t: string) => parts.find((p) => p.type === t)?.value ?? '';
+  const minute = get('minute');
+  const time = `${get('hour')}${minute && minute !== '00' ? `:${minute}` : ''}${get('dayPeriod').toLowerCase()}`;
+  const date = atMs - nowMs > 24 * 60 * 60 * 1000 ? `${get('month')} ${get('day')}, ` : '';
+  return `${date}${time} (${zone})`;
+}
+
 async function runJob(cfg: AgentConfig, job: ClaimedJob): Promise<void> {
   const sink = new EventSink(cfg, job.jobId, job.lease);
   sink.start();
@@ -608,10 +784,7 @@ async function runJob(cfg: AgentConfig, job: ClaimedJob): Promise<void> {
   } catch (err) {
     await sink.finish();
     if (sink.isClosed()) return;
-    await api(cfg, `/api/agent/jobs/${job.jobId}/complete`, {
-      lease: job.lease,
-      error: err instanceof Error ? err.message : String(err),
-    });
+    await api(cfg, `/api/agent/jobs/${job.jobId}/complete`, completionErrorBody(job.lease, err));
   }
 }
 
@@ -620,7 +793,8 @@ async function runJob(cfg: AgentConfig, job: ClaimedJob): Promise<void> {
  * version string is directly unit-testable without starting the real (infinite) loop.
  */
 export function startupBanner(cfg: AgentConfig): string {
-  return `[noesis-agent] v${agentVersion()} started (concurrency=${cfg.concurrency}${cfg.fake ? ', FAKE mode' : ''}) → ${cfg.apiBaseUrl}`;
+  const fake = cfg.fake ? `, FAKE mode${cfg.fakeMode && cfg.fakeMode !== 'canned' ? ` (${cfg.fakeMode})` : ''}` : '';
+  return `[noesis-agent] v${agentVersion()} started (concurrency=${cfg.concurrency}${fake}) → ${cfg.apiBaseUrl}`;
 }
 
 /** Run the daemon loop until aborted. */
