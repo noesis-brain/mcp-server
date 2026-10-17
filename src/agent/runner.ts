@@ -18,6 +18,7 @@ import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { checkWebFetchUrl, webFetchEnvWarnings, type UrlVerdict } from './webGuard.js';
 import { resolveIdentity, type DaemonIdentity } from './identity.js';
+import { TokenGate, applyStartupCheck, checkToken, classifyRefusal } from './tokenState.js';
 
 const POLL_INTERVAL_MS = 2000;      // idle poll cadence
 const CHUNK_FLUSH_MS = 500;         // batch streamed deltas before POST /events
@@ -199,11 +200,44 @@ export function claimBody(workerId: string, id: DaemonIdentity): Record<string, 
   return { workerId, agentVersion: agentVersion(), daemonId: id.daemonId, bootId: id.bootId, label: id.label, platform: id.platform };
 }
 
-async function claim(cfg: AgentConfig, workerId: string): Promise<ClaimedJob | null> {
-  const res = await api(cfg, '/api/agent/jobs/claim', claimBody(workerId, daemonIdentity()));
+/** The token state every worker shares (see tokenState.ts). */
+const tokenGate = new TokenGate();
+
+/**
+ * Read a claim answer. A 401 means the server refused this daemon's API token (expired,
+ * revoked or unknown): the shared gate explains it once and the workers back off, instead
+ * of retrying silently every 2 s. Any accepted answer clears that state and feeds the
+ * token-expiry warning.
+ */
+export async function handleClaimResponse(res: Response, gate: TokenGate): Promise<ClaimedJob | null> {
+  if (res.status === 401) {
+    gate.refused(classifyRefusal(await res.json().catch(() => ({}))));
+    return null;
+  }
   if (!res.ok) return null;
+  gate.accepted();
+  gate.expiryHeader(res.headers.get('x-noesis-token-expires'));
   const data = (await res.json()) as { job: ClaimedJob | null };
   return data.job ?? null;
+}
+
+async function claim(cfg: AgentConfig, workerId: string): Promise<ClaimedJob | null> {
+  const res = await api(cfg, '/api/agent/jobs/claim', claimBody(workerId, daemonIdentity()));
+  return handleClaimResponse(res, tokenGate);
+}
+
+/** Sleep, but wake at once on shutdown — the refused-token backoff is a minute long. */
+function sleep(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise((resolve) => {
+    if (signal?.aborted) return resolve();
+    const timer = setTimeout(done, ms);
+    function done() {
+      clearTimeout(timer);
+      signal?.removeEventListener('abort', done);
+      resolve();
+    }
+    signal?.addEventListener('abort', done, { once: true });
+  });
 }
 
 /** Buffers streamed text and flushes it as lease-fenced chunk events + keepalives. */
@@ -806,6 +840,9 @@ export async function runAgentDaemon(cfg: AgentConfig, signal?: AbortSignal): Pr
   }
   for (const warning of webFetchEnvWarnings(process.env)) console.error(warning);
   console.error(startupBanner(cfg));
+  // Confirm the API token before polling: an expired token is explained and waited out
+  // (it recovers after an Extend); a revoked or unknown one ends the process here.
+  applyStartupCheck(await checkToken(cfg.apiBaseUrl, cfg.apiToken), tokenGate);
 
   const workers = Array.from({ length: cfg.concurrency }, (_, i) => workerLoop(cfg, `worker-${i + 1}`, signal));
   await Promise.all(workers);
@@ -823,7 +860,7 @@ async function workerLoop(cfg: AgentConfig, workerId: string, signal?: AbortSign
       console.error(`[noesis-agent] ${workerId} claimed ${job.kind} job ${job.jobId.slice(0, 8)}`);
       await runJob(cfg, job);
     } else {
-      await new Promise((r) => setTimeout(r, POLL_INTERVAL_MS));
+      await sleep(tokenGate.waitMs(POLL_INTERVAL_MS), signal);
     }
   }
 }

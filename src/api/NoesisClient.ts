@@ -343,6 +343,17 @@ export interface ApplySkimReadResult {
 }
 
 /**
+ * An expired API token is the one refusal the user can fix in a click (Extend keeps the
+ * same token value), so say where. Older servers send no error_code; match their text.
+ */
+export function explainTokenError(status: number, body: { error?: string; error_code?: string }, message: string): string {
+  if (status === 401 && (body.error_code === 'API_TOKEN_EXPIRED' || /has expired/i.test(body.error ?? ''))) {
+    return `${message} — extend it in Noesis Settings → API Tokens`;
+  }
+  return message;
+}
+
+/**
  * HTTP client for Noesis API
  */
 export class NoesisClient {
@@ -389,8 +400,8 @@ export class NoesisClient {
     });
 
     if (!response.ok) {
-      const errorBody = await response.json().catch(() => ({ error: 'Request failed' })) as { error?: string };
-      throw new Error(errorBody.error || `HTTP ${response.status}: ${response.statusText}`);
+      const errorBody = await response.json().catch(() => ({ error: 'Request failed' })) as { error?: string; error_code?: string };
+      throw new Error(explainTokenError(response.status, errorBody, errorBody.error || `HTTP ${response.status}: ${response.statusText}`));
     }
 
     return response.json() as Promise<T>;
@@ -950,6 +961,7 @@ export class NoesisClient {
 
     const responseBody = await response.json().catch(() => ({})) as {
       error?: string;
+      error_code?: string;
       retryHint?: string;
       rawSample?: string;
       noteId?: number;
@@ -958,7 +970,7 @@ export class NoesisClient {
     };
 
     if (!response.ok) {
-      const parts = [responseBody.error || `HTTP ${response.status}: ${response.statusText}`];
+      const parts = [explainTokenError(response.status, responseBody, responseBody.error || `HTTP ${response.status}: ${response.statusText}`)];
       if (responseBody.retryHint) parts.push(`Retry hint: ${responseBody.retryHint}`);
       if (responseBody.rawSample) parts.push(`Raw sample: ${responseBody.rawSample}`);
       throw new Error(parts.join(' — '));
