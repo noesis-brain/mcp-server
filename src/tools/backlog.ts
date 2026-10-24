@@ -61,16 +61,24 @@ export const BIND_NEXT =
   "(70%–120% of the draft's words, in the draft's language, plain sentences, no sections or increments). " +
   'Then keep the status current with backlog_set_status as you work.';
 
-/** For a bind that does not start planning (a `link` at a later status, a re-link after
- *  /clear) or a ticket already refined — "refine before ExitPlanMode" would not apply
- *  there, and repeating it invites a second refine. */
+/** For a bind at a later status on a ticket not refined yet — a `link` from a session
+ *  that may already have a plan, which then refines once (AC9). */
+export const BIND_NEXT_LINK =
+  'Bound. If this session already has a plan, refine this ticket once now with backlog_refine ' +
+  "(70%–120% of the draft's words, in the draft's language, plain sentences, no sections or increments). " +
+  'Keep the status current with backlog_set_status as you work.';
+
+/** For a ticket already refined (a re-link after /clear, a second bind) — repeating the
+ *  refine step there invites a second refine. */
 export const BIND_NEXT_LATER =
   'Bound. Keep the status current with backlog_set_status as you work; refine the ticket again only if the plan changes or the user asks.';
 
-/** Pick the hint for a bind response: the refine step only for a fresh, unrefined planning bind. */
+/** Pick the hint for a bind response: refine before ExitPlanMode on an unrefined planning
+ *  bind, refine now on an unrefined later bind, no refine step once the ticket is refined. */
 export function bindNextHint(data: unknown): string {
   const issue = (data as { issue?: { work_status?: string; refined_text?: string | null } } | null)?.issue;
-  return issue?.work_status === 'planning' && !(issue.refined_text && issue.refined_text.trim()) ? BIND_NEXT : BIND_NEXT_LATER;
+  if (!issue || (issue.refined_text && issue.refined_text.trim())) return BIND_NEXT_LATER;
+  return issue.work_status === 'planning' ? BIND_NEXT : BIND_NEXT_LINK;
 }
 
 const NO_SESSION =

@@ -61,7 +61,9 @@ describe('ticket tools → client', () => {
   const handlers = new Map<string, Handler>();
   const schemas = new Map<string, Record<string, z.ZodTypeAny>>();
   const calls: Array<[string, ...unknown[]]> = [];
-  const saved = { sid: process.env.CLAUDE_CODE_SESSION_ID, dir: process.env.CLAUDE_PROJECT_DIR, label: process.env.NOESIS_AGENT_LABEL };
+  /** What every fake client method answers; a test may swap in a real-shaped response. */
+  let reply: unknown = { ok: true };
+  const saved ={ sid: process.env.CLAUDE_CODE_SESSION_ID, dir: process.env.CLAUDE_PROJECT_DIR, label: process.env.NOESIS_AGENT_LABEL };
 
   beforeAll(async () => {
     process.env.NOESIS_AGENT_LABEL = 'Test Machine';
@@ -75,13 +77,14 @@ describe('ticket tools → client', () => {
     };
     const record = (name: string) => async (...args: unknown[]) => {
       calls.push([name, ...args]);
-      return { ok: true };
+      return reply;
     };
     const client = new Proxy({}, { get: (_t, prop) => record(String(prop)) });
     registerBacklogTools(server as never, client as never);
   });
   afterEach(() => {
     calls.length = 0;
+    reply = { ok: true };
   });
   afterAll(() => {
     for (const [k, v] of [['CLAUDE_CODE_SESSION_ID', saved.sid], ['CLAUDE_PROJECT_DIR', saved.dir], ['NOESIS_AGENT_LABEL', saved.label]] as const) {
@@ -121,22 +124,37 @@ describe('ticket tools → client', () => {
     ]);
   });
 
-  it('a fresh planning bind tells the session to refine before ExitPlanMode; later binds do not', async () => {
-    const { bindNextHint, BIND_NEXT, BIND_NEXT_LATER } = await import('../src/tools/backlog.js');
+  it('a fresh planning bind tells the session to refine before ExitPlanMode; a later unrefined bind, to refine now', async () => {
+    const { bindNextHint, BIND_NEXT, BIND_NEXT_LINK, BIND_NEXT_LATER } = await import('../src/tools/backlog.js');
     expect(BIND_NEXT).toMatch(/before ExitPlanMode/);
-    expect(BIND_NEXT).toMatch(/backlog_refine/);
-    expect(BIND_NEXT).toMatch(/70%–120%/);
+    for (const hint of [BIND_NEXT, BIND_NEXT_LINK]) {
+      expect(hint).toMatch(/backlog_refine/);
+      expect(hint).toMatch(/70%–120%/);
+    }
+    expect(BIND_NEXT_LINK).toMatch(/already has a plan, refine this ticket once now/);
     expect(bindNextHint({ issue: { work_status: 'planning', refined_text: null } })).toBe(BIND_NEXT);
-    expect(bindNextHint({ issue: { work_status: 'implementing', refined_text: null } })).toBe(BIND_NEXT_LATER);
-    expect(bindNextHint({ issue: { work_status: 'planning', refined_text: 'already refined' } })).toBe(BIND_NEXT_LATER);
     expect(bindNextHint({ issue: { work_status: 'planning', refined_text: '   ' } })).toBe(BIND_NEXT);
-    expect(BIND_NEXT_LATER).not.toMatch(/ExitPlanMode/);
-    // the tool passes the server response through and adds the hint
+    expect(bindNextHint({ issue: { work_status: 'implementing', refined_text: null } })).toBe(BIND_NEXT_LINK);
+    expect(bindNextHint({ issue: { work_status: 'ready_to_implement' } })).toBe(BIND_NEXT_LINK);
+    expect(bindNextHint({ issue: { work_status: 'planning', refined_text: 'already refined' } })).toBe(BIND_NEXT_LATER);
+    expect(bindNextHint({ issue: { work_status: 'implementing', refined_text: 'already refined' } })).toBe(BIND_NEXT_LATER);
+    expect(bindNextHint({ ok: true })).toBe(BIND_NEXT_LATER);
+    for (const hint of [BIND_NEXT_LINK, BIND_NEXT_LATER]) expect(hint).not.toMatch(/ExitPlanMode/);
+  });
+
+  it('the bind tool reads the hint from the ticket the server returns', async () => {
+    const { BIND_NEXT, BIND_NEXT_LINK, BIND_NEXT_LATER } = await import('../src/tools/backlog.js');
     process.env.CLAUDE_CODE_SESSION_ID = SESSION;
-    const res = await run('backlog_bind', { key: 'TCK-7' });
-    const body = JSON.parse(res.content[0].text);
-    expect(body.ok).toBe(true);
-    expect(body.next).toBe(BIND_NEXT_LATER); // the fake response has no issue → no refine step
+    const bind = async (issue: Record<string, unknown> | undefined) => {
+      reply = issue ? { issue, released: null } : { ok: true };
+      return JSON.parse((await run('backlog_bind', { key: 'TCK-7' })).content[0].text);
+    };
+    const fresh = await bind({ key: 'TCK-7', work_status: 'planning', refined_text: null });
+    expect(fresh.issue.key).toBe('TCK-7'); // the server response passes through
+    expect(fresh.next).toBe(BIND_NEXT);
+    expect((await bind({ key: 'TCK-7', work_status: 'implementing', refined_text: null })).next).toBe(BIND_NEXT_LINK);
+    expect((await bind({ key: 'TCK-7', work_status: 'planning', refined_text: 'Tidy jot.' })).next).toBe(BIND_NEXT_LATER);
+    expect((await bind(undefined)).next).toBe(BIND_NEXT_LATER);
   });
 
   it('set_status, unbind and refine carry the same caller', async () => {
