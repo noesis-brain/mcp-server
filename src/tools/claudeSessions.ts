@@ -26,6 +26,15 @@ export interface ClaudeSessionRef {
   machine_name?: string;
   title?: string;
   branch?: string;
+  /**
+   * The session reached bypass-permissions mode. Claude Code enters that mode for a session
+   * launched with --dangerously-skip-permissions (or --allow-dangerously-skip-permissions), or
+   * set to it by a `defaultMode` setting. It records no launch flags, so this is the closest
+   * fact the transcript holds. The web panel adds --dangerously-skip-permissions to the copied
+   * resume command when it is set.
+   * Written only when true, and sticky: a later stamp without it never clears it.
+   */
+  skip_permissions?: true;
 }
 
 /** Mirrors MAX_CLAUDE_SESSIONS in the backend. Keeps frontmatter readable, bounds diff noise. */
@@ -124,23 +133,38 @@ function parseLines(chunk: string, dropFirstPartial: boolean): Array<Record<stri
 }
 
 /**
- * Pull {cwd, branch, last_active, title} out of a transcript with two bounded reads.
+ * Both `type: "permission-mode"` records and typed-prompt `user` records carry the mode. Claude
+ * Code re-emits it on every turn, so the head and tail windows below find it in practice: all
+ * but one of ~47 bypass sessions in a ~300-transcript scan (the miss had bypass only in its
+ * middle).
+ */
+function isBypassRecord(e: Record<string, unknown>): boolean {
+  return e.permissionMode === 'bypassPermissions';
+}
+
+/**
+ * Pull {cwd, branch, last_active, title, skip_permissions} out of a transcript with two bounded
+ * reads.
  *
  * ~300 KB regardless of file size, which matters: the transcript corpus here is ~471 MB with a
  * 30 MB single-file maximum, and this runs on every push.
  */
 export function readTranscriptMeta(file: string): {
   cwd: string | null; branch: string | null; last_active: string | null; title: string | null;
+  skip_permissions: boolean;
 } {
   let cwd: string | null = null;
   let branch: string | null = null;
+  let skip_permissions = false;
 
   // FIRST cwd, not the last: a `cd` inside a Bash tool call changes the recorded cwd partway
   // through ~3% of transcripts, and the launch directory is the one `claude --resume` needs.
+  // The loop runs on past the first cwd and branch: a bypass record can come later in the head.
   for (const e of parseLines(readChunk(file, 0, HEAD_BYTES), false)) {
     if (cwd === null && typeof e.cwd === 'string' && e.cwd) cwd = e.cwd;
     if (branch === null && typeof e.gitBranch === 'string') branch = e.gitBranch;
-    if (cwd !== null && branch !== null) break;
+    if (!skip_permissions && isBypassRecord(e)) skip_permissions = true;
+    if (cwd !== null && branch !== null && skip_permissions) break;
   }
 
   let last_active: string | null = null;
@@ -149,6 +173,7 @@ export function readTranscriptMeta(file: string): {
   for (const span of [TAIL_BYTES, TAIL_BYTES_MAX]) {
     const from = Math.max(0, size - span);
     for (const e of parseLines(readChunk(file, from, span), from > 0)) {
+      if (!skip_permissions && isBypassRecord(e)) skip_permissions = true;
       // max(timestamp), never the file mtime: reopening a session appends untimestamped lines,
       // so mtime can overshoot real activity by days.
       if (typeof e.timestamp === 'string' && (last_active === null || e.timestamp > last_active)) {
@@ -162,7 +187,7 @@ export function readTranscriptMeta(file: string): {
     if (last_active !== null || from === 0) break;
   }
 
-  return { cwd, branch, last_active, title };
+  return { cwd, branch, last_active, title, skip_permissions };
 }
 
 /**
@@ -214,6 +239,7 @@ export function currentSessionRef(explicitId?: string): { ref: ClaudeSessionRef;
   };
   if (meta.title) ref.title = meta.title;
   if (meta.branch) ref.branch = meta.branch;
+  if (meta.skip_permissions) ref.skip_permissions = true;
 
   // Surface the /clear-style drift instead of guessing around it. The threshold is generous on
   // purpose: a live session's transcript is routinely minutes stale mid-turn.
@@ -239,7 +265,8 @@ function sameRefs(a: ClaudeSessionRef[], b: ClaudeSessionRef[]): boolean {
     const y = b[i];
     return x.id === y.id && x.cwd === y.cwd && x.last_active === y.last_active
       && (x.machine_name || '') === (y.machine_name || '')
-      && (x.title || '') === (y.title || '') && (x.branch || '') === (y.branch || '');
+      && (x.title || '') === (y.title || '') && (x.branch || '') === (y.branch || '')
+      && (x.skip_permissions === true) === (y.skip_permissions === true);
   });
 }
 
@@ -281,15 +308,22 @@ export function upsertSessionFrontmatter(content: string, ref: ClaudeSessionRef)
   }
 
   const prior = existing.find((r) => r.id === ref.id);
+  // Sticky, and applied BEFORE the guard and the merge: a stamp that lacks the flag (a tail
+  // window that no longer reaches a bypass record, or find_claude_sessions_for_note) must not
+  // drop it from the entry it replaces.
+  if (prior?.skip_permissions === true && ref.skip_permissions !== true) {
+    ref = { ...ref, skip_permissions: true };
+  }
   if (prior) {
     const drift = new Date(ref.last_active).getTime() - new Date(prior.last_active).getTime();
     // Same session, same folder, and the clock barely moved — nothing worth rewriting the file for.
     // A machine change must never be swallowed by the time guard: the same session id carrying a
     // different hostname means the note moved between machines, and that is exactly the fact the
-    // reader needs to know the entry is not resumable here.
+    // reader needs to know the entry is not resumable here. Nor may a newly seen bypass mode.
     if (Number.isFinite(drift) && drift < LAST_ACTIVE_REFRESH_MS && prior.cwd === ref.cwd
         && (prior.machine_name || '') === (ref.machine_name || '')
-        && (prior.title || '') === (ref.title || '')) {
+        && (prior.title || '') === (ref.title || '')
+        && (prior.skip_permissions === true) === (ref.skip_permissions === true)) {
       return content;
     }
   }

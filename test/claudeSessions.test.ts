@@ -7,8 +7,11 @@
  *   - byte-preservation of everything that is not the `claude_sessions:` block, blank lines
  *     included — this is exactly where updateFrontmatter would have damaged the file.
  */
-import { describe, it, expect } from 'vitest';
-import { upsertSessionFrontmatter, encodeProjectDir, normalizeCwd, MAX_CLAUDE_SESSIONS, type ClaudeSessionRef } from '../src/tools/claudeSessions.js';
+import { describe, it, expect, afterAll } from 'vitest';
+import * as fs from 'fs';
+import * as os from 'os';
+import * as path from 'path';
+import { upsertSessionFrontmatter, readTranscriptMeta, currentSessionRef, encodeProjectDir, normalizeCwd, MAX_CLAUDE_SESSIONS, type ClaudeSessionRef } from '../src/tools/claudeSessions.js';
 import { updateFrontmatter } from '../src/tools/index.js';
 
 const REF: ClaudeSessionRef = {
@@ -160,5 +163,126 @@ describe('upsertSessionFrontmatter', () => {
     expect(enriched).toContain('claude_sessions:');
     expect(enriched).toContain(REF.id);
     expect(enriched).toContain('Cloud Title');
+  });
+});
+
+describe('readTranscriptMeta — skip_permissions', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cs-transcript-'));
+  afterAll(() => fs.rmSync(dir, { recursive: true, force: true }));
+
+  const header = { type: 'summary', leafUuid: 'x' };
+  const first = { type: 'user', cwd: '/repo', gitBranch: 'main', timestamp: '2026-10-24T01:00:00.000Z', permissionMode: 'plan' };
+  const mode = (m: string) => ({ type: 'permission-mode', permissionMode: m, sessionId: 's' });
+  const turn = (ts: string) => ({ type: 'assistant', timestamp: ts, message: { content: 'x' } });
+  // ~2 MB of ordinary turns: pushes a record out of both the 256 KB head and the 1 MB tail.
+  const filler = (n: number) => Array.from({ length: n }, (_, i) =>
+    ({ type: 'assistant', timestamp: '2026-10-24T02:00:00.000Z', message: { content: `${i} ${'y'.repeat(200)}` } }));
+
+  function write(name: string, records: object[]): string {
+    const file = path.join(dir, `${name}.jsonl`);
+    fs.writeFileSync(file, records.map((r) => JSON.stringify(r)).join('\n') + '\n');
+    return file;
+  }
+
+  it('is true when bypass appears only in the head, after the first cwd and branch', () => {
+    // The head loop used to break as soon as it had a cwd and a branch; the bypass record
+    // comes later, so the old break would have hidden it.
+    const file = write('head', [header, first, mode('plan'), mode('bypassPermissions'), ...filler(9000), turn('2026-10-24T03:00:00.000Z')]);
+    const meta = readTranscriptMeta(file);
+    expect(meta.skip_permissions).toBe(true);
+    expect(meta.cwd).toBe('/repo');
+    expect(meta.branch).toBe('main');
+  });
+
+  it('is true when bypass appears only in the tail', () => {
+    const file = write('tail', [header, first, ...filler(9000), mode('bypassPermissions'), turn('2026-10-24T03:00:00.000Z')]);
+    expect(readTranscriptMeta(file).skip_permissions).toBe(true);
+  });
+
+  it('is true for a typed prompt that carries the mode (plan, then bypass)', () => {
+    const file = write('plan-then-bypass', [header, first, mode('plan'),
+      { type: 'user', timestamp: '2026-10-24T01:30:00.000Z', permissionMode: 'bypassPermissions', message: { content: 'go' } }]);
+    expect(readTranscriptMeta(file).skip_permissions).toBe(true);
+  });
+
+  it('is false for a session that never reached bypass', () => {
+    const file = write('never', [header, first, mode('plan'), mode('acceptEdits'), mode('auto'), turn('2026-10-24T03:00:00.000Z')]);
+    expect(readTranscriptMeta(file).skip_permissions).toBe(false);
+  });
+
+  it('currentSessionRef stamps skip_permissions only for a bypass session', () => {
+    const saved = process.env.CLAUDE_CONFIG_DIR;
+    const config = fs.mkdtempSync(path.join(os.tmpdir(), 'cs-config-'));
+    try {
+      process.env.CLAUDE_CONFIG_DIR = config;
+      fs.mkdirSync(path.join(config, 'projects', '-repo'), { recursive: true });
+      const bypassId = '11111111-2222-4333-8444-555555555555';
+      const planId = '66666666-7777-4888-8999-aaaaaaaaaaaa';
+      const put = (id: string, records: object[]) => fs.writeFileSync(
+        path.join(config, 'projects', '-repo', `${id}.jsonl`), records.map((r) => JSON.stringify(r)).join('\n') + '\n');
+      put(bypassId, [header, first, mode('bypassPermissions'), turn('2026-10-24T03:00:00.000Z')]);
+      put(planId, [header, first, mode('plan'), turn('2026-10-24T03:00:00.000Z')]);
+
+      expect(currentSessionRef(bypassId)?.ref.skip_permissions).toBe(true);
+      expect(currentSessionRef(planId)?.ref).not.toHaveProperty('skip_permissions');
+    } finally {
+      if (saved === undefined) delete process.env.CLAUDE_CONFIG_DIR; else process.env.CLAUDE_CONFIG_DIR = saved;
+      fs.rmSync(config, { recursive: true, force: true });
+    }
+  });
+
+  it('does not read past the windows: bypass only in the middle of a big file is not seen', () => {
+    // Documents the bounded-read trade-off rather than hiding it.
+    const file = write('middle', [header, first, ...filler(4000), mode('bypassPermissions'), ...filler(9000), turn('2026-10-24T03:00:00.000Z')]);
+    expect(readTranscriptMeta(file).skip_permissions).toBe(false);
+  });
+});
+
+describe('upsertSessionFrontmatter — skip_permissions', () => {
+  const BYPASS: ClaudeSessionRef = { ...REF, skip_permissions: true };
+
+  it('writes skip_permissions: true only when set', () => {
+    expect(upsertSessionFrontmatter('---\ntitle: t\n---\n# Doc\n', REF)).not.toContain('skip_permissions');
+    expect(upsertSessionFrontmatter('---\ntitle: t\n---\n# Doc\n', BYPASS)).toContain('skip_permissions: true');
+  });
+
+  it('a newly seen bypass mode is NOT swallowed by the 5-minute guard', () => {
+    const first = upsertSessionFrontmatter('---\ntitle: t\n---\n# Doc\n', REF);
+    const nudged = { ...BYPASS, last_active: '2026-09-04T15:06:00.000Z' };
+    const second = upsertSessionFrontmatter(first, nudged);
+    expect(second).not.toBe(first);
+    expect(second).toContain('skip_permissions: true');
+  });
+
+  it('adds the flag even when nothing else about the entry changed', () => {
+    // Identical id, cwd and clock: only the merge's sameRefs check can tell the two apart.
+    const first = upsertSessionFrontmatter('---\ntitle: t\n---\n# Doc\n', REF);
+    const second = upsertSessionFrontmatter(first, BYPASS);
+    expect(second).not.toBe(first);
+    expect(second).toContain('skip_permissions: true');
+  });
+
+  it('is sticky: a later stamp without the flag keeps it, inside and past the window', () => {
+    const first = upsertSessionFrontmatter('---\ntitle: t\n---\n# Doc\n', BYPASS);
+    // Inside the window, the same ref without the flag is a byte-identical no-op.
+    expect(upsertSessionFrontmatter(first, { ...REF, last_active: '2026-09-04T15:06:00.000Z' })).toBe(first);
+    // Past the window the entry is rewritten, and the flag survives the rewrite.
+    const later = upsertSessionFrontmatter(first, { ...REF, last_active: '2026-09-04T16:30:00.000Z' });
+    expect(later).toContain('2026-09-04T16:30:00.000Z');
+    expect(later).toContain('skip_permissions: true');
+  });
+
+  it('never mutates the caller\'s ref', () => {
+    const first = upsertSessionFrontmatter('---\ntitle: t\n---\n# Doc\n', BYPASS);
+    const plain = { ...REF, last_active: '2026-09-04T16:30:00.000Z' };
+    upsertSessionFrontmatter(first, plain);
+    expect(plain).not.toHaveProperty('skip_permissions');
+  });
+
+  it('leaves another session\'s flag alone', () => {
+    const one = upsertSessionFrontmatter('---\ntitle: t\n---\n# Doc\n', { ...OTHER, skip_permissions: true });
+    const two = upsertSessionFrontmatter(one, REF);
+    const block = two.slice(0, two.indexOf('\n---', 4));
+    expect(block.match(/skip_permissions: true/g)).toHaveLength(1);
   });
 });
