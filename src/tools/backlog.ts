@@ -53,6 +53,26 @@ export function ticketCaller(): { session_id: string; machine: string; cwd: stri
   return { session_id: ref.ref.id, machine: machineLabel(), cwd: ref.ref.cwd };
 }
 
+/** Returned with every successful bind. The tool result is the freshest thing the
+ *  model reads, and a round trip showed the conventions block alone was not enough
+ *  for the refine-before-ExitPlanMode step. */
+export const BIND_NEXT =
+  'Bound. When your plan is ready — before ExitPlanMode — refine this ticket once with backlog_refine ' +
+  "(70%–120% of the draft's words, in the draft's language, plain sentences, no sections or increments). " +
+  'Then keep the status current with backlog_set_status as you work.';
+
+/** For a bind that does not start planning (a `link` at a later status, a re-link after
+ *  /clear) or a ticket already refined — "refine before ExitPlanMode" would not apply
+ *  there, and repeating it invites a second refine. */
+export const BIND_NEXT_LATER =
+  'Bound. Keep the status current with backlog_set_status as you work; refine the ticket again only if the plan changes or the user asks.';
+
+/** Pick the hint for a bind response: the refine step only for a fresh, unrefined planning bind. */
+export function bindNextHint(data: unknown): string {
+  const issue = (data as { issue?: { work_status?: string; refined_text?: string | null } } | null)?.issue;
+  return issue?.work_status === 'planning' && !(issue.refined_text && issue.refined_text.trim()) ? BIND_NEXT : BIND_NEXT_LATER;
+}
+
 const NO_SESSION =
   'No Claude Code session id (CLAUDE_CODE_SESSION_ID is not set). Ticket binding works only inside a Claude Code session.';
 
@@ -263,7 +283,8 @@ export function registerBacklogTools(server: McpServer, client: NoesisClient): v
         if (!who) return errText(new Error(NO_SESSION));
         const { key, ...rest } = args;
         const body = Object.fromEntries(Object.entries({ ...who, ...rest }).filter(([, v]) => v !== undefined));
-        return jsonText(await client.backlogBind(key, body));
+        const data = await client.backlogBind(key, body);
+        return jsonText({ ...data, next: bindNextHint(data) });
       } catch (e) {
         return errText(e);
       }

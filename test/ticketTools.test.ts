@@ -121,6 +121,24 @@ describe('ticket tools → client', () => {
     ]);
   });
 
+  it('a fresh planning bind tells the session to refine before ExitPlanMode; later binds do not', async () => {
+    const { bindNextHint, BIND_NEXT, BIND_NEXT_LATER } = await import('../src/tools/backlog.js');
+    expect(BIND_NEXT).toMatch(/before ExitPlanMode/);
+    expect(BIND_NEXT).toMatch(/backlog_refine/);
+    expect(BIND_NEXT).toMatch(/70%–120%/);
+    expect(bindNextHint({ issue: { work_status: 'planning', refined_text: null } })).toBe(BIND_NEXT);
+    expect(bindNextHint({ issue: { work_status: 'implementing', refined_text: null } })).toBe(BIND_NEXT_LATER);
+    expect(bindNextHint({ issue: { work_status: 'planning', refined_text: 'already refined' } })).toBe(BIND_NEXT_LATER);
+    expect(bindNextHint({ issue: { work_status: 'planning', refined_text: '   ' } })).toBe(BIND_NEXT);
+    expect(BIND_NEXT_LATER).not.toMatch(/ExitPlanMode/);
+    // the tool passes the server response through and adds the hint
+    process.env.CLAUDE_CODE_SESSION_ID = SESSION;
+    const res = await run('backlog_bind', { key: 'TCK-7' });
+    const body = JSON.parse(res.content[0].text);
+    expect(body.ok).toBe(true);
+    expect(body.next).toBe(BIND_NEXT_LATER); // the fake response has no issue → no refine step
+  });
+
   it('set_status, unbind and refine carry the same caller', async () => {
     process.env.CLAUDE_CODE_SESSION_ID = SESSION;
     await run('backlog_set_status', { key: 'TCK-5', status: 'iterating' });
