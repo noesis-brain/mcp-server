@@ -256,7 +256,7 @@ describe('a refusal keeps its error_code and details', () => {
   });
 });
 
-describe('noesis-mcp setup installs the ticket skill and the v2 conventions block', () => {
+describe('noesis-mcp setup installs the ticket skill and the v3 conventions block', () => {
   let home: string;
   const savedHome = process.env.HOME;
   beforeAll(() => {
@@ -267,7 +267,7 @@ describe('noesis-mcp setup installs the ticket skill and the v2 conventions bloc
     fs.rmSync(home, { recursive: true, force: true });
   });
 
-  it('writes commands/noesis-ticket.md and a v2 block with the tickets section', async () => {
+  it('writes commands/noesis-ticket.md and a v3 block with the tickets section and the bound-session procedure', async () => {
     process.env.HOME = home;
     vi.resetModules();
     const log = vi.spyOn(console, 'log').mockImplementation(() => {});
@@ -281,8 +281,12 @@ describe('noesis-mcp setup installs the ticket skill and the v2 conventions bloc
     expect(skill).toContain('link TCK-<n> [status] [--force]');
     expect(skill).toContain('70%–120%');
     const md = fs.readFileSync(path.join(home, '.claude', 'CLAUDE.md'), 'utf8');
-    expect(md).toContain('<!-- noesis-mcp-server:start v2 -->');
+    expect(md).toContain('<!-- noesis-mcp-server:start v3 -->');
     expect(md).toContain('### Noesis tickets (Jot page, TCK-<n>)');
+    expect(md).toContain('New work in a bound session');
+    expect(md).toContain('TICKET_CLOSED');
+    expect(skill).toContain('## New work in a bound session');
+    expect(skill).toMatch(/1\. Set the current ticket to the status it really reached[\s\S]*2\. Create the new ticket[\s\S]*3\. A short session: `backlog_bind\(new key, switch: true\)`/);
     expect(md).not.toMatch(/Claude Code/); // client-neutral: the block also feeds Copilot
   });
 });

@@ -72,8 +72,22 @@ Refine once when your plan is ready, just before `ExitPlanMode`. Refine again on
 
 Call `backlog_get` with no filter, and keep the tickets whose status is in progress (`planning` to `deploying`). Show key, status, computer and the first line of each.
 
+## New work in a bound session
+
+This is the standard procedure, not a special case. When this session holds a ticket and a new plan starts, decide first whether the plan belongs to that ticket.
+
+- **It belongs** (a fix, the next round, a change the user asked for): re-plan the same ticket. Set it to `planning`, refine its text again if the scope changed, and give it a short title if its title is the whole draft (`backlog_upsert_issue(key, title)`, using the user's first sentence). Ask nothing.
+- **It does not belong, or it deserves its own ticket:** before `ExitPlanMode`, suggest a new ticket and say why in one sentence. The user may decline; then re-plan the same ticket as above. If they agree, do these steps in this order, because a status change needs the binding:
+  1. Set the current ticket to the status it really reached (`backlog_set_status`).
+  2. Create the new ticket with `backlog_upsert_issue`. Its text is the user's own words for the new request.
+  3. A short session: `backlog_bind(new key, switch: true)`, which releases the old ticket. A long session: `backlog_unbind` the old ticket and leave the new one for a new session, which binds it there.
+- **Not sure:** ask the user once.
+- **A closed ticket never moves.** If the bound ticket is `shipped` or `dropped` and a new plan starts, release it or switch before you present the plan. The server refuses any change to a closed ticket (`TICKET_CLOSED`), and closing a ticket releases its binding.
+
 ## Rules
 
 - One ticket per session. `SESSION_BUSY` means this session holds another ticket: switch (`switch: true`) only when the user clearly hands over the new one, never because a ticket is merely mentioned.
 - `RESET_BY_OWNER` means the user reset this session's binding on the page. Bind again (`force: true`) only if the user asks.
+- `TICKET_CLOSED` means the ticket is Shipped or Dropped. Do not retry and do not force it: only the user reopens a ticket, on the Jot page. For new work, create a new ticket that names the closed one.
+- With the optional ticket hook (`noesis-mcp setup --with-ticket-hook`), the plan steps move by themselves: Ready to implement at `ExitPlanMode` (only from `planning`), Implementing when the plan is approved, and `planning` again when a presented plan is rejected. The hook changes no other status, so set every other one yourself — including `planning` before you re-plan a ticket that is further along.
 - Never put the full plan on the ticket. Nobody reads the long version; the ticket stays a jot.

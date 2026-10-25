@@ -3,6 +3,9 @@
  *
  * Idempotent: re-running upgrades the bracketed block / overwrites versioned
  * skill files in place. User edits outside the markers are preserved.
+ *
+ * Opt-ins: --with-restructure-rule, --with-capture, --with-ticket-hook (each with a
+ * --no-* twin that wins); --all turns on every opt-in.
  */
 
 import * as fs from 'fs';
@@ -46,7 +49,7 @@ interface BlockSpec {
 }
 
 // Core conventions — always installed (unless --skills-only).
-const CORE_BLOCK_VERSION = 'v2'; // v2 (2.5.0): + Noesis tickets section
+const CORE_BLOCK_VERSION = 'v3'; // v2 (2.5.0): + Noesis tickets section; v3 (2.6.0): + new work in a bound session
 const CORE_BLOCK: BlockSpec = {
   templateFile: 'claude-md-block.md',
   startMarker: `<!-- noesis-mcp-server:start ${CORE_BLOCK_VERSION} -->`,
@@ -74,6 +77,8 @@ interface SetupOptions {
   noRestructure: boolean;
   withCapture: boolean;
   noCapture: boolean;
+  withTicketHook: boolean;
+  noTicketHook: boolean;
 }
 
 function parseArgs(argv: string[]): SetupOptions {
@@ -83,15 +88,19 @@ function parseArgs(argv: string[]): SetupOptions {
     throw new Error(`Unknown --client "${client}" (expected "claude" or "copilot").`);
   }
 
+  // --all = every opt-in; an explicit --no-* still wins (the resolvers check it first).
+  const all = argv.includes('--all');
   return {
     client,
     claudeMdOnly: argv.includes('--claude-md-only'),
     skillsOnly: argv.includes('--skills-only'),
     dryRun: argv.includes('--dry-run'),
-    withRestructure: argv.includes('--with-restructure-rule'),
+    withRestructure: all || argv.includes('--with-restructure-rule'),
     noRestructure: argv.includes('--no-restructure-rule'),
-    withCapture: argv.includes('--with-capture'),
+    withCapture: all || argv.includes('--with-capture'),
     noCapture: argv.includes('--no-capture'),
+    withTicketHook: all || argv.includes('--with-ticket-hook'),
+    noTicketHook: argv.includes('--no-ticket-hook'),
   };
 }
 
@@ -417,6 +426,240 @@ async function resolveCaptureChoice(options: SetupOptions, alreadyInstalled: boo
   return promptYesNo(`Install this optional hook?${suffix}`, alreadyInstalled);
 }
 
+// ---------------------------------------------------------------------------
+// Optional Jot ticket hook (opt-in).
+//
+// Copies scripts/noesis-ticket-session.mjs to ~/.claude/hooks/ and runs it from three
+// events, so a session bound to a Jot ticket keeps its status current without relying on
+// the model's memory: a reminder on every prompt, Ready to implement / Implementing at the
+// plan steps (back to Planning after a rejected plan, and no other status), and a closed ticket never moves. The copy (not the package
+// path, as the capture hook uses) gives a stable path that survives an npx cache or a
+// moved checkout; every setup run while the hook is installed refreshes the copy, so an
+// upgrade never leaves an old hook behind. It also allows the five ticket tools, so the
+// bookkeeping never stops at a permission prompt.
+// ---------------------------------------------------------------------------
+
+const TICKET_HOOK_FILE = 'noesis-ticket-session.mjs';
+const TICKET_HOOK_MARKER = 'noesis-ticket-session';
+/** The owner's earlier hand-installed hook (claude-config hooks/tck-session.js): replaced in place on install. */
+const LEGACY_TICKET_HOOK_RE = /(?:^|[\s"'\\/])tck-session\.js\b/;
+const HOOKS_DIR = path.join(CLAUDE_DIR, 'hooks');
+const TICKET_HOOK_PATH = path.join(HOOKS_DIR, TICKET_HOOK_FILE);
+const TICKET_HOOK_EVENTS: ReadonlyArray<{ event: string; matcher: string }> = [
+  { event: 'UserPromptSubmit', matcher: '' },
+  { event: 'PreToolUse', matcher: '*' },
+  { event: 'PostToolUse', matcher: 'ExitPlanMode|mcp__noesis__backlog_(bind|set_status|unbind|refine)' },
+];
+const TICKET_TOOLS_ALLOW = [
+  'mcp__noesis__backlog_get',
+  'mcp__noesis__backlog_bind',
+  'mcp__noesis__backlog_set_status',
+  'mcp__noesis__backlog_unbind',
+  'mcp__noesis__backlog_refine',
+];
+
+/** The exact command we register: the copied script, absolute, forward slashes. */
+function ticketHookCommand(): string {
+  return `node "${TICKET_HOOK_PATH.replace(/\\/g, '/')}"`;
+}
+
+/** The script a `node <path>` command runs, with ~ expanded, for comparing two spellings. */
+function commandScript(cmd: string): string | null {
+  const m = cmd.trim().match(/^node(?:\.exe)?\s+(?:"([^"]+)"|'([^']+)'|(\S+))$/i);
+  if (!m) return null;
+  let p = m[1] ?? m[2] ?? m[3];
+  if (p === '~' || p.startsWith('~/') || p.startsWith('~\\')) p = path.join(os.homedir(), p.slice(2));
+  const norm = path.resolve(p).replace(/\\/g, '/');
+  return process.platform === 'win32' ? norm.toLowerCase() : norm;
+}
+
+const isOurTicketCommand = (cmd: unknown): boolean => typeof cmd === 'string' && cmd.includes(TICKET_HOOK_MARKER);
+const isLegacyTicketCommand = (cmd: unknown): boolean =>
+  typeof cmd === 'string' && !cmd.includes(TICKET_HOOK_MARKER) && LEGACY_TICKET_HOOK_RE.test(cmd);
+/** Ours and pointing at the copied file (absolute or ~/ spelling). */
+const isCanonicalTicketCommand = (cmd: string): boolean => {
+  const a = commandScript(cmd);
+  return a !== null && a === commandScript(ticketHookCommand());
+};
+
+/** Two matchers select the same tools: '' / '*' / absent all mean "every tool". */
+function sameMatcher(a: unknown, b: string): boolean {
+  const all = (m: unknown) => m == null || m === '' || m === '*';
+  return all(a) && all(b) ? true : a === b;
+}
+
+/** Whether any registered hook command is ours (the legacy owner hook does not count). */
+function settingsHasTicketHook(settings: any): boolean {
+  const hooks = settings?.hooks;
+  if (!isPlainObject(hooks)) return false;
+  return TICKET_HOOK_EVENTS.some(({ event }) => {
+    const arr = hooks[event];
+    return (
+      Array.isArray(arr) &&
+      arr.some((g: any) => Array.isArray(g?.hooks) && g.hooks.some((h: any) => isOurTicketCommand(h?.command)))
+    );
+  });
+}
+
+/** Tolerant presence check for the interactive prompt default (never throws). */
+function ticketHookInstalled(): boolean {
+  try {
+    const s = readSettings();
+    return s !== null && settingsHasTicketHook(s);
+  } catch {
+    return false;
+  }
+}
+
+/** Refuse a settings.json whose shape we would have to guess at (never discard the user's data). */
+function assertTicketSettingsShape(settings: any): void {
+  if (!isPlainObject(settings)) {
+    throw new Error(`Unexpected JSON root in ${SETTINGS_PATH} (expected an object). Fix it manually and re-run.`);
+  }
+  if (settings.hooks != null && !isPlainObject(settings.hooks)) {
+    throw new Error(`"hooks" in ${SETTINGS_PATH} is not an object. Fix it manually and re-run.`);
+  }
+  for (const { event } of TICKET_HOOK_EVENTS) {
+    const arr = settings.hooks?.[event];
+    if (arr != null && !Array.isArray(arr)) {
+      throw new Error(`"hooks.${event}" in ${SETTINGS_PATH} is not an array. Fix it manually and re-run.`);
+    }
+  }
+  if (settings.permissions != null && !isPlainObject(settings.permissions)) {
+    throw new Error(`"permissions" in ${SETTINGS_PATH} is not an object. Fix it manually and re-run.`);
+  }
+  if (settings.permissions?.allow != null && !Array.isArray(settings.permissions.allow)) {
+    throw new Error(`"permissions.allow" in ${SETTINGS_PATH} is not an array. Fix it manually and re-run.`);
+  }
+}
+
+type FileAction = 'created' | 'updated' | 'unchanged' | 'removed' | 'absent';
+
+/**
+ * Install or remove the ticket hook, idempotently: the copied script plus one command per
+ * event, checked by matcher AND command (added to an existing group with the same matcher,
+ * so other hooks in that group stay where they are; a copy under another matcher moves).
+ * Only our own command is ever changed or removed.
+ */
+function registerTicketHook(install: boolean, dryRun: boolean): { settings: BlockAction; file: FileAction } {
+  const loaded = readSettings(); // throws on malformed JSON — before anything is copied
+  const existed = loaded !== null;
+  const settings = loaded ?? {};
+  assertTicketSettingsShape(settings);
+  const wasInstalled = settingsHasTicketHook(settings);
+  const command = ticketHookCommand();
+  let changed = false;
+
+  if (!install) {
+    if (isPlainObject(settings.hooks)) {
+      for (const { event } of TICKET_HOOK_EVENTS) {
+        const arr = settings.hooks[event];
+        if (!Array.isArray(arr)) continue;
+        for (const g of arr) {
+          if (!Array.isArray(g?.hooks)) continue;
+          const kept = g.hooks.filter((h: any) => !isOurTicketCommand(h?.command));
+          if (kept.length !== g.hooks.length) {
+            g.hooks = kept;
+            changed = true;
+          }
+        }
+        settings.hooks[event] = arr.filter((g: any) => !Array.isArray(g?.hooks) || g.hooks.length > 0);
+        if (settings.hooks[event].length === 0) delete settings.hooks[event];
+      }
+      if (Object.keys(settings.hooks).length === 0) delete settings.hooks;
+    }
+    if (changed && !dryRun) fs.writeFileSync(SETTINGS_PATH, JSON.stringify(settings, null, 2) + '\n', 'utf-8');
+    let file: FileAction = 'absent';
+    if (fs.existsSync(TICKET_HOOK_PATH)) {
+      if (!dryRun) fs.unlinkSync(TICKET_HOOK_PATH);
+      file = 'removed';
+    }
+    return { settings: changed ? 'removed' : 'absent', file };
+  }
+
+  // The copied script: refreshed whenever its content differs.
+  const content = fs.readFileSync(path.join(SCRIPTS_DIR, TICKET_HOOK_FILE), 'utf-8');
+  let file: FileAction;
+  if (!fs.existsSync(TICKET_HOOK_PATH)) file = 'created';
+  else file = fs.readFileSync(TICKET_HOOK_PATH, 'utf-8') === content ? 'unchanged' : 'updated';
+  if (file !== 'unchanged' && !dryRun) {
+    fs.mkdirSync(HOOKS_DIR, { recursive: true });
+    fs.writeFileSync(TICKET_HOOK_PATH, content, 'utf-8');
+  }
+
+  if (settings.hooks == null) settings.hooks = {};
+  for (const { event, matcher } of TICKET_HOOK_EVENTS) {
+    if (settings.hooks[event] == null) settings.hooks[event] = [];
+    const arr = settings.hooks[event] as any[];
+    let found = false;
+    for (const g of arr) {
+      if (!Array.isArray(g?.hooks)) continue;
+      const rightMatcher = sameMatcher(g.matcher, matcher);
+      g.hooks = g.hooks.filter((h: any) => {
+        const cmd = h?.command;
+        if (!isOurTicketCommand(cmd) && !isLegacyTicketCommand(cmd)) return true;
+        if (found || !rightMatcher) {
+          // A second copy in this event, or one under a matcher that would not fire for
+          // every tool the hook needs: drop it (the right group gets the command below).
+          changed = true;
+          return false;
+        }
+        found = true;
+        if (!isCanonicalTicketCommand(cmd)) {
+          h.command = command; // a legacy hook or a stale path, replaced in place
+          changed = true;
+        }
+        return true;
+      });
+    }
+    settings.hooks[event] = arr.filter((g: any) => !Array.isArray(g?.hooks) || g.hooks.length > 0);
+    if (!found) {
+      const group = (settings.hooks[event] as any[]).find((g: any) => sameMatcher(g?.matcher, matcher) && Array.isArray(g?.hooks));
+      if (group) group.hooks.push({ type: 'command', command });
+      else settings.hooks[event].push({ matcher, hooks: [{ type: 'command', command }] });
+      changed = true;
+    }
+  }
+  if (settings.permissions == null) settings.permissions = {};
+  if (settings.permissions.allow == null) settings.permissions.allow = [];
+  for (const name of TICKET_TOOLS_ALLOW) {
+    if (!settings.permissions.allow.includes(name)) {
+      settings.permissions.allow.push(name);
+      changed = true;
+    }
+  }
+
+  if (changed && !dryRun) {
+    fs.mkdirSync(CLAUDE_DIR, { recursive: true });
+    fs.writeFileSync(SETTINGS_PATH, JSON.stringify(settings, null, 2) + '\n', 'utf-8');
+  }
+  const action: BlockAction = !changed ? 'unchanged' : !existed ? 'created' : wasInstalled ? 'upgraded' : 'inserted';
+  return { settings: action, file };
+}
+
+/**
+ * Decide what to do with the optional ticket hook.
+ * Returns true (install), false (remove), or undefined (leave current state).
+ * Precedence: explicit flags > interactive prompt > leave-as-is (non-TTY / dry-run).
+ */
+async function resolveTicketHookChoice(options: SetupOptions, alreadyInstalled: boolean): Promise<boolean | undefined> {
+  if (options.noTicketHook) return false;
+  if (options.withTicketHook) return true;
+  if (options.dryRun) return undefined;
+  if (!process.stdin.isTTY) return undefined;
+
+  console.log('');
+  console.log('Optional feature — Jot ticket hook:');
+  console.log('  When this session works on a Jot ticket (TCK-<n>), the hook reminds Claude of the');
+  console.log('  ticket on every prompt and moves its status at the plan steps (Ready to implement,');
+  console.log('  then Implementing, and back to Planning if you reject the plan) — never any other status,');
+  console.log('  and never for a Shipped or Dropped ticket.');
+  console.log('  It copies a small, fail-safe script to ~/.claude/hooks/ and adds three hook entries');
+  console.log('  and five allowed ticket tools to ~/.claude/settings.json.');
+  const suffix = alreadyInstalled ? ' [Y/n] ' : ' [y/N] ';
+  return promptYesNo(`Install this optional hook?${suffix}`, alreadyInstalled);
+}
+
 function printMcpRegistrationHint(): void {
   // Resolve the absolute path to the running MCP server entry.
   const entry = path.join(PACKAGE_ROOT, 'dist', 'index.js').replace(/\\/g, '/');
@@ -514,6 +757,19 @@ async function runClaudeSetup(options: SetupOptions): Promise<void> {
     } else {
       const action = registerCaptureHook(captureChoice, options.dryRun);
       console.log(`  Capture SessionEnd hook: ${action}`);
+    }
+
+    // Optional opt-in Jot ticket hook. While it is installed, every run refreshes it (the
+    // copied script and its entries), so an upgraded package never leaves an old hook.
+    const ticketAlready = ticketHookInstalled();
+    const ticketChoice = await resolveTicketHookChoice(options, ticketAlready);
+    const ticketInstall = ticketChoice ?? (ticketAlready ? true : undefined);
+    if (ticketInstall === undefined) {
+      console.log('  Ticket hook: not installed');
+    } else {
+      const r = registerTicketHook(ticketInstall, options.dryRun);
+      const kept = ticketChoice === undefined ? 'kept (installed); ' : '';
+      console.log(`  Ticket hook: ${kept}settings ${r.settings}, script ${r.file}`);
     }
   } else {
     console.log('  Skills: skipped (--claude-md-only)');

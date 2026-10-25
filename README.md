@@ -80,14 +80,19 @@ syncs your notes) plus a set of Noesis slash-command skills into `~/.claude/comm
 - `/noesis-investigate` — enrich a prompt that spans codebases and notes into a consolidated context brief before you dig in.
 - `/noesis-manage-news` — manage your Daily News preferences (sources, topics, language, limits) in natural language.
 - `/noesis-capture` — mirror a live Claude Code session into a Noesis note that updates in the cloud in real time.
+- `/noesis-ticket` — work a Jot ticket (TCK-<n>) from the session: bind it, link the running session, keep its status current, refine its text, reset or list.
 
 It's idempotent — re-run any time to upgrade in place; your own content outside the markers is
 preserved.
 
 ```bash
 noesis-mcp setup            # install/upgrade conventions + skills (prompts for opt-in rules)
+noesis-mcp setup --all      # also every opt-in: restructure rule, capture hook, ticket hook
 noesis-mcp setup --dry-run  # preview only; writes nothing
 ```
+
+`--all` turns on every opt-in below; an explicit `--no-*` flag still wins
+(`noesis-mcp setup --all --no-restructure-rule`).
 
 ### Opt-in rule: "Restructure notes on sync"
 
@@ -122,6 +127,34 @@ noesis-mcp setup --no-capture     # remove / skip it (no prompt)
 ```
 
 The `/noesis-capture` skill itself is always installed; only the hook is gated.
+
+### Opt-in feature: the Jot ticket hook
+
+When a Claude Code session works on a Jot ticket (TCK-<n>), the **optional, off-by-default**
+ticket hook keeps the ticket's status true without relying on the model's memory:
+
+- every prompt gets a short reminder of the bound ticket and its status;
+- the plan steps move by themselves: Ready to implement when a plan is presented (from
+  Planning), Implementing when you approve it, back to Planning when you reject it. The hook
+  never changes any other status, so a new plan cannot drag an Iterating ticket backwards;
+- a Shipped or Dropped ticket never moves, and a new plan in a session that is past Planning
+  is reminded of the "new work in a bound session" procedure of `/noesis-ticket`.
+
+`setup` copies the hook to `~/.claude/hooks/noesis-ticket-session.mjs`, registers it for three
+events in `~/.claude/settings.json`, and allows the five ticket tools so the bookkeeping never
+stops at a permission prompt. Every later `setup` run refreshes the copy, so run
+`noesis-mcp setup` again after you update the package.
+
+```bash
+noesis-mcp setup --with-ticket-hook   # install the ticket hook (no prompt)
+noesis-mcp setup --no-ticket-hook     # remove it (the allowed tools stay)
+```
+
+The hook reads `NOESIS_API_URL` / `NOESIS_API_TOKEN` from the `noesis` server entry in
+`~/.claude.json` (where `claude mcp add` stores it). It keeps a small per-session file in
+`~/.claude/tck-bindings/`, which a status line can read to show the bound ticket. Kill switch:
+`TCK_SESSION_HOOK=off`. Restart running Claude Code sessions after installing: hooks load at
+session start.
 
 ### Using Noesis from other AI CLIs
 
@@ -203,7 +236,7 @@ The server exposes 19 MCP tools, grouped by domain:
 - `backlog_unbind` — release this session's binding
 - `backlog_refine` — store a refinement of the ticket text, within 70%–120% of the draft's words
 
-The `/noesis-ticket` skill drives them: start a ticket, `link` the session you are already in, set the status, refine, reset, or list.
+The `/noesis-ticket` skill drives them: start a ticket, `link` the session you are already in, set the status, refine, reset, or list. It also holds the procedure for new work in a bound session. A Shipped or Dropped ticket never moves (`TICKET_CLOSED`), and closing a ticket releases its binding.
 
 ### Catalogs + relations
 
