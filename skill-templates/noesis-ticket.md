@@ -82,7 +82,7 @@ This is the standard procedure, not a special case. When this session holds a ti
   2. Create the new ticket with `backlog_upsert_issue`. Its text is the user's own words for the new request.
   3. A short session: `backlog_bind(new key, switch: true)`, which releases the old ticket. A long session: `backlog_unbind` the old ticket and leave the new one for a new session, which binds it there.
 - **Not sure:** ask the user once.
-- **A closed ticket never moves.** If the bound ticket is `shipped` or `dropped` and a new plan starts, release it or switch before you present the plan. The server refuses any change to a closed ticket (`TICKET_CLOSED`), and closing a ticket releases its binding.
+- **A closed ticket never moves.** If the bound ticket is `shipped` or `dropped` and a new plan starts, release it or switch before you present the plan. The server refuses a status change, a bind or a refinement of a closed ticket (`TICKET_CLOSED`), and closing a ticket releases its binding.
 
 ## Rules
 
