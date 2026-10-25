@@ -6,16 +6,83 @@
  * anything UN-parked) have NO tool here by design — they exist only on the
  * owner's page. The one disposal this surface carries is the owner-instructed
  * reject of a PARKED item: ambiguous|superseded -> rejected, reason required.
+ *
+ * 2.5.0 adds the Jot ticket tools (backlog_bind / set_status / unbind / refine): the
+ * page's work status and its binding to ONE Claude Code session on one computer. They
+ * send this session's id (CLAUDE_CODE_SESSION_ID), the computer name (machineLabel.ts)
+ * and the working folder; the server decides who may change what.
  */
 import { z } from 'zod';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import type { NoesisClient } from '../api/NoesisClient.js';
+import { currentSessionRef } from './claudeSessions.js';
+import { machineLabel } from '../machineLabel.js';
 
 // 'rejected' rides along for set_stage's parked disposal and as a backlog_get
 // list filter; it is NOT a stage the loop may reach from un-parked items.
 const STAGE_ENUM = z.enum(['jot', 'ambiguous', 'superseded', 'refined', 'materialized', 'approved', 'running', 'implemented', 'shipped', 'rejected']);
 const KIND_ENUM = z.enum(['feature', 'bug', 'design', 'process', 'research']);
 const SIZE_ENUM = z.enum(['S', 'M', 'L']);
+
+// Jot work status (2.5.0) — how far a Claude Code session has got with a ticket.
+// Separate from the old `stage` above, which belongs to the retired groom/run workflow.
+const WORK_STATUS_ENUM = z.enum([
+  'created', 'planning', 'ready_to_implement', 'implementing', 'iterating',
+  'ready_to_merge', 'deploying', 'shipped', 'dropped',
+]);
+// created and dropped are the user's decisions (a new jot, an abandoned idea): OWNER_GATE.
+const CLAUDE_STATUS_ENUM = z.enum([
+  'planning', 'ready_to_implement', 'implementing', 'iterating', 'ready_to_merge', 'deploying', 'shipped',
+]);
+
+/** The status ladder, said the same way in every tool description and in the skill. */
+export const STATUS_LADDER =
+  'planning = reading the ticket and the code, writing a plan (plan mode) · ' +
+  'ready_to_implement = the plan is presented, waiting for the user to approve it · ' +
+  'implementing = building the approved plan · ' +
+  'iterating = the first version is delivered; the user is testing it and asking for changes · ' +
+  'ready_to_merge = YOU judge the work complete (all feedback done, or a /cc-loop reached LOOP COMPLETE); waiting for the user to say ship it · ' +
+  'deploying = merging, pushing and verifying the deployment · ' +
+  'shipped = the change is live in production. ' +
+  'created and dropped are the user\'s to set.';
+
+/** Who is calling: this Claude Code session, this computer, this folder. */
+export function ticketCaller(): { session_id: string; machine: string; cwd: string } | null {
+  const ref = currentSessionRef();
+  if (!ref) return null;
+  return { session_id: ref.ref.id, machine: machineLabel(), cwd: ref.ref.cwd };
+}
+
+/** Returned with every successful bind. The tool result is the freshest thing the
+ *  model reads, and a round trip showed the conventions block alone was not enough
+ *  for the refine-before-ExitPlanMode step. */
+export const BIND_NEXT =
+  'Bound. When your plan is ready — before ExitPlanMode — refine this ticket once with backlog_refine ' +
+  "(70%–120% of the draft's words, in the draft's language, plain sentences, no sections or increments). " +
+  'Then keep the status current with backlog_set_status as you work.';
+
+/** For a bind at a later status on a ticket not refined yet — a `link` from a session
+ *  that may already have a plan, which then refines once (AC9). */
+export const BIND_NEXT_LINK =
+  'Bound. If this session already has a plan, refine this ticket once now with backlog_refine ' +
+  "(70%–120% of the draft's words, in the draft's language, plain sentences, no sections or increments). " +
+  'Keep the status current with backlog_set_status as you work.';
+
+/** For a ticket already refined (a re-link after /clear, a second bind) — repeating the
+ *  refine step there invites a second refine. */
+export const BIND_NEXT_LATER =
+  'Bound. Keep the status current with backlog_set_status as you work; refine the ticket again only if the plan changes or the user asks.';
+
+/** Pick the hint for a bind response: refine before ExitPlanMode on an unrefined planning
+ *  bind, refine now on an unrefined later bind, no refine step once the ticket is refined. */
+export function bindNextHint(data: unknown): string {
+  const issue = (data as { issue?: { work_status?: string; refined_text?: string | null } } | null)?.issue;
+  if (!issue || (issue.refined_text && issue.refined_text.trim())) return BIND_NEXT_LATER;
+  return issue.work_status === 'planning' ? BIND_NEXT : BIND_NEXT_LINK;
+}
+
+const NO_SESSION =
+  'No Claude Code session id (CLAUDE_CODE_SESSION_ID is not set). Ticket binding works only inside a Claude Code session.';
 
 function jsonText(data: unknown): { content: Array<{ type: 'text'; text: string }> } {
   return { content: [{ type: 'text' as const, text: JSON.stringify(data, null, 2) }] };
@@ -33,13 +100,14 @@ export function registerBacklogTools(server: McpServer, client: NoesisClient): v
     {
       key: z.string().optional().describe('Issue key like TCK-7 (omit to list)'),
       stage: STAGE_ENUM.optional().describe('List filter: only this stage'),
+      status: WORK_STATUS_ENUM.optional().describe('List filter: only this work status (the Jot page status)'),
       query: z.string().optional().describe('List filter: title/body text search'),
     },
     async (args) => {
       try {
         const data = args.key
           ? await client.backlogGet(args.key)
-          : await client.backlogList({ stage: args.stage, q: args.query });
+          : await client.backlogList({ stage: args.stage, status: args.status, q: args.query });
         return jsonText(data);
       } catch (e) {
         return errText(e);
@@ -198,6 +266,88 @@ export function registerBacklogTools(server: McpServer, client: NoesisClient): v
         const { key, ...body } = args;
         const clean = Object.fromEntries(Object.entries(body).filter(([, v]) => v !== undefined));
         return jsonText(await client.backlogAppendEvent(key, clean));
+      } catch (e) {
+        return errText(e);
+      }
+    }
+  );
+
+  // ── Jot work status + Claude Code binding + refinement (2.5.0) ─────────────────
+  // The ticket tools are bookkeeping on the user's Noesis ticket, which the user asked
+  // for: calling them in plan mode is expected. Rules are enforced server-side.
+
+  server.tool(
+    'backlog_bind',
+    "Bind a Jot ticket to THIS Claude Code session: records the session id, this computer's name and the working folder, and sets the ticket's work status. Call it when the user hands you a ticket (pastes 'TCK-<n>: …', or asks you to read, plan or work on TCK-<n>), or links the running session to one (/noesis-ticket link). With no status the ticket is set to planning; when you link a session that is already further along, pass the status it has really reached. Errors: BOUND_ELSEWHERE — another session or computer holds it; take it over (force) only if the user asks. SESSION_BUSY — this session already holds another ticket; switch only if the user hands over this one. RESET_BY_OWNER — the user reset this session's binding on the page; bind again (force) only if the user asks. Status ladder: " + STATUS_LADDER,
+    {
+      key: z.string().describe('Ticket key like TCK-7'),
+      status: CLAUDE_STATUS_ENUM.optional().describe('Status to set; omit to start at planning'),
+      force: z.boolean().optional().describe('Take over a ticket bound elsewhere, or re-bind after an owner reset — only when the user asks'),
+      switch: z.boolean().optional().describe('Release the ticket this session holds and bind this one — only when the user hands this one over'),
+    },
+    async (args) => {
+      try {
+        const who = ticketCaller();
+        if (!who) return errText(new Error(NO_SESSION));
+        const { key, ...rest } = args;
+        const body = Object.fromEntries(Object.entries({ ...who, ...rest }).filter(([, v]) => v !== undefined));
+        const data = await client.backlogBind(key, body);
+        return jsonText({ ...data, next: bindNextHint(data) });
+      } catch (e) {
+        return errText(e);
+      }
+    }
+  );
+
+  server.tool(
+    'backlog_set_status',
+    'Set the work status of the Jot ticket bound to THIS session (bind it first with backlog_bind). Keep it current as you work. Status ladder: ' + STATUS_LADDER + ' Errors: NOT_BOUND (bind first; if the user reset the binding, ask before binding again), BOUND_ELSEWHERE (another session holds it), OWNER_GATE (created/dropped are the user\'s).',
+    {
+      key: z.string().describe('Ticket key like TCK-7'),
+      status: CLAUDE_STATUS_ENUM,
+    },
+    async (args) => {
+      try {
+        const who = ticketCaller();
+        if (!who) return errText(new Error(NO_SESSION));
+        return jsonText(await client.backlogSetStatus(args.key, { ...who, status: args.status }));
+      } catch (e) {
+        return errText(e);
+      }
+    }
+  );
+
+  server.tool(
+    'backlog_unbind',
+    "Release this session's binding on a Jot ticket (the status stays). Use it when the user says to stop working the ticket here, or to reset the binding. force releases a binding held by another session — only when the user asks.",
+    {
+      key: z.string().describe('Ticket key like TCK-7'),
+      force: z.boolean().optional(),
+    },
+    async (args) => {
+      try {
+        const who = ticketCaller();
+        if (!who) return errText(new Error(NO_SESSION));
+        const body = Object.fromEntries(Object.entries({ ...who, force: args.force }).filter(([, v]) => v !== undefined));
+        return jsonText(await client.backlogUnbind(args.key, body));
+      } catch (e) {
+        return errText(e);
+      }
+    }
+  );
+
+  server.tool(
+    'backlog_refine',
+    "Store your refinement of a Jot ticket's text (the ticket must be bound to this session). It must stay a jot: 70%–120% of the draft's word count (5 words of slack for short drafts; each Chinese, Japanese or Korean character counts as one word), in the draft's language, plain sentences or a short list — no headings, no code fences, no increments, acceptance criteria or plan sections. Refine once when your plan is ready (just before ExitPlanMode), and again only if the plan changes or the user asks. The user's draft is never changed; the page shows your text with the draft kept under it. Errors: REFINE_LENGTH (the details give draft_words, min, max and got — rewrite to fit), REFINE_FORMAT.",
+    {
+      key: z.string().describe('Ticket key like TCK-7'),
+      text: z.string().describe('The refined ticket text, about as long as the draft'),
+    },
+    async (args) => {
+      try {
+        const who = ticketCaller();
+        if (!who) return errText(new Error(NO_SESSION));
+        return jsonText(await client.backlogRefine(args.key, { ...who, text: args.text }));
       } catch (e) {
         return errText(e);
       }

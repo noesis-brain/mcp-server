@@ -1379,9 +1379,10 @@ export class NoesisClient {
 
   // ── Backlog v2 (loop surface /api/mcp/backlog) — thin passthroughs; semantics live server-side ──
 
-  async backlogList(params: { stage?: string; q?: string } = {}): Promise<any> {
+  async backlogList(params: { stage?: string; status?: string; q?: string } = {}): Promise<any> {
     const qs = new URLSearchParams();
     if (params.stage) qs.set('stage', params.stage);
+    if (params.status) qs.set('status', params.status);
     if (params.q) qs.set('q', params.q);
     const suffix = qs.toString() ? `?${qs.toString()}` : '';
     return this.request('GET', `/api/mcp/backlog/issues${suffix}`);
@@ -1422,6 +1423,49 @@ export class NoesisClient {
 
   async backlogAppendEvent(key: string, body: Record<string, unknown>): Promise<any> {
     return this.request('POST', `/api/mcp/backlog/issues/${encodeURIComponent(key)}/events`, body);
+  }
+
+  // ── Jot work status + Claude Code binding + refinement (2.5.0) ──
+  // These keep the server's error_code and details in the thrown message: the caller
+  // (a Claude Code session) must tell BOUND_ELSEWHERE from SESSION_BUSY from
+  // REFINE_LENGTH, and see the other computer's name or the word bounds.
+
+  private async requestWithCode<T>(method: string, path: string, body?: unknown): Promise<T> {
+    const response = await fetch(`${this.baseUrl}${path}`, {
+      method,
+      headers: {
+        'Authorization': `Bearer ${this.apiToken}`,
+        'Content-Type': 'application/json',
+        'X-Client-OS': CLIENT_OS,
+      },
+      body: body ? JSON.stringify(body) : undefined,
+    });
+    if (!response.ok) {
+      const errorBody = await response.json().catch(() => ({ error: 'Request failed' })) as {
+        error?: string; error_code?: string; details?: Record<string, unknown>;
+      };
+      const base = explainTokenError(response.status, errorBody, errorBody.error || `HTTP ${response.status}: ${response.statusText}`);
+      const code = errorBody.error_code ? ` [${errorBody.error_code}]` : '';
+      const details = errorBody.details ? ` ${JSON.stringify(errorBody.details)}` : '';
+      throw new Error(`${base}${code}${details}`);
+    }
+    return response.json() as Promise<T>;
+  }
+
+  async backlogBind(key: string, body: Record<string, unknown>): Promise<any> {
+    return this.requestWithCode('POST', `/api/mcp/backlog/issues/${encodeURIComponent(key)}/binding`, body);
+  }
+
+  async backlogUnbind(key: string, body: Record<string, unknown>): Promise<any> {
+    return this.requestWithCode('DELETE', `/api/mcp/backlog/issues/${encodeURIComponent(key)}/binding`, body);
+  }
+
+  async backlogSetStatus(key: string, body: Record<string, unknown>): Promise<any> {
+    return this.requestWithCode('POST', `/api/mcp/backlog/issues/${encodeURIComponent(key)}/status`, body);
+  }
+
+  async backlogRefine(key: string, body: Record<string, unknown>): Promise<any> {
+    return this.requestWithCode('PUT', `/api/mcp/backlog/issues/${encodeURIComponent(key)}/refined`, body);
   }
 
 }

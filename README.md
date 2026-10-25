@@ -196,6 +196,15 @@ The server exposes 19 MCP tools, grouped by domain:
 - `list_codebases`, `create_codebase`, `get_codebase`, `update_codebase`, `delete_codebase`, `find_or_create_codebase` — manage the codebase registry (file-path-to-project mappings for `related_codes`)
 - `search_by_related_code` — find all notes linked to a given codebase
 
+### Jot tickets — Claude Code and the Jot page
+
+- `backlog_bind` — bind a Jot ticket (TCK-<n>) to this Claude Code session; the page shows the session and the computer
+- `backlog_set_status` — keep the ticket's work status current (planning → ready to implement → implementing → iterating → ready to merge → deploying → shipped)
+- `backlog_unbind` — release this session's binding
+- `backlog_refine` — store a refinement of the ticket text, within 70%–120% of the draft's words
+
+The `/noesis-ticket` skill drives them: start a ticket, `link` the session you are already in, set the status, refine, reset, or list.
+
 ### Catalogs + relations
 
 - `list_catalogs` — list user-defined catalog tags
@@ -267,7 +276,7 @@ scripts/
 └── noesis-capture-session-end.mjs   # Optional SessionEnd hook that auto-stops captures
 
 skill-templates/                # Claude Code skill templates (noesis-sync, -refine-note, -create-study-note,
-                                #   -skim-read, -find-related, -investigate, -manage-news, -capture)
+                                #   -skim-read, -find-related, -investigate, -manage-news, -capture, -ticket)
 templates/                      # CLAUDE.md convention blocks
 ```
 

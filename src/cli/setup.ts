@@ -46,7 +46,7 @@ interface BlockSpec {
 }
 
 // Core conventions — always installed (unless --skills-only).
-const CORE_BLOCK_VERSION = 'v1';
+const CORE_BLOCK_VERSION = 'v2'; // v2 (2.5.0): + Noesis tickets section
 const CORE_BLOCK: BlockSpec = {
   templateFile: 'claude-md-block.md',
   startMarker: `<!-- noesis-mcp-server:start ${CORE_BLOCK_VERSION} -->`,

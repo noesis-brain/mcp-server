@@ -12,6 +12,13 @@
 - Note relations and codebase links live in the Noesis **database**, not in `.md` frontmatter — don't grep `.md` files for them.
 - Use `mcp__noesis__get_note` (read by ID or path), `mcp__noesis__find_similar_notes` (semantic similarity), `mcp__noesis__search_semantic` / `mcp__noesis__search_notes` (meaning / keyword search), `mcp__noesis__update_relations` (read-only when called without the `relations` param).
 
+### Noesis tickets (Jot page, TCK-<n>)
+- The Jot page shows each ticket's work status and which session, on which computer, is working on it. Keep both true.
+- When the user hands you a ticket (pastes `TCK-<n>: …`, or asks you to read, plan or work on TCK-<n>), bind it to this session with `mcp__noesis__backlog_bind`. The ticket tools are bookkeeping the user asked for, so calling them in plan mode is expected.
+- Keep the status current with `mcp__noesis__backlog_set_status`: planning → ready_to_implement (plan presented) → implementing (plan approved) → iterating (first version delivered, user giving feedback) → ready_to_merge (you judge the work complete) → deploying (merging, pushing, verifying) → shipped (live). `created` and `dropped` are the user's.
+- Refine the ticket text once, when your plan is ready, with `mcp__noesis__backlog_refine`: 70%–120% of the draft's words, in the draft's language. Never add increments, acceptance criteria or plan sections to a ticket — it stays a jot.
+- The `noesis-ticket` skill covers start, `link` (bind the session you are already in, also after `/clear`), status, refine, reset and list.
+
 ### Path-as-identifier (cross-machine)
 For any path inside a Noesis-watched root, the path is a Noesis identifier — the cloud copy is always authoritative, and the local copy on this machine may be **missing** (other machine) or **stale** (the user edited the note via the Noesis web UI's Quick Fix; the web UI surfaces that state with the badge 「在线编辑 · 等待本地同步」). Either way, the local copy is not a trustworthy source of truth — reading it directly silently feeds outdated content into the rest of the turn.
 
