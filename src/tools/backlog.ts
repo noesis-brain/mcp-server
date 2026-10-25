@@ -11,6 +11,8 @@
  * page's work status and its binding to ONE Claude Code session on one computer. They
  * send this session's id (CLAUDE_CODE_SESSION_ID), the computer name (machineLabel.ts)
  * and the working folder; the server decides who may change what.
+ * 2.6.0: a Shipped or Dropped ticket never moves (TICKET_CLOSED), and closing a ticket
+ * releases its binding.
  */
 import { z } from 'zod';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
@@ -278,7 +280,7 @@ export function registerBacklogTools(server: McpServer, client: NoesisClient): v
 
   server.tool(
     'backlog_bind',
-    "Bind a Jot ticket to THIS Claude Code session: records the session id, this computer's name and the working folder, and sets the ticket's work status. Call it when the user hands you a ticket (pastes 'TCK-<n>: …', or asks you to read, plan or work on TCK-<n>), or links the running session to one (/noesis-ticket link). With no status the ticket is set to planning; when you link a session that is already further along, pass the status it has really reached. Errors: BOUND_ELSEWHERE — another session or computer holds it; take it over (force) only if the user asks. SESSION_BUSY — this session already holds another ticket; switch only if the user hands over this one. RESET_BY_OWNER — the user reset this session's binding on the page; bind again (force) only if the user asks. Status ladder: " + STATUS_LADDER,
+    "Bind a Jot ticket to THIS Claude Code session: records the session id, this computer's name and the working folder, and sets the ticket's work status. Call it when the user hands you a ticket (pastes 'TCK-<n>: …', or asks you to read, plan or work on TCK-<n>), or links the running session to one (/noesis-ticket link). With no status the ticket is set to planning; when you link a session that is already further along, pass the status it has really reached. Errors: BOUND_ELSEWHERE — another session or computer holds it; take it over (force) only if the user asks. SESSION_BUSY — this session already holds another ticket; switch only if the user hands over this one. RESET_BY_OWNER — the user reset this session's binding on the page; bind again (force) only if the user asks. TICKET_CLOSED — the ticket is Shipped or Dropped: never retry or force it; only the user reopens it, on the page; for new work create a new ticket that names it. Status ladder: " + STATUS_LADDER,
     {
       key: z.string().describe('Ticket key like TCK-7'),
       status: CLAUDE_STATUS_ENUM.optional().describe('Status to set; omit to start at planning'),
@@ -301,7 +303,7 @@ export function registerBacklogTools(server: McpServer, client: NoesisClient): v
 
   server.tool(
     'backlog_set_status',
-    'Set the work status of the Jot ticket bound to THIS session (bind it first with backlog_bind). Keep it current as you work. Status ladder: ' + STATUS_LADDER + ' Errors: NOT_BOUND (bind first; if the user reset the binding, ask before binding again), BOUND_ELSEWHERE (another session holds it), OWNER_GATE (created/dropped are the user\'s).',
+    'Set the work status of the Jot ticket bound to THIS session (bind it first with backlog_bind). Keep it current as you work. Status ladder: ' + STATUS_LADDER + ' Errors: NOT_BOUND (bind first; if the user reset the binding, ask before binding again), BOUND_ELSEWHERE (another session holds it), OWNER_GATE (created/dropped are the user\'s), TICKET_CLOSED (the ticket is Shipped or Dropped: it never moves; only the user reopens it). Setting shipped releases the binding.',
     {
       key: z.string().describe('Ticket key like TCK-7'),
       status: CLAUDE_STATUS_ENUM,
@@ -338,7 +340,7 @@ export function registerBacklogTools(server: McpServer, client: NoesisClient): v
 
   server.tool(
     'backlog_refine',
-    "Store your refinement of a Jot ticket's text (the ticket must be bound to this session). It must stay a jot: 70%–120% of the draft's word count (5 words of slack for short drafts; each Chinese, Japanese or Korean character counts as one word), in the draft's language, plain sentences or a short list — no headings, no code fences, no increments, acceptance criteria or plan sections. Refine once when your plan is ready (just before ExitPlanMode), and again only if the plan changes or the user asks. The user's draft is never changed; the page shows your text with the draft kept under it. Errors: REFINE_LENGTH (the details give draft_words, min, max and got — rewrite to fit), REFINE_FORMAT.",
+    "Store your refinement of a Jot ticket's text (the ticket must be bound to this session). It must stay a jot: 70%–120% of the draft's word count (5 words of slack for short drafts; each Chinese, Japanese or Korean character counts as one word), in the draft's language, plain sentences or a short list — no headings, no code fences, no increments, acceptance criteria or plan sections. Refine once when your plan is ready (just before ExitPlanMode), and again only if the plan changes or the user asks. The user's draft is never changed; the page shows your text with the draft kept under it. Errors: REFINE_LENGTH (the details give draft_words, min, max and got — rewrite to fit), REFINE_FORMAT, TICKET_CLOSED (a Shipped or Dropped ticket is never refined).",
     {
       key: z.string().describe('Ticket key like TCK-7'),
       text: z.string().describe('The refined ticket text, about as long as the draft'),
