@@ -1,7 +1,7 @@
 // noesis-ticket-session — the Noesis Jot ticket <-> this Claude Code session.
 // Hook version 2 (@noesis-brain/mcp-server 2.7.0). `noesis-mcp setup --with-ticket-hook`
 // copies this file to ~/.claude/hooks/ and runs it from UserPromptSubmit, PreToolUse (every
-// tool) and PostToolUse (ExitPlanMode, AskUserQuestion + the ticket tools).
+// tool), PostToolUse (ExitPlanMode, Bash, AskUserQuestion + the ticket tools) and SessionStart.
 //
 // The per-computer switch is ~/.claude/noesis-ticket.json, re-read on every event. When it is
 // missing, or says "enabled": false, the hook does nothing at all: no output, no network.
@@ -608,7 +608,7 @@ const loopNote = (hit) =>
   `[tck-session] No Jot ticket is bound to this /cc-loop session (${MOMENT[hit.kind]} in ${hit.repo.remote}). Go on without one: never bind a ticket the owner did not choose, and add a NEEDS-ATTENTION line to the loop state: "no Jot ticket was bound to this loop".`;
 
 const commitNote = (entry) =>
-  `[tck-session] This commit belongs to ${entry.key} (status: ${entry.status}); it will carry the trailer "Ticket: ${entry.key}". If it is other work, stop and tell the owner before you commit.`;
+  `[tck-session] This commit belongs to ${entry.key} (status: ${entry.status}); it will carry the trailer "Ticket: ${entry.key}". If it is other work, tell the owner; with their OK, commit it with NOESIS_TICKET=none in front of the command (no trailer).`;
 
 /** The owner's answer to the hook's "Ticket" question, from an AskUserQuestion call. */
 export function ticketAnswer(p) {
@@ -1128,7 +1128,8 @@ export async function decide(p) {
     if (!entry) return null;
     if (p.tool_name === 'ExitPlanMode') await setStatus(sid, entry, 'ready_to_implement', cwd);
     else if (plan && entry.status === 'ready_to_implement') await setStatus(sid, entry, 'planning', cwd);
-    if (hit && live && hit.kind === 'commit') return pre({ additionalContext: commitNote(live) });
+    const noTicket = /(^|[\s;&|(])NOESIS_TICKET=none\b/.test(String((p.tool_input && p.tool_input.command) || ''));
+    if (hit && live && hit.kind === 'commit' && !noTicket) return pre({ additionalContext: commitNote(live) });
     return null;
   }
 

@@ -702,6 +702,8 @@ describe('TCK-1838: per-computer switch and the which-ticket checkpoint', () => 
     const r = await run(home, bash('git commit -m x', repo));
     expect(denied(r)).toBe(false);
     expect(r.ctx).toMatch(/This commit belongs to TCK-12 \(status: implementing\); it will carry the trailer "Ticket: TCK-12"/);
+    expect(r.ctx).toMatch(/with their OK, commit it with NOESIS_TICKET=none/);
+    expect((await run(home, bash('NOESIS_TICKET=none git commit -m "chore: unrelated"', repo))).json).toBeNull(); // no trailer, so no note
     expect((await run(home, bash('git push origin HEAD:main', repo))).json).toBeNull();
     expect(requests).toHaveLength(0);
   });

@@ -49,7 +49,7 @@ interface BlockSpec {
 }
 
 // Core conventions — always installed (unless --skills-only).
-const CORE_BLOCK_VERSION = 'v3'; // v2 (2.5.0): + Noesis tickets section; v3 (2.6.0): + new work in a bound session
+const CORE_BLOCK_VERSION = 'v4'; // v2 (2.5.0): + Noesis tickets section; v3 (2.6.0): + new work in a bound session; v4 (2.7.0): + the "which ticket?" checkpoint and ship
 const CORE_BLOCK: BlockSpec = {
   templateFile: 'claude-md-block.md',
   startMarker: `<!-- noesis-mcp-server:start ${CORE_BLOCK_VERSION} -->`,
@@ -429,14 +429,17 @@ async function resolveCaptureChoice(options: SetupOptions, alreadyInstalled: boo
 // ---------------------------------------------------------------------------
 // Optional Jot ticket hook (opt-in).
 //
-// Copies scripts/noesis-ticket-session.mjs to ~/.claude/hooks/ and runs it from three
+// Copies scripts/noesis-ticket-session.mjs to ~/.claude/hooks/ and runs it from four
 // events, so a session bound to a Jot ticket keeps its status current without relying on
 // the model's memory: a reminder on every prompt, Ready to implement / Implementing at the
 // plan steps (back to Planning after a rejected plan, and no other status), and a closed ticket never moves. The copy (not the package
 // path, as the capture hook uses) gives a stable path that survives an npx cache or a
 // moved checkout; every setup run while the hook is installed refreshes the copy, so an
-// upgrade never leaves an old hook behind. It also allows the five ticket tools, so the
-// bookkeeping never stops at a permission prompt.
+// upgrade never leaves an old hook behind. It also allows the six ticket tools, so the
+// bookkeeping never stops at a permission prompt, and writes the per-computer switch file
+// ~/.claude/noesis-ticket.json ({"enabled": true, "repos": []}) when there is none. Listing
+// repos there turns on the "which ticket?" checkpoint, the commit trailer, the push read-back
+// and the session-start checks in those repos (TCK-1838).
 // ---------------------------------------------------------------------------
 
 const TICKET_HOOK_FILE = 'noesis-ticket-session.mjs';
@@ -448,14 +451,22 @@ const TICKET_HOOK_PATH = path.join(HOOKS_DIR, TICKET_HOOK_FILE);
 const TICKET_HOOK_EVENTS: ReadonlyArray<{ event: string; matcher: string }> = [
   { event: 'UserPromptSubmit', matcher: '' },
   { event: 'PreToolUse', matcher: '*' },
-  { event: 'PostToolUse', matcher: 'ExitPlanMode|mcp__noesis__backlog_(bind|set_status|unbind|refine)' },
+  // Bash: the branch record and the push read-back; AskUserQuestion: the owner's "Ticket" answer.
+  { event: 'PostToolUse', matcher: 'ExitPlanMode|Bash|AskUserQuestion|mcp__noesis__backlog_(bind|set_status|unbind|refine|ship)' },
+  // Stale bindings, the reconcile and the /clear hint; never on compact.
+  { event: 'SessionStart', matcher: 'startup|resume|clear' },
 ];
+/** The hook's per-computer switch. Missing means the hook does nothing at all; setup writes this
+ *  default so an installed hook keeps working, and the owner lists repos in it for the checkpoint. */
+const TICKET_SWITCH_PATH = path.join(CLAUDE_DIR, 'noesis-ticket.json');
+const TICKET_SWITCH_DEFAULT = { enabled: true, repos: [] as unknown[] };
 const TICKET_TOOLS_ALLOW = [
   'mcp__noesis__backlog_get',
   'mcp__noesis__backlog_bind',
   'mcp__noesis__backlog_set_status',
   'mcp__noesis__backlog_unbind',
   'mcp__noesis__backlog_refine',
+  'mcp__noesis__backlog_ship',
 ];
 
 /** The exact command we register: the copied script, absolute, forward slashes. */
@@ -541,7 +552,7 @@ type FileAction = 'created' | 'updated' | 'unchanged' | 'removed' | 'absent';
  * so other hooks in that group stay where they are; a copy under another matcher moves).
  * Only our own command is ever changed or removed.
  */
-function registerTicketHook(install: boolean, dryRun: boolean): { settings: BlockAction; file: FileAction } {
+function registerTicketHook(install: boolean, dryRun: boolean): { settings: BlockAction; file: FileAction; switchFile: 'created' | 'kept' | 'left' } {
   const loaded = readSettings(); // throws on malformed JSON — before anything is copied
   const existed = loaded !== null;
   const settings = loaded ?? {};
@@ -574,7 +585,8 @@ function registerTicketHook(install: boolean, dryRun: boolean): { settings: Bloc
       if (!dryRun) fs.unlinkSync(TICKET_HOOK_PATH);
       file = 'removed';
     }
-    return { settings: changed ? 'removed' : 'absent', file };
+    // The switch file is the owner's configuration: removing the hook leaves it.
+    return { settings: changed ? 'removed' : 'absent', file, switchFile: 'left' };
   }
 
   // The copied script: refreshed whenever its content differs.
@@ -585,6 +597,13 @@ function registerTicketHook(install: boolean, dryRun: boolean): { settings: Bloc
   if (file !== 'unchanged' && !dryRun) {
     fs.mkdirSync(HOOKS_DIR, { recursive: true });
     fs.writeFileSync(TICKET_HOOK_PATH, content, 'utf-8');
+  }
+  // Without the switch file the hook does nothing, so an install writes the default (never over
+  // an existing one: it holds the owner's repo list and any "enabled": false).
+  const switchFile = fs.existsSync(TICKET_SWITCH_PATH) ? 'kept' : 'created';
+  if (switchFile === 'created' && !dryRun) {
+    fs.mkdirSync(CLAUDE_DIR, { recursive: true });
+    fs.writeFileSync(TICKET_SWITCH_PATH, JSON.stringify(TICKET_SWITCH_DEFAULT, null, 2) + '\n', 'utf-8');
   }
 
   if (settings.hooks == null) settings.hooks = {};
@@ -634,7 +653,7 @@ function registerTicketHook(install: boolean, dryRun: boolean): { settings: Bloc
     fs.writeFileSync(SETTINGS_PATH, JSON.stringify(settings, null, 2) + '\n', 'utf-8');
   }
   const action: BlockAction = !changed ? 'unchanged' : !existed ? 'created' : wasInstalled ? 'upgraded' : 'inserted';
-  return { settings: action, file };
+  return { settings: action, file, switchFile };
 }
 
 /**
@@ -654,8 +673,9 @@ async function resolveTicketHookChoice(options: SetupOptions, alreadyInstalled: 
   console.log('  ticket on every prompt and moves its status at the plan steps (Ready to implement,');
   console.log('  then Implementing, and back to Planning if you reject the plan) — never any other status,');
   console.log('  and never for a Shipped or Dropped ticket.');
-  console.log('  It copies a small, fail-safe script to ~/.claude/hooks/ and adds three hook entries');
-  console.log('  and five allowed ticket tools to ~/.claude/settings.json.');
+  console.log('  It copies a small, fail-safe script to ~/.claude/hooks/, adds four hook entries');
+  console.log('  and six allowed ticket tools to ~/.claude/settings.json, and writes the switch file');
+  console.log('  ~/.claude/noesis-ticket.json if there is none.');
   const suffix = alreadyInstalled ? ' [Y/n] ' : ' [y/N] ';
   return promptYesNo(`Install this optional hook?${suffix}`, alreadyInstalled);
 }
@@ -769,7 +789,7 @@ async function runClaudeSetup(options: SetupOptions): Promise<void> {
     } else {
       const r = registerTicketHook(ticketInstall, options.dryRun);
       const kept = ticketChoice === undefined ? 'kept (installed); ' : '';
-      console.log(`  Ticket hook: ${kept}settings ${r.settings}, script ${r.file}`);
+      console.log(`  Ticket hook: ${kept}settings ${r.settings}, script ${r.file}, switch file ${r.switchFile}`);
     }
   } else {
     console.log('  Skills: skipped (--claude-md-only)');

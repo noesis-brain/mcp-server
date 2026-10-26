@@ -279,7 +279,7 @@ describe('noesis-mcp setup installs the ticket skill and the v3 conventions bloc
     fs.rmSync(home, { recursive: true, force: true });
   });
 
-  it('writes commands/noesis-ticket.md and a v3 block with the tickets section and the bound-session procedure', async () => {
+  it('writes commands/noesis-ticket.md and a v4 block with the tickets section and the bound-session procedure', async () => {
     process.env.HOME = home;
     vi.resetModules();
     const log = vi.spyOn(console, 'log').mockImplementation(() => {});
@@ -293,12 +293,19 @@ describe('noesis-mcp setup installs the ticket skill and the v3 conventions bloc
     expect(skill).toContain('link TCK-<n> [status] [--force]');
     expect(skill).toContain('70%–120%');
     const md = fs.readFileSync(path.join(home, '.claude', 'CLAUDE.md'), 'utf8');
-    expect(md).toContain('<!-- noesis-mcp-server:start v3 -->');
+    expect(md).toContain('<!-- noesis-mcp-server:start v4 -->');
     expect(md).toContain('### Noesis tickets (Jot page, TCK-<n>)');
     expect(md).toContain('New work in a bound session');
     expect(md).toContain('TICKET_CLOSED');
     expect(skill).toContain('## New work in a bound session');
     expect(skill).toMatch(/1\. Set the current ticket to the status it really reached[\s\S]*2\. Create the new ticket[\s\S]*3\. A short session: `backlog_bind\(new key, switch: true\)`/);
+    // TCK-1838: the checkpoint and the ship step are documented in both
+    expect(skill).toContain('## When the hook asks which ticket');
+    expect(skill).toMatch(/header is exactly `Ticket`/);
+    expect(skill).toContain('### `ship` — the ship step');
+    expect(skill).toContain('backlog_ship(key, commit)');
+    expect(md).toContain('mcp__noesis__backlog_ship');
+    expect(md).toContain('~/.claude/noesis-ticket.json');
     expect(md).not.toMatch(/Claude Code/); // client-neutral: the block also feeds Copilot
   });
 });

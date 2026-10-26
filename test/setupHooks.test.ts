@@ -13,14 +13,18 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 
 const SCRIPT = path.resolve(__dirname, '..', 'scripts', 'noesis-ticket-session.mjs');
-const POST_MATCHER = 'ExitPlanMode|mcp__noesis__backlog_(bind|set_status|unbind|refine)';
-const ALLOW = [
+const POST_MATCHER = 'ExitPlanMode|Bash|AskUserQuestion|mcp__noesis__backlog_(bind|set_status|unbind|refine|ship)';
+const START_MATCHER = 'startup|resume|clear';
+/** The 2.6.0 registration, for the upgrade test. */
+const POST_MATCHER_260 = 'ExitPlanMode|mcp__noesis__backlog_(bind|set_status|unbind|refine)';
+const ALLOW_260 = [
   'mcp__noesis__backlog_get',
   'mcp__noesis__backlog_bind',
   'mcp__noesis__backlog_set_status',
   'mcp__noesis__backlog_unbind',
   'mcp__noesis__backlog_refine',
 ];
+const ALLOW = [...ALLOW_260, 'mcp__noesis__backlog_ship'];
 
 let home: string;
 let logs: string[];
@@ -29,6 +33,7 @@ const saved = { HOME: process.env.HOME, USERPROFILE: process.env.USERPROFILE, is
 const claude = (...p: string[]) => path.join(home, '.claude', ...p);
 const settingsPath = () => claude('settings.json');
 const hookPath = () => claude('hooks', 'noesis-ticket-session.mjs');
+const switchPath = () => claude('noesis-ticket.json');
 const readSettings = () => JSON.parse(fs.readFileSync(settingsPath(), 'utf8'));
 const writeSettings = (s: unknown) => {
   fs.mkdirSync(claude(), { recursive: true });
@@ -69,20 +74,61 @@ afterEach(() => {
 });
 
 describe('--with-ticket-hook', () => {
-  it('installs the copied script, three events and the five allowed tools; a re-run changes nothing', async () => {
+  it('installs the copied script, four events, the six allowed tools and the switch file; a re-run changes nothing', async () => {
     const line = await setup('--with-ticket-hook');
-    expect(line).toMatch(/Ticket hook: settings created, script created/);
+    expect(line).toMatch(/Ticket hook: settings created, script created, switch file created/);
+    expect(JSON.parse(fs.readFileSync(switchPath(), 'utf8'))).toEqual({ enabled: true, repos: [] });
     expect(fs.readFileSync(hookPath(), 'utf8')).toBe(fs.readFileSync(SCRIPT, 'utf8'));
     const s = readSettings();
     expect(s.hooks.UserPromptSubmit).toEqual([{ matcher: '', hooks: [{ type: 'command', command: canonical() }] }]);
     expect(s.hooks.PreToolUse).toEqual([{ matcher: '*', hooks: [{ type: 'command', command: canonical() }] }]);
     expect(s.hooks.PostToolUse).toEqual([{ matcher: POST_MATCHER, hooks: [{ type: 'command', command: canonical() }] }]);
+    expect(s.hooks.SessionStart).toEqual([{ matcher: START_MATCHER, hooks: [{ type: 'command', command: canonical() }] }]);
     expect(s.permissions.allow).toEqual(ALLOW);
     expect(canonical()).toMatch(/^node "[^"\\]+noesis-ticket-session\.mjs"$/); // absolute, forward slashes
 
     const before = fs.readFileSync(settingsPath(), 'utf8');
-    expect(await setup('--with-ticket-hook')).toMatch(/settings unchanged, script unchanged/);
+    expect(await setup('--with-ticket-hook')).toMatch(/settings unchanged, script unchanged, switch file kept/);
     expect(fs.readFileSync(settingsPath(), 'utf8')).toBe(before);
+  });
+
+  it('TCK-1838: upgrades a 2.6.0 install — the PostToolUse matcher moves, SessionStart and backlog_ship are added', async () => {
+    const cmd = canonical();
+    writeSettings({
+      hooks: {
+        UserPromptSubmit: [{ matcher: '', hooks: [{ type: 'command', command: cmd }] }],
+        PreToolUse: [{ matcher: '*', hooks: [{ type: 'command', command: cmd }] }],
+        PostToolUse: [
+          { matcher: 'Write', hooks: [{ type: 'command', command: 'node other.js' }] },
+          { matcher: POST_MATCHER_260, hooks: [{ type: 'command', command: cmd }] },
+        ],
+        SessionStart: [{ hooks: [{ type: 'command', command: 'node session-start.js' }] }],
+      },
+      permissions: { allow: ['Bash(ls:*)', ...ALLOW_260] },
+    });
+    const line = await setup('--with-ticket-hook');
+    expect(line).toMatch(/settings upgraded/);
+    const s = readSettings();
+    expect(s.hooks.PostToolUse).toEqual([
+      { matcher: 'Write', hooks: [{ type: 'command', command: 'node other.js' }] },
+      { matcher: POST_MATCHER, hooks: [{ type: 'command', command: cmd }] },
+    ]);
+    expect(s.hooks.SessionStart).toEqual([
+      { hooks: [{ type: 'command', command: 'node session-start.js' }] },
+      { matcher: START_MATCHER, hooks: [{ type: 'command', command: cmd }] },
+    ]);
+    expect(s.permissions.allow).toEqual(['Bash(ls:*)', ...ALLOW]);
+    expect(await setup('--with-ticket-hook')).toMatch(/settings unchanged/);
+  });
+
+  it('TCK-1838: an existing switch file (the owner\'s repo list, or "enabled": false) is never overwritten', async () => {
+    fs.mkdirSync(claude(), { recursive: true });
+    const mine = JSON.stringify({ enabled: false, repos: [{ remote: 'github.com/me/app', deployBranch: 'main' }] });
+    fs.writeFileSync(switchPath(), mine);
+    expect(await setup('--with-ticket-hook')).toMatch(/switch file kept/);
+    expect(fs.readFileSync(switchPath(), 'utf8')).toBe(mine);
+    await setup('--no-ticket-hook');
+    expect(fs.readFileSync(switchPath(), 'utf8')).toBe(mine); // removing the hook leaves the owner's file
   });
 
   it('with no flag, an installed hook is kept AND refreshed: a stale copied script is rewritten', async () => {
@@ -107,12 +153,13 @@ describe('--with-ticket-hook', () => {
         UserPromptSubmit: [{ matcher: '', hooks: [{ type: 'command', command: tilde }] }],
         PreToolUse: [{ matcher: '*', hooks: [{ type: 'command', command: tilde }] }],
         PostToolUse: [{ matcher: POST_MATCHER, hooks: [{ type: 'command', command: tilde }] }],
+        SessionStart: [{ matcher: START_MATCHER, hooks: [{ type: 'command', command: tilde }] }],
       },
       permissions: { allow: ALLOW },
     });
     const line = await setup('--with-ticket-hook');
     expect(line).toMatch(/settings unchanged, script created/);
-    for (const e of ['UserPromptSubmit', 'PreToolUse', 'PostToolUse']) expect(commands(readSettings(), e)).toEqual([tilde]);
+    for (const e of ['UserPromptSubmit', 'PreToolUse', 'PostToolUse', 'SessionStart']) expect(commands(readSettings(), e)).toEqual([tilde]);
   });
 
   it("replaces the owner's legacy tck-session.js in place, keeping the other hooks of a shared group", async () => {
@@ -209,7 +256,7 @@ describe('--all', () => {
   it('turns on every opt-in: the restructure rule, the capture hook and the ticket hook', async () => {
     await setup('--all');
     const md = fs.readFileSync(claude('CLAUDE.md'), 'utf8');
-    expect(md).toContain('<!-- noesis-mcp-server:start v3 -->');
+    expect(md).toContain('<!-- noesis-mcp-server:start v4 -->');
     expect(md).toMatch(/<!-- noesis-mcp-server:restructure-on-sync:start v\d+ -->/);
     const s = readSettings();
     expect(commands(s, 'SessionEnd').some((c) => c.includes('noesis-capture-session-end'))).toBe(true);
@@ -236,9 +283,10 @@ describe('--all', () => {
 describe('safety', () => {
   it('--dry-run writes nothing', async () => {
     const line = await setup('--with-ticket-hook', '--dry-run');
-    expect(line).toMatch(/settings created, script created/);
+    expect(line).toMatch(/settings created, script created, switch file created/);
     expect(fs.existsSync(settingsPath())).toBe(false);
     expect(fs.existsSync(hookPath())).toBe(false);
+    expect(fs.existsSync(switchPath())).toBe(false);
   });
 
   it('a malformed settings.json aborts before anything is copied, and is never overwritten', async () => {
@@ -249,6 +297,7 @@ describe('safety', () => {
     await expect(setup('--with-ticket-hook')).rejects.toThrow(/Could not parse/);
     expect(fs.readFileSync(settingsPath(), 'utf8')).toBe('{ "hooks": ');
     expect(fs.existsSync(hookPath())).toBe(false);
+    expect(fs.existsSync(switchPath())).toBe(false);
   });
 
   it('an unexpected shape (hooks.PreToolUse not an array) aborts without writing', async () => {

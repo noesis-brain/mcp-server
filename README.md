@@ -135,23 +135,58 @@ ticket hook keeps the ticket's status true without relying on the model's memory
 
 - every prompt gets a short reminder of the bound ticket and its status;
 - the plan steps move by themselves: Ready to implement when a plan is presented (from
-  Planning), Implementing when you approve it, back to Planning when you reject it. The hook
-  never changes any other status, so a new plan cannot drag an Iterating ticket backwards;
+  Planning), Implementing when you approve it, back to Planning when you reject it;
 - a Shipped or Dropped ticket never moves, and a new plan in a session that is past Planning
   is reminded of the "new work in a bound session" procedure of `/noesis-ticket`.
 
-`setup` copies the hook to `~/.claude/hooks/noesis-ticket-session.mjs`, registers it for three
-events in `~/.claude/settings.json`, and allows the five ticket tools so the bookkeeping never
-stops at a permission prompt. Every later `setup` run refreshes the copy, so run
-`noesis-mcp setup` again after you update the package.
+`setup` copies the hook to `~/.claude/hooks/noesis-ticket-session.mjs`, registers it for four
+events in `~/.claude/settings.json` (UserPromptSubmit, PreToolUse, PostToolUse, SessionStart),
+allows the six ticket tools so the bookkeeping never stops at a permission prompt, and writes
+the per-computer switch file `~/.claude/noesis-ticket.json` if there is none. Every later
+`setup` run refreshes the copy, so run `noesis-mcp setup` again after you update the package.
 
 ```bash
 noesis-mcp setup --with-ticket-hook   # install the ticket hook (no prompt)
-noesis-mcp setup --no-ticket-hook     # remove it (the allowed tools stay)
+noesis-mcp setup --no-ticket-hook     # remove it (the allowed tools and the switch file stay)
 ```
 
+#### The switch file and the "which ticket?" checkpoint
+
+`~/.claude/noesis-ticket.json` is read on every event, and it is local to the computer. With no
+file, or `"enabled": false`, the hook does nothing at all — no output, no network — so a
+computer that never works on tickets is untouched. To turn the hook off on one computer, set
+`"enabled": false`: it takes effect at once and lasts (a deleted file is written again, as
+`{"enabled": true, "repos": []}`, by the next `setup`). Its `repos` list turns on more checks
+in those repositories only:
+
+```json
+{
+  "enabled": true,
+  "gateSince": "2026-10-27T00:00:00Z",
+  "repos": [
+    { "remote": "github.com/you/your-app", "deployBranch": "main" },
+    { "remote": "github.com/you/your-library" }
+  ]
+}
+```
+
+- **Which ticket?** In a listed repository, a session that holds no ticket cannot approve a plan
+  or run `git commit`, `merge` or `push` (or `gh pr merge`) until the user answers one question
+  with the header `Ticket`: a likely ticket, a new ticket, or "No ticket for this work". Sessions
+  that started before `gateSince`, subagents, `claude -p` runs and the git commands of a running
+  `/cc-loop` are never stopped. A bound session's commit gets a one-line confirmation instead.
+- **Commits carry the ticket.** `scripts/git-hooks/prepare-commit-msg` (install it into a
+  repository's `.git/hooks`) adds the trailer `Ticket: TCK-<n>` to the commits of a bound
+  session. After the first commit on a feature branch, the ticket records that branch.
+- **A push to the deploy branch is read back** (repositories with a `deployBranch`). When the
+  pushed range holds the bound ticket's work, it moves to Deploying; every other open ticket in
+  the range, and every waiting ticket whose branch is already merged, is listed so the user can
+  confirm it and ship it with `backlog_ship`. The hook never sets Shipped itself.
+- **At a session start** (at most every 6 hours) it reports bindings with no activity for 24
+  hours, and waiting tickets whose branch was merged on GitHub. It never releases anything.
+
 The hook reads `NOESIS_API_URL` / `NOESIS_API_TOKEN` from the `noesis` server entry in
-`~/.claude.json` (where `claude mcp add` stores it). It keeps a small per-session file in
+`~/.claude.json` (where `claude mcp add` stores it). It keeps small per-session files in
 `~/.claude/tck-bindings/`, which a status line can read to show the bound ticket. Kill switch:
 `TCK_SESSION_HOOK=off`. Restart running Claude Code sessions after installing: hooks load at
 session start.
