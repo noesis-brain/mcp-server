@@ -18,7 +18,7 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import * as http from 'node:http';
-import { spawn } from 'node:child_process';
+import { spawn, execFileSync } from 'node:child_process';
 import type { AddressInfo } from 'node:net';
 
 const HOOK = path.resolve(__dirname, '..', 'scripts', 'noesis-ticket-session.mjs');
@@ -47,9 +47,15 @@ const server = http.createServer((req, res) => {
 
 const baseUrl = () => `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
 
-function sandbox(): string {
+/** An isolated HOME. It holds the per-computer switch file (`setup` writes the same default),
+ *  unless the case passes its own content, or null for "no file". */
+function sandbox(switchFile: Record<string, unknown> | null = { enabled: true, repos: [] }): string {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'tck-home-'));
   homes.push(home);
+  if (switchFile) {
+    fs.mkdirSync(path.join(home, '.claude'), { recursive: true });
+    fs.writeFileSync(path.join(home, '.claude', 'noesis-ticket.json'), JSON.stringify(switchFile));
+  }
   return home;
 }
 
@@ -80,6 +86,9 @@ function run(home: string, payload: Record<string, unknown>, extraEnv: Record<st
     };
     if (!('TCK_SESSION_HOOK' in extraEnv)) delete env.TCK_SESSION_HOOK;
     if (!('TCK_BINDINGS_DIR' in extraEnv)) delete env.TCK_BINDINGS_DIR;
+    // The suite itself may run inside Claude Code: never inherit its session's switches.
+    if (!('NOESIS_TICKET_CONFIG' in extraEnv)) delete env.NOESIS_TICKET_CONFIG;
+    if (!('CLAUDE_CODE_SESSION_ATTENDED' in extraEnv)) delete env.CLAUDE_CODE_SESSION_ATTENDED;
     for (const k of Object.keys(env)) if (env[k] === undefined) delete env[k];
     const started = Date.now();
     const child = spawn(process.execPath, [HOOK], { env: env as NodeJS.ProcessEnv });
@@ -504,5 +513,318 @@ describe('TCK-1835: forward only, closed tickets, re-check, plan-mode line, conf
     expect(fs.existsSync(old)).toBe(false);
     expect(fs.existsSync(recent)).toBe(true);
     expect(fs.existsSync(cacheFile(home))).toBe(false); // not in the default dir
+  });
+});
+
+// ── TCK-1838: the per-computer switch and the "which ticket?" checkpoint ─────────────────
+describe('TCK-1838: per-computer switch and the which-ticket checkpoint', () => {
+  const LISTED = 'https://github.com/noesis-owner/notes-app.git';
+  const repos: string[] = [];
+  afterAll(() => {
+    for (const r of repos) fs.rmSync(r, { recursive: true, force: true });
+  });
+
+  /** A real git repo with an origin remote, on `branch`, with one commit (inside `parent` if given). */
+  function gitRepo(remote: string, branch = 'loop/tck-77', parent = os.tmpdir()): string {
+    const dir = fs.realpathSync(fs.mkdtempSync(path.join(parent, 'tck-repo-')));
+    repos.push(dir);
+    const g = (...a: string[]) => execFileSync('git', ['-C', dir, ...a], { stdio: 'ignore' });
+    g('init', '-q', '-b', branch);
+    g('config', 'user.email', 't@example.invalid');
+    g('config', 'user.name', 't');
+    g('remote', 'add', 'origin', remote);
+    fs.writeFileSync(path.join(dir, 'a.txt'), 'a');
+    g('add', 'a.txt');
+    g('commit', '-q', '-m', 'init');
+    return dir;
+  }
+
+  const listedHome = (extra: Record<string, unknown> = {}) =>
+    sandbox({ enabled: true, repos: [{ remote: 'git@github.com:noesis-owner/notes-app.git', deployBranch: 'main' }], ...extra });
+
+  const OPEN_LIST = {
+    issues: [
+      { key: 'TCK-5', title: 'An older unbound jot', work_status: 'created', bound_session_id: null, updated_at: '2026-10-20T00:00:00Z' },
+      { key: 'TCK-77', title: 'The ticket named in the branch', work_status: 'implementing', bound_session_id: null, updated_at: '2026-10-01T00:00:00Z' },
+      { key: 'TCK-9', title: 'A shipped one', work_status: 'shipped', bound_session_id: null, updated_at: '2026-10-25T00:00:00Z' },
+    ],
+  };
+  const listReply = (method: string, url: string): Reply =>
+    method === 'GET' && url.startsWith('/api/mcp/backlog/issues') ? { status: 200, body: OPEN_LIST } : { status: 404, body: {} };
+
+  const bash = (command: string, cwd: string) => ({ hook_event_name: 'PreToolUse', tool_name: 'Bash', tool_input: { command }, cwd });
+  const denied = (r: Run) => r.json?.hookSpecificOutput?.permissionDecision === 'deny';
+  const reason = (r: Run) => String(r.json?.hookSpecificOutput?.permissionDecisionReason ?? '');
+  const ask = (answer: string, header = 'Ticket') => {
+    const question = 'Which ticket is this work for?';
+    return {
+      hook_event_name: 'PostToolUse',
+      tool_name: 'AskUserQuestion',
+      tool_input: { questions: [{ question, header, options: [{ label: 'TCK-77' }, { label: 'Create a new ticket from my words' }, { label: 'No ticket for this work' }], multiSelect: false }] },
+      tool_response: { questions: [{ question, header, options: [], multiSelect: false }], answers: { [question]: answer }, annotations: {} },
+    };
+  };
+
+  // ── AC2: the switch ──────────────────────────────────────────────────────────────────
+  it('RED: no switch file -> every event is silent and sends nothing, even for a bound session', async () => {
+    const home = sandbox(null);
+    seed(home, { ...BOUND, status: 'ready_to_implement', checkedAt: 0 });
+    respond = statusReply();
+    const repo = gitRepo(LISTED);
+    const runs = [
+      await run(home, { hook_event_name: 'UserPromptSubmit', prompt: 'continue' }),
+      await run(home, { hook_event_name: 'PreToolUse', tool_name: 'ExitPlanMode', permission_mode: 'plan', cwd: repo }),
+      await run(home, bash('git commit -m x', repo)),
+      await run(home, ask('No ticket for this work')),
+    ];
+    for (const r of runs) expect(r.json).toBeNull();
+    expect(requests).toHaveLength(0);
+    expect(fs.existsSync(path.join(home, '.claude', 'tck-bindings', `${HOOK_SID}.gate.json`))).toBe(false);
+  });
+
+  it('RED: "enabled": false is the same as no file', async () => {
+    const home = sandbox({ enabled: false, repos: [{ remote: LISTED }] });
+    seed(home, { ...BOUND, checkedAt: 0 });
+    const r = await run(home, { hook_event_name: 'UserPromptSubmit', prompt: 'continue' });
+    const r2 = await run(home, bash('git commit -m x', gitRepo(LISTED)));
+    expect(r.json).toBeNull();
+    expect(r2.json).toBeNull();
+    expect(requests).toHaveLength(0);
+  });
+
+  it('an unlisted repository (a company-like remote): no deny, no note, no network', async () => {
+    const home = listedHome();
+    respond = listReply;
+    const repo = gitRepo('https://github.com/tierconnect/bt-bartender.git');
+    for (const c of ['git commit -m x', 'git push origin HEAD:main', 'git merge loop/x']) {
+      const r = await run(home, bash(c, repo));
+      expect(r.json).toBeNull();
+    }
+    const r = await run(home, { hook_event_name: 'PreToolUse', tool_name: 'ExitPlanMode', permission_mode: 'plan', cwd: repo });
+    expect(r.json).toBeNull();
+    expect(requests).toHaveLength(0);
+  });
+
+  it('a listed switch with an empty repos list keeps the v1 behaviour only', async () => {
+    const home = sandbox({ enabled: true, repos: [] });
+    const r = await run(home, bash('git commit -m x', gitRepo(LISTED)));
+    expect(r.json).toBeNull();
+    expect(requests).toHaveLength(0);
+  });
+
+  // ── AC3: the checkpoint ──────────────────────────────────────────────────────────────
+  it('RED: unbound git commit in a listed repo is denied, with the Ticket question and candidates (branch ticket first)', async () => {
+    const home = listedHome();
+    respond = listReply;
+    const r = await run(home, bash('git add a.txt && git commit -m "feat: x"', gitRepo(LISTED)));
+    expect(denied(r)).toBe(true);
+    expect(reason(r)).toMatch(/header is exactly "Ticket"/);
+    expect(reason(r)).toMatch(/"Create a new ticket from my words"/);
+    expect(reason(r)).toMatch(/"No ticket for this work"/);
+    expect(reason(r)).toMatch(/this git commit in github\.com\/noesis-owner\/notes-app/);
+    const listed = reason(r).split('Likely tickets: ')[1] ?? '';
+    expect(listed.indexOf('TCK-77')).toBeGreaterThanOrEqual(0);
+    expect(listed.indexOf('TCK-77')).toBeLessThan(listed.indexOf('TCK-5'));
+    expect(listed).not.toMatch(/TCK-9\b/); // shipped tickets are not candidates
+    expect(reason(r)).toMatch(/never answer the question yourself/);
+  });
+
+  it('RED: unbound ExitPlanMode in a listed repo is denied', async () => {
+    const home = listedHome();
+    respond = listReply;
+    const r = await run(home, { hook_event_name: 'PreToolUse', tool_name: 'ExitPlanMode', permission_mode: 'plan', cwd: gitRepo(LISTED), tool_input: { plan: '# Plan' } });
+    expect(denied(r)).toBe(true);
+    expect(reason(r)).toMatch(/approving this plan/);
+  });
+
+  it('merge, push and gh pr merge are checkpoints; read-only and look-alike git commands are not', async () => {
+    const home = listedHome();
+    respond = listReply;
+    const repo = gitRepo(LISTED);
+    for (const c of ['git merge loop/x', 'git push origin HEAD:main', 'gh pr merge 18 --squash', 'git -c user.name=x commit -m y']) {
+      expect(denied(await run(home, bash(c, repo))), c).toBe(true);
+    }
+    for (const c of ['git status', 'git merge-base main HEAD', 'git stash push', 'git merge --abort', 'git log --grep=merge', 'echo "git push origin main"', 'git push --dry-run', 'grep -n "git commit" notes.md']) {
+      expect((await run(home, bash(c, repo))).json, c).toBeNull();
+    }
+  });
+
+  it('a heredoc commit message that says "git push" is one commit, not a push', async () => {
+    const home = listedHome();
+    respond = listReply;
+    const cmd = 'git commit -m "$(cat <<\'EOF\'\nfix: x\n\nthen git push origin main\nEOF\n)"';
+    const r = await run(home, bash(cmd, gitRepo(LISTED)));
+    expect(denied(r)).toBe(true);
+    expect(reason(r)).toMatch(/this git commit/);
+  });
+
+  it('`cd <listed repo> && git commit` from an unlisted folder resolves the listed repo', async () => {
+    const home = listedHome();
+    respond = listReply;
+    const listed = gitRepo(LISTED);
+    const other = gitRepo('https://github.com/someone/else.git');
+    expect(denied(await run(home, bash(`cd ${listed} && git commit -m x`, other)))).toBe(true);
+    expect(denied(await run(home, bash(`git -C ${listed} commit -m x`, other)))).toBe(true);
+    expect((await run(home, bash(`cd ${other} && git commit -m x`, listed))).json).toBeNull();
+  });
+
+  it('RED: the deny persists until the owner answers; "No ticket for this work" opens the gate for the session', async () => {
+    const home = listedHome();
+    respond = listReply;
+    const repo = gitRepo(LISTED);
+    expect(denied(await run(home, bash('git commit -m x', repo)))).toBe(true);
+    expect(denied(await run(home, bash('git commit -m x', repo)))).toBe(true); // a plain retry is still denied
+    const a = await run(home, ask('No ticket for this work'));
+    expect(a.ctx).toMatch(/Recorded: the owner chose no ticket/);
+    expect(JSON.parse(fs.readFileSync(path.join(home, '.claude', 'tck-bindings', `${HOOK_SID}.gate.json`), 'utf8'))).toMatchObject({ noTicket: true });
+    expect((await run(home, bash('git commit -m x', repo))).json).toBeNull();
+    expect((await run(home, { hook_event_name: 'PreToolUse', tool_name: 'ExitPlanMode', permission_mode: 'plan', cwd: repo })).json).toBeNull();
+  });
+
+  it('a ticket answer says to bind it (the gate stays closed); a new-ticket answer says to create one', async () => {
+    const home = listedHome();
+    respond = listReply;
+    const a = await run(home, ask('TCK-77'));
+    expect(a.ctx).toMatch(/owner chose TCK-77\. Bind it now: mcp__noesis__backlog_bind\(key: "TCK-77"/);
+    expect(denied(await run(home, bash('git commit -m x', gitRepo(LISTED))))).toBe(true);
+    const b = await run(home, ask('Create a new ticket from my words'));
+    expect(b.ctx).toMatch(/wants a new ticket/);
+    const c = await run(home, ask('No ticket for this work', 'Scope')); // another question: not ours
+    expect(c.json).toBeNull();
+    const d = await run(home, ask('please do TCK-1 and TCK-2 together')); // free text: Claude reads it
+    expect(d.json).toBeNull();
+  });
+
+  it('RED: a bound session is never denied; its commit gets the confirmation note, with no network', async () => {
+    const home = listedHome();
+    seed(home, { ...BOUND, status: 'implementing' });
+    const repo = gitRepo(LISTED);
+    const r = await run(home, bash('git commit -m x', repo));
+    expect(denied(r)).toBe(false);
+    expect(r.ctx).toMatch(/This commit belongs to TCK-12 \(status: implementing\); it will carry the trailer "Ticket: TCK-12"/);
+    expect((await run(home, bash('git push origin HEAD:main', repo))).json).toBeNull();
+    expect(requests).toHaveLength(0);
+  });
+
+  it('a cached CLOSED ticket counts as unbound: the commit is denied', async () => {
+    const home = listedHome();
+    seed(home, { ...BOUND, status: 'shipped' });
+    respond = listReply;
+    expect(denied(await run(home, bash('git commit -m x', gitRepo(LISTED))))).toBe(true);
+  });
+
+  it('a session that began before gateSince is never denied; one that began after is', async () => {
+    const t = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'tck-tr-')), 's.jsonl');
+    repos.push(path.dirname(t));
+    fs.writeFileSync(t, '{"type":"mode","mode":"normal"}\n{"type":"user","timestamp":"2026-10-20T08:00:00.000Z"}\n');
+    respond = listReply;
+    const repo = gitRepo(LISTED);
+    const before = listedHome({ gateSince: '2026-10-26T00:00:00Z' });
+    expect((await run(before, { ...bash('git commit -m x', repo), transcript_path: t })).json).toBeNull();
+    const after = listedHome({ gateSince: '2026-10-19T00:00:00Z' });
+    expect(denied(await run(after, { ...bash('git commit -m x', repo), transcript_path: t }))).toBe(true);
+  });
+
+  it('unattended runs (CLAUDE_CODE_SESSION_ATTENDED=0) are never denied; attended ones are', async () => {
+    const home = listedHome();
+    respond = listReply;
+    const repo = gitRepo(LISTED);
+    expect((await run(home, bash('git commit -m x', repo), { CLAUDE_CODE_SESSION_ATTENDED: '0' })).json).toBeNull();
+    expect(denied(await run(home, bash('git commit -m x', repo), { CLAUDE_CODE_SESSION_ATTENDED: '1' }))).toBe(true);
+  });
+
+  it('a running /cc-loop: git commands get a note instead of a deny; plan approval is still denied', async () => {
+    const home = listedHome();
+    const marker = path.join(home, '.claude', 'loop-supervisor');
+    fs.mkdirSync(marker, { recursive: true });
+    fs.writeFileSync(path.join(marker, `${HOOK_SID}.json`), '{}');
+    respond = listReply;
+    const repo = gitRepo(LISTED);
+    const r = await run(home, bash('git commit -m x', repo));
+    expect(denied(r)).toBe(false);
+    expect(r.ctx).toMatch(/No Jot ticket is bound to this \/cc-loop session/);
+    expect(r.ctx).toMatch(/NEEDS-ATTENTION/);
+    expect(denied(await run(home, { hook_event_name: 'PreToolUse', tool_name: 'ExitPlanMode', permission_mode: 'plan', cwd: repo }))).toBe(true);
+  });
+
+  it('subagents are never gated', async () => {
+    const home = listedHome();
+    respond = listReply;
+    const r = await run(home, { ...bash('git commit -m x', gitRepo(LISTED)), agent_id: 'agent-7' });
+    expect(r.json).toBeNull();
+    expect(requests).toHaveLength(0);
+  });
+
+  it('a hanging server still gives the deny, without candidates, in about 3 s', async () => {
+    const home = listedHome();
+    respond = () => 'hang';
+    const r = await run(home, bash('git commit -m x', gitRepo(LISTED)));
+    expect(denied(r)).toBe(true);
+    expect(reason(r)).toMatch(/the Noesis server did not answer/);
+    expect(r.ms).toBeLessThan(4500);
+  }, 10_000);
+
+  it('RED: folders named through shell variables and ~ resolve to the listed repo (real shapes from this Mac)', async () => {
+    const home = listedHome();
+    respond = listReply;
+    const listed = gitRepo(LISTED);
+    const inHome = gitRepo(LISTED, 'loop/tck-77', home);
+    const sub = path.basename(inHome);
+    const other = gitRepo('https://github.com/someone/else.git');
+    for (const c of [
+      `WT=${listed}; git -C $WT push origin HEAD:main`,
+      `B=${listed}; cd $B && git commit -m x`,
+      `export WT=${listed} && git -C "$WT" merge --ff-only abc`,
+      `WT=${listed}; git -C \${WT} commit -m x`,
+      `cd "$HOME/${sub}" && git commit -m x`,
+      `git -C ~/${sub} commit -m x`,
+    ]) {
+      expect(denied(await run(home, bash(c, other))), c).toBe(true);
+    }
+    // an unknown variable falls back to the session folder: denied in a listed cwd, silent elsewhere
+    expect(denied(await run(home, bash('cd $NOT_SET_ANYWHERE && git commit -m x', listed)))).toBe(true);
+    expect((await run(home, bash('cd $NOT_SET_ANYWHERE && git commit -m x', other))).json).toBeNull();
+  });
+
+  it('gateSince reads the records\' own timestamps, not one nested inside a tool input', async () => {
+    const t = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'tck-tr-')), 's.jsonl');
+    repos.push(path.dirname(t));
+    fs.writeFileSync(
+      t,
+      '{"type":"mode","mode":"normal"}\n' +
+        '{"type":"assistant","timestamp":"2026-10-27T08:00:00.000Z","message":{"content":[{"type":"tool_use","name":"X","input":{"timestamp":"2026-01-01T00:00:00Z"}}]}}\n',
+    );
+    respond = listReply;
+    const home = listedHome({ gateSince: '2026-10-26T00:00:00Z' });
+    expect(denied(await run(home, { ...bash('git commit -m x', gitRepo(LISTED)), transcript_path: t }))).toBe(true);
+  });
+
+  it('the switch: "enabled": "false" (a string) is off; remotes compare in any form', async () => {
+    const off = sandbox({ enabled: 'false', repos: [{ remote: LISTED }] });
+    seed(off, { ...BOUND, checkedAt: 0 });
+    expect((await run(off, { hook_event_name: 'UserPromptSubmit', prompt: 'continue' })).json).toBeNull();
+    expect(requests).toHaveLength(0);
+    const home = sandbox({ enabled: true, repos: [{ remote: 'https://token@GitHub.com/Noesis-Owner/notes-app.git/' }] });
+    respond = listReply;
+    expect(denied(await run(home, bash('git commit -m x', gitRepo('git@github.com:noesis-owner/notes-app'))))).toBe(true);
+  });
+
+  // ── ship phrases ─────────────────────────────────────────────────────────────────────
+  it('ship phrases: a bound session gets the ship steps; an unbound one in a listed repo is told to ask', async () => {
+    const bound = listedHome();
+    seed(bound, { ...BOUND, status: 'ready_to_merge' });
+    for (const prompt of ['ship it', 'OK, merge to main', 'push it please', 'verify the deployment']) {
+      const r = await run(bound, { hook_event_name: 'UserPromptSubmit', prompt });
+      expect(r.ctx, prompt).toMatch(/The ship steps for TCK-12: set it to deploying/);
+    }
+    expect((await run(bound, { hook_event_name: 'UserPromptSubmit', prompt: 'continue' })).ctx).not.toMatch(/ship steps/);
+
+    const unbound = listedHome();
+    const repo = gitRepo(LISTED);
+    const u = await run(unbound, { hook_event_name: 'UserPromptSubmit', prompt: 'ship it', cwd: repo });
+    expect(u.ctx).toMatch(/asked to ship, and no Jot ticket is bound/);
+    const other = await run(unbound, { hook_event_name: 'UserPromptSubmit', prompt: 'ship it', cwd: gitRepo('https://github.com/someone/else.git') });
+    expect(other.json).toBeNull();
+    expect(requests).toHaveLength(0);
   });
 });
