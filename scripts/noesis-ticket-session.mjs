@@ -23,6 +23,10 @@
 //     remote-tracking branch was, PostToolUse compares): tickets whose "Ticket:" trailers or
 //     recorded branches are in the new range are reported. The bound one moves to deploying by
 //     itself; the others are listed for the owner to confirm, then backlog_ship.
+//   - SessionStart (startup, resume, clear — never compact), in a listed repo, at most once every
+//     6 hours: bindings of other sessions idle for 24 hours are reported (never released), and
+//     tickets at ready_to_merge / deploying whose branch is already in the deploy branch are
+//     listed for the owner (the reconcile). After /clear: the tickets bound to this folder.
 // `node noesis-ticket-session.mjs --trailer-key` prints the key of the open ticket bound to
 // CLAUDE_CODE_SESSION_ID, or nothing; the git prepare-commit-msg hook in scripts/git-hooks/
 // uses it to add the trailer "Ticket: TCK-<n>" to that session's commits.
@@ -877,6 +881,197 @@ const out = (event, additionalContext) =>
   additionalContext ? { hookSpecificOutput: { hookEventName: event, additionalContext } } : null;
 const pre = (fields) => ({ hookSpecificOutput: { hookEventName: 'PreToolUse', ...fields } });
 
+// ── Session start: stale bindings, the reconcile, the /clear hint ──────────────────────────
+
+const STALE_MS = 24 * 60 * 60 * 1000;
+const START_CHECK_MS = 6 * 60 * 60 * 1000;
+/** The stale check covers every binding on this computer: one stamp. The reconcile is per repository:
+ *  one stamp each, so a start in one listed repo never uses up another's. */
+const staleStampPath = () => path.join(cacheDir(), '.session-start-stale');
+const reconcileStampPath = (repo) => path.join(cacheDir(), `.session-start-reconcile-${String(repo.remote).replace(/[^A-Za-z0-9_-]+/g, '_')}`);
+
+/** True at most once every START_CHECK_MS per stamp; the stamp is written first, so parallel starts do not all run. */
+function dueAndStamp(file) {
+  try {
+    if (Date.now() - fs.statSync(file).mtimeMs < START_CHECK_MS) return false;
+  } catch {
+    /* never ran */
+  }
+  try {
+    fs.mkdirSync(cacheDir(), { recursive: true });
+    fs.writeFileSync(file, String(Date.now()));
+  } catch {
+    /* fail open */
+  }
+  return true;
+}
+
+/** When a session was last active: its cache file or its transcript, whichever is newer. */
+function lastActive(file, sessionId) {
+  let t = 0;
+  try {
+    if (file) t = fs.statSync(file).mtimeMs;
+  } catch {
+    /* gone */
+  }
+  const projects = path.join(os.homedir(), '.claude', 'projects');
+  let dirs = [];
+  try {
+    dirs = fs.readdirSync(projects);
+  } catch {
+    /* no projects folder */
+  }
+  for (const d of dirs) {
+    try {
+      const m = fs.statSync(path.join(projects, d, `${sessionId}.jsonl`)).mtimeMs;
+      if (m > t) t = m;
+    } catch {
+      /* not this project */
+    }
+  }
+  return t;
+}
+
+/** Bindings cached on this computer, idle for 24 hours and still bound on the server. One binding
+ *  can have several cache files: /clear gives the session a new payload id (and a new file after
+ *  /noesis-ticket link) while the binding keeps the old id. So a binding is judged by the NEWEST
+ *  activity of all its files and their transcripts (and the bound id's own transcript), never by
+ *  one file; and it is reported once. `skip` holds keys this start already names (the /clear hint). */
+async function staleBindings(cfg, ownSid, skip) {
+  const found = [];
+  let names = [];
+  try {
+    names = fs.readdirSync(cacheDir()).filter((n) => /^[A-Za-z0-9_-]+\.json$/.test(n));
+  } catch {
+    return found;
+  }
+  const groups = new Map(); // `${bound}|${key}` -> { key, bound, files: [{ file, sid }] }
+  let own = null;
+  for (const name of names) {
+    const sessionId = name.slice(0, -'.json'.length);
+    const file = path.join(cacheDir(), name);
+    let e = null;
+    try {
+      e = JSON.parse(fs.readFileSync(file, 'utf8'));
+    } catch {
+      continue;
+    }
+    if (!e || typeof e.key !== 'string' || typeof e.bound_session_id !== 'string') continue;
+    const id = `${e.bound_session_id.toLowerCase()}|${e.key}`;
+    if (sessionId === ownSid) own = id;
+    if (!groups.has(id)) groups.set(id, { key: e.key, bound: e.bound_session_id, files: [] });
+    groups.get(id).files.push({ file, sid: sessionId });
+  }
+  for (const [id, g] of groups) {
+    if (id === own || skip.has(g.key)) continue; // this session's own binding, or named already
+    const newest = Math.max(lastActive(null, g.bound), ...g.files.map((f) => lastActive(f.file, f.sid)));
+    const idle = Date.now() - newest;
+    if (idle < STALE_MS) continue;
+    let issue = null;
+    try {
+      const res = await api(cfg, 'GET', keyPath(g.key));
+      issue = res && res.issue;
+    } catch (e) {
+      if (!e || !e.status) break; // no answer from the server: stop here, look again next time
+      if (e.status === 404) {
+        // The ticket is gone (deleted on the page) or not this account's: forget the local copies.
+        for (const f of g.files) {
+          try {
+            fs.unlinkSync(f.file);
+          } catch {
+            /* raced */
+          }
+        }
+      }
+      continue; // the server answered for this ticket: the next one may still be stale
+    }
+    if (!issue || String(issue.bound_session_id || '').toLowerCase() !== g.bound.toLowerCase() || isClosed(issue.work_status)) {
+      // Released or closed meanwhile: forget this computer's copies (the server is not touched).
+      for (const f of g.files) {
+        try {
+          fs.unlinkSync(f.file);
+        } catch {
+          /* raced */
+        }
+      }
+      continue;
+    }
+    found.push({ key: g.key, status: issue.work_status, machine: issue.bound_machine, sid: g.bound, hours: Math.floor(idle / 3600000) });
+  }
+  return found;
+}
+
+/** The reconcile: tickets at ready_to_merge / deploying whose branch is already in the deploy branch. */
+async function startReconcile(cfg, repo) {
+  if (!repo.deployBranch) return { tip: null, list: [] };
+  try {
+    // Never prompt the owner for a password or passphrase from a hook.
+    const env = { ...process.env, GIT_TERMINAL_PROMPT: '0', GIT_SSH_COMMAND: process.env.GIT_SSH_COMMAND || 'ssh -o BatchMode=yes' };
+    execFileSync('git', ['-C', repo.dir, 'fetch', '--quiet', 'origin', repo.deployBranch], { stdio: 'ignore', timeout: 10000, windowsHide: true, env });
+  } catch {
+    /* offline: use the last fetched state */
+  }
+  const tip = git(repo.dir, ['rev-parse', '--verify', '-q', `refs/remotes/origin/${repo.deployBranch}`]);
+  if (!tip) return { tip: null, list: [] };
+  const merged = await mergedTickets(cfg, repo.dir, 'origin', repo.deployBranch, tip, null);
+  return { tip, list: merged.map((m) => m.issue) };
+}
+
+/** After /clear: the open tickets bound to this folder, which this session may need to link again. */
+async function boundHere(cfg, cwd) {
+  let data;
+  try {
+    data = await api(cfg, 'GET', '/api/mcp/backlog/issues');
+  } catch {
+    return [];
+  }
+  return (data && Array.isArray(data.issues) ? data.issues : []).filter(
+    (i) => i && i.bound_session_id && OPEN.includes(i.work_status) && i.bound_cwd && (cwd === i.bound_cwd || String(cwd).startsWith(i.bound_cwd + path.sep)),
+  );
+}
+
+async function sessionStart(p, sw) {
+  if (p.source === 'compact') return null;
+  const repo = repoOf(p.cwd, sw);
+  if (!repo) return null;
+  const cfg = loadConfig(p.cwd);
+  if (!cfg) return null;
+  const lines = [];
+  const named = new Set();
+  if (p.source === 'clear' && !readCache(p.session_id)) {
+    const here = await boundHere(cfg, p.cwd);
+    for (const i of here) named.add(i.key);
+    if (here.length) {
+      lines.push(
+        `[tck-session] After /clear this session has no ticket reminder. Bound to this folder: ${here
+          .map((i) => `${i.key} (${i.work_status}, session ${String(i.bound_session_id).slice(0, 8)})`)
+          .join(', ')}. If one of them is this session's work, run /noesis-ticket link <key>.`,
+      );
+    }
+  }
+  if (dueAndStamp(staleStampPath())) {
+    const stale = await staleBindings(cfg, p.session_id, named);
+    if (stale.length) {
+      lines.push(
+        `[tck-session] Bindings with no activity for 24 hours or more: ${stale
+          .map((b) => `${b.key} (${b.status}, session ${b.sid.slice(0, 8)}${b.machine ? ` on ${b.machine}` : ''}, idle ${b.hours} h)`)
+          .join(', ')}. Tell the owner. For each one that is not at ready_to_merge, ask whether to release it (mcp__noesis__backlog_unbind with force: true); a ready_to_merge one is only waiting for "ship it". Never release a binding without the owner's yes.`,
+      );
+    }
+  }
+  if (repo.deployBranch && dueAndStamp(reconcileStampPath(repo))) {
+    const rec = await startReconcile(cfg, repo);
+    if (rec.list.length) {
+      lines.push(
+        `[tck-session] These tickets still wait, but their branch is already in ${repo.deployBranch} (${rec.tip.slice(0, 12)}): ${rec.list
+          .map((i) => `${i.key} (${i.work_status}, ${i.branch})`)
+          .join(', ')}. Ask the owner whether to mark each one Shipped; on a yes, call mcp__noesis__backlog_ship(key, commit: "${rec.tip}").`,
+      );
+    }
+  }
+  return lines.length ? out('SessionStart', lines.join('\n')) : null;
+}
+
 export async function decide(p) {
   if (process.env.TCK_SESSION_HOOK === 'off') return null;
   if (!p || p.agent_id || !p.session_id) return null;
@@ -886,6 +1081,8 @@ export async function decide(p) {
   const event = p.hook_event_name;
   const plan = p.permission_mode === 'plan';
   const cwd = p.cwd;
+
+  if (event === 'SessionStart') return sessionStart(p, sw);
 
   if (event === 'UserPromptSubmit') {
     let entry = readCache(sid);

@@ -1172,6 +1172,173 @@ describe('TCK-1838: per-computer switch and the which-ticket checkpoint', () => 
     expect(fs.existsSync(cacheFile(home))).toBe(false);
   });
 
+  // ── INC-6: session start — stale bindings, the reconcile, the /clear hint ─────────────
+  const start = (dir: string, source = 'startup') => ({ hook_event_name: 'SessionStart', source, cwd: dir, transcript_path: '/nowhere.jsonl' });
+  /** A cache file for ANOTHER session, last touched `hoursAgo` hours ago. */
+  function otherCache(home: string, sid: string, entry: Record<string, unknown>, hoursAgo: number): string {
+    const f = path.join(home, '.claude', 'tck-bindings', `${sid}.json`);
+    fs.mkdirSync(path.dirname(f), { recursive: true });
+    fs.writeFileSync(f, JSON.stringify(entry));
+    const t = (Date.now() - hoursAgo * 3600 * 1000) / 1000;
+    fs.utimesSync(f, t, t);
+    return f;
+  }
+  const startServer = (issues: Record<string, Record<string, unknown>>, list: Array<Record<string, unknown>> = [], merged: Array<Record<string, unknown>> = []) =>
+    (method: string, url: string): Reply => {
+      if (method === 'GET' && url === '/api/mcp/backlog/issues?status=ready_to_merge') return { status: 200, body: { issues: merged } };
+      if (method === 'GET' && url === '/api/mcp/backlog/issues?status=deploying') return { status: 200, body: { issues: [] } };
+      if (method === 'GET' && url === '/api/mcp/backlog/issues') return { status: 200, body: { issues: list } };
+      const m = url.match(/^\/api\/mcp\/backlog\/issues\/(TCK-\d+)$/);
+      if (m && method === 'GET' && issues[m[1]]) return { status: 200, body: { issue: { key: m[1], ...issues[m[1]] } } };
+      return { status: 404, body: {} };
+    };
+
+  it('RED (TCK-1836 case): a binding idle for 24 h is reported once, never released', async () => {
+    const { dir, home } = pushRepo();
+    otherCache(home, '2b7d013b-old', { key: 'TCK-1836', status: 'planning', bound_session_id: '2b7d013b-old', machine: 'Mac' }, 30);
+    respond = startServer({ 'TCK-1836': { work_status: 'planning', bound_session_id: '2b7d013b-old', bound_machine: 'Mac' } });
+    const r = await run(home, start(dir));
+    expect(r.ctx).toMatch(/Bindings with no activity for 24 hours or more: TCK-1836 \(planning, session 2b7d013b on Mac, idle 3\d h\)/);
+    expect(r.ctx).toMatch(/Never release a binding without the owner's yes/);
+    expect(requests.some((q) => q.method === 'DELETE' || q.method === 'POST')).toBe(false); // nothing released or moved
+    requests.length = 0;
+    const again = await run(home, start(dir, 'resume')); // within 6 h: no second check
+    expect(again.json).toBeNull();
+    expect(requests).toHaveLength(0);
+  });
+
+  it('a fresh binding, or one whose transcript is still growing, is not stale', async () => {
+    const { dir, home } = pushRepo();
+    otherCache(home, 'fresh-sess', { key: 'TCK-5', status: 'implementing', bound_session_id: 'fresh-sess' }, 1);
+    otherCache(home, 'busy-sess', { key: 'TCK-6', status: 'implementing', bound_session_id: 'busy-sess' }, 40);
+    const proj = path.join(home, '.claude', 'projects', '-some-project');
+    fs.mkdirSync(proj, { recursive: true });
+    fs.writeFileSync(path.join(proj, 'busy-sess.jsonl'), '{}\n'); // touched now
+    respond = startServer({ 'TCK-5': { work_status: 'implementing', bound_session_id: 'fresh-sess' }, 'TCK-6': { work_status: 'implementing', bound_session_id: 'busy-sess' } });
+    const r = await run(home, start(dir));
+    expect(r.json).toBeNull();
+  });
+
+  it('a binding the server no longer holds is forgotten locally, not reported', async () => {
+    const { dir, home } = pushRepo();
+    const f = otherCache(home, 'gone-sess', { key: 'TCK-7', status: 'planning', bound_session_id: 'gone-sess' }, 50);
+    respond = startServer({ 'TCK-7': { work_status: 'shipped', bound_session_id: null } });
+    const r = await run(home, start(dir));
+    expect(r.json).toBeNull();
+    expect(fs.existsSync(f)).toBe(false);
+  });
+
+  it('RED (TCK-235 case): the reconcile lists a waiting ticket whose branch is already in main, with the commit', async () => {
+    const { dir, home } = pushRepo();
+    commitOn(dir, 'loop/tck-235', 'feat: paste a transcript');
+    sh(dir, 'checkout', '-q', 'main');
+    sh(dir, 'merge', '-q', '--no-ff', '-m', 'Merge pull request #18', 'loop/tck-235');
+    sh(dir, 'push', '-q', 'origin', 'HEAD:main');
+    respond = startServer({}, [], [
+      { key: 'TCK-235', work_status: 'ready_to_merge', branch: 'loop/tck-235' },
+      { key: 'TCK-237', work_status: 'ready_to_merge', branch: 'loop/never-merged' },
+    ]);
+    const r = await run(home, start(dir));
+    expect(r.ctx).toMatch(/These tickets still wait, but their branch is already in main \([0-9a-f]{12}\): TCK-235 \(ready_to_merge, loop\/tck-235\)/);
+    expect(r.ctx).toContain(`mcp__noesis__backlog_ship(key, commit: "${head(dir)}")`);
+    expect(r.ctx).not.toMatch(/TCK-237/);
+  });
+
+  it('after /clear: the tickets bound to this folder are named for /noesis-ticket link', async () => {
+    const { dir, home } = pushRepo();
+    respond = startServer({}, [
+      { key: 'TCK-12', work_status: 'implementing', bound_session_id: 'pre-clear-id-1', bound_cwd: dir },
+      { key: 'TCK-13', work_status: 'implementing', bound_session_id: 'elsewhere', bound_cwd: '/some/other/folder' },
+      { key: 'TCK-14', work_status: 'shipped', bound_session_id: 'x', bound_cwd: dir },
+    ]);
+    const r = await run(home, start(dir, 'clear'));
+    expect(r.ctx).toMatch(/After \/clear this session has no ticket reminder\. Bound to this folder: TCK-12 \(implementing, session pre-clea\)/);
+    expect(r.ctx).not.toMatch(/TCK-13|TCK-14/);
+  });
+
+  it('RED: a binding relinked after /clear (an old idle file AND a fresh file, both bound to the old id) is not stale', async () => {
+    const { dir, home } = pushRepo();
+    otherCache(home, 'aaaaaaaa-pre-clear', { key: 'TCK-1', status: 'implementing', bound_session_id: 'aaaaaaaa-pre-clear', machine: 'Mac' }, 30);
+    otherCache(home, 'bbbbbbbb-post-clear', { key: 'TCK-1', status: 'implementing', bound_session_id: 'aaaaaaaa-pre-clear', machine: 'Mac' }, 0);
+    respond = startServer({ 'TCK-1': { work_status: 'implementing', bound_session_id: 'aaaaaaaa-pre-clear', bound_machine: 'Mac' } });
+    const r = await run(home, start(dir));
+    expect(r.json).toBeNull();
+  });
+
+  it('RED: idle, then /clear in that session: only the relink hint, never "release it" for the same ticket', async () => {
+    const { dir, home } = pushRepo();
+    otherCache(home, 'aaaaaaaa-pre-clear', { key: 'TCK-1', status: 'implementing', bound_session_id: 'aaaaaaaa-pre-clear', machine: 'Mac' }, 30);
+    respond = startServer(
+      { 'TCK-1': { work_status: 'implementing', bound_session_id: 'aaaaaaaa-pre-clear', bound_machine: 'Mac' } },
+      [{ key: 'TCK-1', work_status: 'implementing', bound_session_id: 'aaaaaaaa-pre-clear', bound_cwd: dir }],
+    );
+    const r = await run(home, start(dir, 'clear'));
+    expect(r.ctx).toMatch(/After \/clear this session has no ticket reminder\. Bound to this folder: TCK-1 /);
+    expect(r.ctx).not.toMatch(/no activity for 24 hours/);
+  });
+
+  it('a hanging server: the stale check stops at the first failure (bounded start)', async () => {
+    const { dir, home } = pushRepo();
+    for (const n of [1, 2, 3, 4]) otherCache(home, `idle-${n}`, { key: `TCK-${n}`, status: 'planning', bound_session_id: `idle-${n}` }, 40);
+    respond = () => 'hang';
+    const r = await run(home, start(dir));
+    expect(r.code).toBe(0);
+    expect(requests.filter((q) => /\/issues\/TCK-\d+$/.test(q.url))).toHaveLength(1);
+    expect(r.ms).toBeLessThan(12_000);
+  }, 20_000);
+
+  it('RED: a ticket the server answers 404 for (deleted on the page) never hides a stale binding after it', async () => {
+    const { dir, home } = pushRepo();
+    const dead = otherCache(home, '00000000-dead', { key: 'TCK-900', status: 'planning', bound_session_id: '00000000-dead' }, 40);
+    otherCache(home, '11111111-idle', { key: 'TCK-901', status: 'planning', bound_session_id: '11111111-idle' }, 40);
+    respond = startServer({ 'TCK-901': { work_status: 'planning', bound_session_id: '11111111-idle' } }); // TCK-900 → 404
+    const r = await run(home, start(dir));
+    expect(r.ctx).toMatch(/TCK-901 \(planning, session 11111111/);
+    expect(fs.existsSync(dead)).toBe(false); // gone on the server: the local copy is forgotten
+  });
+
+  it('a stale binding is reported once, not again at a start in another listed repo', async () => {
+    const a = pushRepo();
+    const b = pushRepo();
+    const home = a.home;
+    const remoteA = JSON.parse(fs.readFileSync(path.join(a.home, '.claude', 'noesis-ticket.json'), 'utf8')).repos[0].remote;
+    fs.writeFileSync(path.join(home, '.claude', 'noesis-ticket.json'), JSON.stringify({ enabled: true, repos: [{ remote: remoteA, deployBranch: 'main' }, { remote: b.bare, deployBranch: 'main' }] }));
+    otherCache(home, 'idle-6', { key: 'TCK-6', status: 'planning', bound_session_id: 'idle-6' }, 40);
+    respond = startServer({ 'TCK-6': { work_status: 'planning', bound_session_id: 'idle-6' } });
+    expect((await run(home, start(a.dir))).ctx).toMatch(/TCK-6 \(planning/);
+    expect((await run(home, start(b.dir))).json).toBeNull();
+  });
+
+  it('the 6-hour window is per repository: a start in another listed repo still checks', async () => {
+    const a = pushRepo();
+    const b = pushRepo();
+    const home = a.home;
+    fs.writeFileSync(path.join(home, '.claude', 'noesis-ticket.json'), JSON.stringify({ enabled: true, repos: [
+      { remote: JSON.parse(fs.readFileSync(path.join(a.home, '.claude', 'noesis-ticket.json'), 'utf8')).repos[0].remote, deployBranch: 'main' },
+      { remote: b.bare, deployBranch: 'main' },
+    ] }));
+    respond = startServer({});
+    await run(home, start(a.dir));
+    const first = requests.length;
+    expect(first).toBeGreaterThan(0);
+    await run(home, start(a.dir, 'resume'));
+    expect(requests.length).toBe(first); // same repo, inside the window
+    await run(home, start(b.dir));
+    expect(requests.length).toBeGreaterThan(first); // another repo: its own window
+  });
+
+  it('compact, an unlisted repo, or the switch off: nothing, and no network', async () => {
+    const { dir, home } = pushRepo();
+    otherCache(home, 'old', { key: 'TCK-1836', status: 'planning', bound_session_id: 'old' }, 30);
+    respond = startServer({ 'TCK-1836': { work_status: 'planning', bound_session_id: 'old' } });
+    expect((await run(home, start(dir, 'compact'))).json).toBeNull();
+    expect((await run(listedHome(), start(gitRepo('https://github.com/someone/else.git', 'main')))).json).toBeNull();
+    const off = sandbox(null);
+    otherCache(off, 'old', { key: 'TCK-1836', status: 'planning', bound_session_id: 'old' }, 30);
+    expect((await run(off, start(dir))).json).toBeNull();
+    expect(requests).toHaveLength(0);
+  });
+
   // ── ship phrases ─────────────────────────────────────────────────────────────────────
   it('ship phrases: a bound session gets the ship steps; an unbound one in a listed repo is told to ask', async () => {
     const bound = listedHome();
