@@ -95,8 +95,8 @@ describe('ticket tools → client', () => {
 
   const run = (name: string, args: Record<string, unknown>) => handlers.get(name)!(args);
 
-  it('registers the four ticket tools', () => {
-    for (const t of ['backlog_bind', 'backlog_set_status', 'backlog_unbind', 'backlog_refine']) expect(handlers.has(t)).toBe(true);
+  it('registers the five ticket tools', () => {
+    for (const t of ['backlog_bind', 'backlog_set_status', 'backlog_ship', 'backlog_unbind', 'backlog_refine']) expect(handlers.has(t)).toBe(true);
   });
 
   it('every ticket tool refuses to run without a Claude Code session id', async () => {
@@ -106,6 +106,7 @@ describe('ticket tools → client', () => {
       ['backlog_set_status', { key: 'TCK-5', status: 'implementing' }],
       ['backlog_unbind', { key: 'TCK-5' }],
       ['backlog_refine', { key: 'TCK-5', text: 'x' }],
+      ['backlog_ship', { key: 'TCK-5', commit: 'abc1234' }],
     ] as const) {
       const res = await run(name, args);
       expect(res.isError).toBe(true);
@@ -172,6 +173,14 @@ describe('ticket tools → client', () => {
     ]);
   });
 
+  it('TCK-1838: backlog_ship sends the caller and the merge commit to /shipped', async () => {
+    process.env.CLAUDE_CODE_SESSION_ID = SESSION;
+    await run('backlog_ship', { key: 'TCK-1831', commit: 'f50a6ea2' });
+    expect(calls).toEqual([['backlogShip', 'TCK-1831', { session_id: SESSION, machine: 'Test Machine', cwd: '/work/proj', commit: 'f50a6ea2' }]]);
+    const ship = z.object(schemas.get('backlog_ship')!);
+    expect(ship.safeParse({ key: 'TCK-1' }).success).toBe(false); // the commit is required
+  });
+
   it('Claude Code cannot even ask for created or dropped', () => {
     const status = z.object(schemas.get('backlog_set_status')!);
     expect(status.safeParse({ key: 'TCK-1', status: 'dropped' }).success).toBe(false);
@@ -215,6 +224,7 @@ describe('a refusal keeps its error_code and details', () => {
     ['backlogSetStatus', 'POST', '/status', 'NOT_BOUND', undefined],
     ['backlogRefine', 'PUT', '/refined', 'REFINE_LENGTH', { draft_words: 18, min: 12, max: 23, got: 2 }],
     ['backlogUnbind', 'DELETE', '/binding', 'BOUND_ELSEWHERE', { bound_machine: 'DESKTOP-ABC' }],
+    ['backlogShip', 'POST', '/shipped', 'NOT_READY', { work_status: 'implementing' }],
   ] as const)('%s (%s …%s) keeps [%s] and its details', async (method, verb, suffix, code, details) => {
     let seen = '';
     globalThis.fetch = vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
@@ -245,12 +255,14 @@ describe('a refusal keeps its error_code and details', () => {
     await c.backlogUnbind('TCK-1', {});
     await c.backlogSetStatus('TCK-1', {});
     await c.backlogRefine('TCK-1', {});
+    await c.backlogShip('TCK-1', {});
     await c.backlogList({ status: 'shipped' });
     expect(seen).toEqual([
       'POST https://example.test/api/mcp/backlog/issues/TCK-1/binding',
       'DELETE https://example.test/api/mcp/backlog/issues/TCK-1/binding',
       'POST https://example.test/api/mcp/backlog/issues/TCK-1/status',
       'PUT https://example.test/api/mcp/backlog/issues/TCK-1/refined',
+      'POST https://example.test/api/mcp/backlog/issues/TCK-1/shipped',
       'GET https://example.test/api/mcp/backlog/issues?status=shipped',
     ]);
   });

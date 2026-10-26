@@ -320,6 +320,24 @@ export function registerBacklogTools(server: McpServer, client: NoesisClient): v
   );
 
   server.tool(
+    'backlog_ship',
+    "Ship a Jot ticket whose work is merged into the deploy branch (main): the merge commit is the evidence, so it works whether or not a session — often one that has ended — holds the ticket. Use it when the ticket hook lists a merged ticket that is not bound to THIS session, and only after the user says yes. Only a ticket at ready_to_merge or deploying ships (409 NOT_READY otherwise); a Dropped ticket is TICKET_CLOSED; a Shipped one is a no-op. Shipping releases the binding. For the ticket bound to this session, keep using backlog_set_status.",
+    {
+      key: z.string().describe('Ticket key like TCK-7'),
+      commit: z.string().describe('The commit on the deploy branch that holds the work (7-40 hex digits)'),
+    },
+    async (args) => {
+      try {
+        const who = ticketCaller();
+        if (!who) return errText(new Error(NO_SESSION));
+        return jsonText(await client.backlogShip(args.key, { ...who, commit: args.commit }));
+      } catch (e) {
+        return errText(e);
+      }
+    }
+  );
+
+  server.tool(
     'backlog_unbind',
     "Release this session's binding on a Jot ticket (the status stays). Use it when the user says to stop working the ticket here, or to reset the binding. force releases a binding held by another session — only when the user asks.",
     {

@@ -19,6 +19,10 @@
 //     add the ship steps to a bound session's reminder, or ask which ticket an unbound one ships.
 //   - after a bound session's first commit on a branch of a repo with a "deployBranch", the
 //     ticket records that branch (PATCH branch), so a later merge can be traced to it.
+//   - a push that moves a listed repo's deploy branch is read back (PreToolUse notes where the
+//     remote-tracking branch was, PostToolUse compares): tickets whose "Ticket:" trailers or
+//     recorded branches are in the new range are reported. The bound one moves to deploying by
+//     itself; the others are listed for the owner to confirm, then backlog_ship.
 // `node noesis-ticket-session.mjs --trailer-key` prints the key of the open ticket bound to
 // CLAUDE_CODE_SESSION_ID, or nothing; the git prepare-commit-msg hook in scripts/git-hooks/
 // uses it to add the trailer "Ticket: TCK-<n>" to that session's commits.
@@ -64,7 +68,7 @@ export const HOOK_VERSION = 2;
 const TIMEOUT_MS = 2500;
 export const RECHECK_MS = 60 * 1000;
 const PRUNE_MS = 14 * 24 * 60 * 60 * 1000;
-const TICKET_TOOL = /^mcp__noesis__backlog_(bind|set_status|unbind|refine)$/;
+const TICKET_TOOL = /^mcp__noesis__backlog_(bind|set_status|unbind|refine|ship)$/;
 const CLOSED = ['shipped', 'dropped'];
 /** Past Planning: a new plan in plan mode may be new work, not this ticket's. */
 const PAST_PLANNING = ['implementing', 'iterating', 'ready_to_merge', 'deploying'];
@@ -321,19 +325,186 @@ async function recordBranch(sessionId, entry, p, sw) {
 
 // ── The "which ticket?" checkpoint ──────────────────────────────────────────────────────
 
-/** The first checkpoint of this tool call that is in a listed repository, or null. */
-function findCheckpoint(p, sw) {
-  if (!sw || sw.repos.length === 0) return null;
+/** Every checkpoint of this tool call that is in a listed repository (the gate uses the first). */
+function findCheckpoints(p, sw) {
+  if (!sw || sw.repos.length === 0) return [];
   if (p.tool_name === 'ExitPlanMode') {
     const repo = repoOf(p.cwd, sw);
-    return repo ? { kind: 'plan', dir: p.cwd, repo } : null;
+    return repo ? [{ kind: 'plan', dir: p.cwd, repo }] : [];
   }
-  if (p.tool_name !== 'Bash') return null;
+  if (p.tool_name !== 'Bash') return [];
+  const hits = [];
   for (const c of gitCheckpoints(p.tool_input && p.tool_input.command, p.cwd)) {
     const repo = repoOf(c.dir, sw);
-    if (repo) return { ...c, repo };
+    if (repo) hits.push({ ...c, repo });
   }
-  return null;
+  return hits;
+}
+
+// ── Push sync: the deploy branch moved, so which tickets did it carry? ──────────────────
+
+function gitOk(dir, args) {
+  try {
+    execFileSync('git', ['-C', dir, ...args], { stdio: 'ignore', timeout: 3000, windowsHide: true });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+const pushPath = (sessionId) => path.join(cacheDir(), `${String(sessionId).replace(/[^A-Za-z0-9_-]/g, '')}.push.json`);
+
+const PUSH_OPT_WITH_ARG = new Set(['-o', '--push-option', '--receive-pack', '--exec']);
+const PUSH_RECORD_MAX_MS = 15 * 60 * 1000;
+
+/** The remote a `git push` names (the first word that is not an option or an option's value), else origin. */
+export function pushRemote(args) {
+  const a = args || [];
+  for (let i = 0; i < a.length; i++) {
+    if (a[i].startsWith('--repo=')) return a[i].slice('--repo='.length) || 'origin';
+    if (a[i] === '--repo') return a[i + 1] || 'origin';
+    if (PUSH_OPT_WITH_ARG.has(a[i])) {
+      i++;
+      continue;
+    }
+    if (a[i].startsWith('-')) continue;
+    return !a[i].includes(':') && !a[i].includes('/') ? a[i] : 'origin';
+  }
+  return 'origin';
+}
+
+/** Before a push: note where the remote-tracking deploy branch is, to compare after it. The
+ *  record belongs to this one Bash call (tool_use_id): a push that fails or is refused never
+ *  reaches PostToolUse, and its record must not be read back by a later, unrelated call. */
+function notePush(sessionId, hit, toolUseId, command) {
+  if (!hit || hit.kind !== 'push' || !hit.repo.deployBranch) return;
+  const remote = pushRemote(hit.args);
+  const ref = `refs/remotes/${remote}/${hit.repo.deployBranch}`;
+  const before = git(hit.dir, ['rev-parse', '--verify', '-q', ref]);
+  try {
+    fs.mkdirSync(cacheDir(), { recursive: true });
+    fs.writeFileSync(
+      pushPath(sessionId),
+      JSON.stringify({ dir: hit.dir, remote, deployBranch: hit.repo.deployBranch, before, at: Date.now(), tool_use_id: toolUseId || null, command: String(command || '') }),
+    );
+  } catch {
+    /* fail open */
+  }
+}
+
+/** Open tickets at ready_to_merge / deploying whose recorded branch is contained in `tip` (the
+ *  reconcile). `fresh` = this push brought it in: it was not already in `before`. Only a fresh
+ *  branch is evidence that moves the bound ticket; every merged one is listed for the owner. */
+async function mergedTickets(cfg, dir, remote, deployBranch, tip, before) {
+  const found = [];
+  for (const status of ['ready_to_merge', 'deploying']) {
+    let data;
+    try {
+      data = await api(cfg, 'GET', `/api/mcp/backlog/issues?status=${status}`);
+    } catch {
+      continue;
+    }
+    for (const i of (data && Array.isArray(data.issues) ? data.issues : [])) {
+      if (!i || !i.key || typeof i.branch !== 'string' || !i.branch || i.branch === deployBranch) continue;
+      const ref = [`refs/heads/${i.branch}`, `refs/remotes/${remote}/${i.branch}`].find((r) => git(dir, ['rev-parse', '--verify', '-q', r]));
+      if (!ref || !gitOk(dir, ['merge-base', '--is-ancestor', ref, tip])) continue;
+      found.push({ issue: i, fresh: !!before && !gitOk(dir, ['merge-base', '--is-ancestor', ref, before]) });
+    }
+  }
+  return found;
+}
+
+/** What THIS push did to the deploy branch, from the remote-tracking branch's reflog: the
+ *  "update by push" entries written since the record. A fetch or pull in the same command
+ *  moves the same ref, but never with that subject, so other sessions' pushes are not counted.
+ *  Without a reflog (core.logAllRefUpdates=false), the push's own "old..new  x -> <branch>" line. */
+function pushedRange(rec, response) {
+  const ref = `refs/remotes/${rec.remote}/${rec.deployBranch}`;
+  const lines = git(rec.dir, ['reflog', 'show', '--date=unix', '--format=%H%x09%gd%x09%gs', ref]).split('\n').filter(Boolean);
+  if (lines.length) {
+    const entries = lines.map((l) => {
+      const [sha, gd = '', subject = ''] = l.split('\t');
+      return { sha, t: Number((gd.match(/@\{(\d+)\}/) || [])[1]), subject };
+    });
+    // The reflog is newest first. The updates made since the record are the entries above the
+    // newest one that still holds the recorded value (all of them when the ref did not exist).
+    let end = entries.length;
+    if (rec.before) {
+      end = entries.findIndex((e) => e.sha === rec.before);
+      if (end < 0) {
+        // The recorded value is gone from the reflog (expired or rewritten): fall back to time.
+        const since = Math.floor((rec.at || 0) / 1000);
+        end = entries.findIndex((e) => !(e.t >= since));
+        if (end < 0) end = entries.length;
+      }
+    }
+    let newest = -1;
+    let oldest = -1;
+    for (let i = 0; i < end; i++) {
+      if (!/^update by push/.test(entries[i].subject)) continue;
+      if (newest < 0) newest = i;
+      oldest = i;
+    }
+    if (newest < 0) return null; // this call did not push the deploy branch
+    return { before: entries[oldest + 1] ? entries[oldest + 1].sha : null, after: entries[newest].sha };
+  }
+  const text = response && typeof response === 'object' ? `${response.stdout || ''}\n${response.stderr || ''}` : String(response || '');
+  const esc = rec.deployBranch.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const m = text.match(new RegExp(`([0-9a-f]{7,40})\\.{2,3}([0-9a-f]{7,40})\\s+\\S+\\s+->\\s+(?:refs/heads/)?${esc}\\b`));
+  if (!m) return null;
+  const full = (x) => git(rec.dir, ['rev-parse', '--verify', '-q', `${x}^{commit}`]) || null;
+  const after = full(m[2]);
+  return after ? { before: full(m[1]), after } : null;
+}
+
+/** After a push: if this push moved the deploy branch, move the bound ticket and list the others. */
+async function afterPush(sessionId, entry, rec, cwd, response) {
+  const moved = pushedRange(rec, response);
+  if (!moved) return null;
+  const { before, after } = moved;
+  const range = before ? [`${before}..${after}`] : ['-n', '1', after];
+  const trailerKeys = new Set(
+    git(rec.dir, ['log', '--format=%(trailers:key=Ticket,valueonly)', ...range])
+      .split(/\s+/)
+      .filter((k) => /^TCK-\d+$/i.test(k))
+      .map((k) => k.toUpperCase()),
+  );
+  const cfg = loadConfig(cwd);
+  const merged = cfg ? await mergedTickets(cfg, rec.dir, rec.remote, rec.deployBranch, after, before) : [];
+  const status = new Map(merged.map((m) => [m.issue.key, m.issue.work_status]));
+  const short = after.slice(0, 12);
+  const lines = [];
+  const live = openEntry(entry) ? entry : null;
+  // The bound ticket moves only on evidence in THIS push, and only when the push's start is known.
+  const evidence = !!live && !!before && (trailerKeys.has(live.key) || merged.some((m) => m.fresh && m.issue.key === live.key));
+  if (evidence) {
+    const now = await setStatus(sessionId, live, 'deploying', cwd);
+    lines.push(
+      now
+        ? `[tck-session] The push moved ${rec.deployBranch} to ${short}, and it holds the work of ${live.key}, so ${live.key} is ${now}. Verify the live deployment; then, with the owner's yes, set ${live.key} to shipped (mcp__noesis__backlog_set_status).`
+        : `[tck-session] The push moved ${rec.deployBranch} to ${short}, and it holds the work of ${live.key}, but the hook could not set ${live.key} to deploying (the server refused or did not answer). Set it yourself (mcp__noesis__backlog_set_status), verify the live deployment, then set it to shipped with the owner's yes.`,
+    );
+  }
+  const keys = [...new Set([...trailerKeys, ...merged.map((m) => m.issue.key)])].filter((k) => !(live && k === live.key)).slice(0, 10);
+  const looked = await Promise.all(
+    keys.map(async (key) => {
+      if (status.has(key)) return [key, status.get(key)];
+      if (!cfg) return [key, null];
+      try {
+        const res = await api(cfg, 'GET', keyPath(key));
+        return [key, res && res.issue ? res.issue.work_status : null];
+      } catch {
+        return [key, null];
+      }
+    }),
+  );
+  const others = looked.filter(([, st]) => st && !isClosed(st)).map(([key, st]) => `${key} (${st})`);
+  if (others.length) {
+    lines.push(
+      `[tck-session] ${rec.deployBranch} (${short}) also holds the work of ${others.join(', ')}, not bound to this session. Ask the owner whether to mark each one Shipped; on a yes, call mcp__noesis__backlog_ship(key, commit: "${after}").`,
+    );
+  }
+  return lines.length ? lines.join('\n') : null;
 }
 
 /** When the session's transcript began: the earliest "timestamp" in its first 64 KB. */
@@ -590,6 +761,7 @@ const FORWARD = {
   ready_to_implement: ['planning'],
   implementing: ['ready_to_implement'],
   planning: ['ready_to_implement'], // a rejected plan
+  deploying: ['implementing', 'iterating', 'ready_to_merge'], // its work reached the deploy branch
 };
 
 /** Set the bound ticket's status, as the bound session. Returns the new status or null. */
@@ -747,11 +919,15 @@ export async function decide(p) {
   if (event === 'PreToolUse') {
     const entry = readCache(sid);
     const live = entry && !isClosed(entry.status) ? entry : null;
-    const hit = findCheckpoint(p, sw);
-    if (hit && !live && !gateOpen(sid) && gateApplies(p, sw)) {
-      if (hit.kind !== 'plan' && loopSession(sid, sw)) return pre({ additionalContext: loopNote(hit) });
+    const hits = findCheckpoints(p, sw);
+    const hit = hits[0] || null;
+    if (hit && !live && !gateOpen(sid) && gateApplies(p, sw) && !(hit.kind !== 'plan' && loopSession(sid, sw))) {
       return pre({ permissionDecision: 'deny', permissionDecisionReason: gateReason(hit, await candidates(loadConfig(cwd), hit.dir)) });
     }
+    // The first push into a repo WITH a deploy branch: `git -C <mcp> push && git push origin HEAD:main`
+    // pushes a listed repo without one first, and that must not hide the deploy push.
+    notePush(sid, hits.find((h) => h.kind === 'push' && h.repo.deployBranch), p.tool_use_id, p.tool_input && p.tool_input.command);
+    if (hit && !live && hit.kind !== 'plan' && !gateOpen(sid) && gateApplies(p, sw)) return pre({ additionalContext: loopNote(hit) });
     if (!entry) return null;
     if (p.tool_name === 'ExitPlanMode') await setStatus(sid, entry, 'ready_to_implement', cwd);
     else if (plan && entry.status === 'ready_to_implement') await setStatus(sid, entry, 'planning', cwd);
@@ -763,7 +939,22 @@ export async function decide(p) {
     if (p.tool_name === 'Bash') {
       const entry = readCache(sid);
       if (openEntry(entry) && sw.repos.length) await recordBranch(sid, entry, p, sw);
-      return null;
+      let rec = null;
+      try {
+        rec = JSON.parse(fs.readFileSync(pushPath(sid), 'utf8'));
+        fs.unlinkSync(pushPath(sid)); // read once: a leftover never reaches a later call
+      } catch {
+        rec = null;
+      }
+      // Only the Bash call that wrote the record may read it back (same tool_use_id, or, without
+      // ids, the same command), and only soon after; anything else is a stale record.
+      const mine =
+        rec &&
+        rec.dir &&
+        Date.now() - (rec.at || 0) < PUSH_RECORD_MAX_MS &&
+        (rec.tool_use_id && p.tool_use_id ? rec.tool_use_id === p.tool_use_id : rec.command === String((p.tool_input && p.tool_input.command) || ''));
+      const note = mine ? await afterPush(sid, readCache(sid), rec, cwd, p.tool_response) : null;
+      return note ? out(event, note) : null;
     }
     if (p.tool_name === 'AskUserQuestion') {
       const answer = ticketAnswer(p);

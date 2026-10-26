@@ -1464,6 +1464,10 @@ export class NoesisClient {
     return this.requestWithCode('POST', `/api/mcp/backlog/issues/${encodeURIComponent(key)}/status`, body);
   }
 
+  async backlogShip(key: string, body: Record<string, unknown>): Promise<any> {
+    return this.requestWithCode('POST', `/api/mcp/backlog/issues/${encodeURIComponent(key)}/shipped`, body);
+  }
+
   async backlogRefine(key: string, body: Record<string, unknown>): Promise<any> {
     return this.requestWithCode('PUT', `/api/mcp/backlog/issues/${encodeURIComponent(key)}/refined`, body);
   }

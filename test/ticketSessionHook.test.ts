@@ -18,7 +18,7 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import * as http from 'node:http';
-import { spawn, execFileSync } from 'node:child_process';
+import { spawn, spawnSync, execFileSync } from 'node:child_process';
 import type { AddressInfo } from 'node:net';
 
 const HOOK = path.resolve(__dirname, '..', 'scripts', 'noesis-ticket-session.mjs');
@@ -893,6 +893,283 @@ describe('TCK-1838: per-computer switch and the which-ticket checkpoint', () => 
     expect(readCacheFile(home).branch).toBeUndefined();
     await run(home, posted('git commit -m y', repo));
     expect(requests.filter((q) => q.method === 'PATCH')).toHaveLength(2);
+  });
+
+  // ── INC-5: push sync — the deploy branch moved, so which tickets did it carry? ─────────
+  const sh = (dir: string, ...a: string[]) => execFileSync('git', ['-C', dir, ...a], { stdio: 'ignore' });
+  /** A repo whose origin is a real bare repo (listed in the switch file by its path), main pushed. */
+  function pushRepo(): { dir: string; home: string; bare: string } {
+    const bare = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'tck-bare-')));
+    repos.push(bare);
+    execFileSync('git', ['init', '-q', '--bare', '-b', 'main', bare], { stdio: 'ignore' });
+    const dir = gitRepo(bare, 'main');
+    sh(dir, 'push', '-q', 'origin', 'main');
+    const home = sandbox({ enabled: true, repos: [{ remote: bare, deployBranch: 'main' }] });
+    return { dir, home, bare };
+  }
+  /** Another clone of the same bare origin: plays a parallel session that pushes main. */
+  function otherClone(bare: string): string {
+    const d = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'tck-other-')));
+    repos.push(d);
+    execFileSync('git', ['clone', '-q', bare, d], { stdio: 'ignore' });
+    sh(d, 'config', 'user.email', 'o@example.invalid');
+    sh(d, 'config', 'user.name', 'o');
+    return d;
+  }
+  function commitOn(dir: string, branch: string | null, message: string, file = 'a.txt') {
+    if (branch) sh(dir, 'checkout', '-q', '-B', branch);
+    fs.appendFileSync(path.join(dir, file), `${message}\n`);
+    sh(dir, 'add', file);
+    sh(dir, 'commit', '-q', '-m', message);
+  }
+  const head = (dir: string) => execFileSync('git', ['-C', dir, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
+  /** The hook around a real `git push`: PreToolUse, the push itself, then PostToolUse. */
+  async function hookedPush(home: string, dir: string, command = 'git push origin HEAD:main') {
+    await run(home, bash(command, dir));
+    execFileSync('bash', ['-c', command], { cwd: dir, stdio: 'ignore' });
+    return run(home, { hook_event_name: 'PostToolUse', tool_name: 'Bash', tool_input: { command }, tool_response: { stdout: '', stderr: '' }, cwd: dir });
+  }
+  const shipServer = (extra: Record<string, { work_status: string; branch?: string }> = {}, merged: Array<Record<string, unknown>> = []) =>
+    (method: string, url: string, body: any): Reply => {
+      if (method === 'GET' && url === '/api/mcp/backlog/issues?status=ready_to_merge') return { status: 200, body: { issues: merged } };
+      if (method === 'GET' && url === '/api/mcp/backlog/issues?status=deploying') return { status: 200, body: { issues: [] } };
+      const m = url.match(/^\/api\/mcp\/backlog\/issues\/(TCK-\d+)(\/status)?$/);
+      if (m && method === 'POST' && m[2]) return { status: 200, body: { issue: { key: m[1], work_status: body.status, bound_session_id: BOUND_SID, bound_machine: "Tester's Mac" } } };
+      if (m && method === 'GET' && extra[m[1]]) return { status: 200, body: { issue: { key: m[1], ...extra[m[1]] } } };
+      if (method === 'PATCH') return { status: 200, body: { issue: {} } };
+      return { status: 404, body: {} };
+    };
+  const statusPosts = () => requests.filter((q) => q.method === 'POST' && q.url.endsWith('/status'));
+
+  it('RED: a push whose range holds the bound ticket\'s trailer moves it to deploying, as the bound session', async () => {
+    const { dir, home } = pushRepo();
+    seed(home, { ...BOUND, status: 'ready_to_merge' });
+    respond = shipServer();
+    commitOn(dir, 'loop/tck-12', 'feat: the work\n\nTicket: TCK-12');
+    sh(dir, 'checkout', '-q', 'main');
+    sh(dir, 'merge', '-q', '--no-ff', '-m', 'Merge loop/tck-12', 'loop/tck-12');
+    const r = await hookedPush(home, dir);
+    expect(statusPosts()).toEqual([expect.objectContaining({ url: '/api/mcp/backlog/issues/TCK-12/status', body: expect.objectContaining({ status: 'deploying', session_id: BOUND_SID }) })]);
+    expect(r.ctx).toMatch(/The push moved main to [0-9a-f]{12}, and it holds the work of TCK-12, so TCK-12 is deploying\. Verify the live deployment; then, with the owner's yes, set TCK-12 to shipped/);
+    expect(readCacheFile(home).status).toBe('deploying');
+    expect(fs.existsSync(path.join(home, '.claude', 'tck-bindings', `${HOOK_SID}.push.json`))).toBe(false);
+  });
+
+  it('RED: a push with no evidence for the bound ticket (a hotfix) moves nothing', async () => {
+    const { dir, home } = pushRepo();
+    seed(home, { ...BOUND, status: 'ready_to_merge' });
+    respond = shipServer();
+    commitOn(dir, null, 'fix: an unrelated hotfix');
+    const r = await hookedPush(home, dir);
+    expect(statusPosts()).toHaveLength(0);
+    expect(r.json).toBeNull();
+  });
+
+  it('a push to another branch, or a push that changes nothing, reads nothing back', async () => {
+    const { dir, home } = pushRepo();
+    seed(home, { ...BOUND, status: 'ready_to_merge' });
+    respond = shipServer();
+    commitOn(dir, 'loop/tck-12', 'feat: x\n\nTicket: TCK-12');
+    const r = await hookedPush(home, dir, 'git push -q origin HEAD:refs/heads/loop/tck-12');
+    expect(r.json).toBeNull();
+    sh(dir, 'checkout', '-q', 'main');
+    const r2 = await hookedPush(home, dir); // main is already there: nothing moves
+    expect(r2.json).toBeNull();
+    expect(requests).toHaveLength(0);
+  });
+
+  it('other open tickets in the range are listed for the owner, with the commit for backlog_ship; closed ones are not', async () => {
+    const { dir, home } = pushRepo();
+    seed(home, { ...BOUND, status: 'implementing' });
+    respond = shipServer({ 'TCK-77': { work_status: 'ready_to_merge' }, 'TCK-9': { work_status: 'shipped' } });
+    commitOn(dir, null, 'feat: a\n\nTicket: TCK-77');
+    commitOn(dir, null, 'feat: b\n\nTicket: TCK-9');
+    const r = await hookedPush(home, dir);
+    const sha = head(dir);
+    expect(r.ctx).toMatch(/also holds the work of TCK-77 \(ready_to_merge\), not bound to this session\. Ask the owner whether to mark each one Shipped/);
+    expect(r.ctx).toContain(`mcp__noesis__backlog_ship(key, commit: "${sha}")`);
+    expect(r.ctx).not.toMatch(/TCK-9\b/);
+    expect(statusPosts()).toHaveLength(0); // the bound TCK-12 had no evidence
+  });
+
+  it('RED (TCK-1831 case): a ready_to_merge ticket whose recorded branch is now in main is found without any trailer', async () => {
+    const { dir, home } = pushRepo();
+    seed(home, { ...BOUND, key: 'TCK-1837', status: 'ready_to_merge' });
+    commitOn(dir, 'loop/live-librarian', 'feat: the librarian (no trailer)');
+    sh(dir, 'checkout', '-q', 'main');
+    sh(dir, 'merge', '-q', '--no-ff', '-m', 'Merge loop/live-librarian', 'loop/live-librarian');
+    respond = shipServer({}, [{ key: 'TCK-1831', work_status: 'ready_to_merge', branch: 'loop/live-librarian' }, { key: 'TCK-235', work_status: 'ready_to_merge', branch: 'loop/never-merged' }]);
+    const r = await hookedPush(home, dir);
+    expect(r.ctx).toMatch(/also holds the work of TCK-1831 \(ready_to_merge\)/);
+    expect(r.ctx).not.toMatch(/TCK-235/);
+  });
+
+  it('an unbound session that chose "no ticket" still gets the list; an unlisted repo gets nothing', async () => {
+    const { dir, home } = pushRepo();
+    fs.mkdirSync(path.join(home, '.claude', 'tck-bindings'), { recursive: true });
+    fs.writeFileSync(path.join(home, '.claude', 'tck-bindings', `${HOOK_SID}.gate.json`), JSON.stringify({ noTicket: true }));
+    respond = shipServer({ 'TCK-77': { work_status: 'deploying' } });
+    commitOn(dir, null, 'feat: a\n\nTicket: TCK-77');
+    const r = await hookedPush(home, dir);
+    expect(r.ctx).toMatch(/also holds the work of TCK-77 \(deploying\)/);
+
+    requests.length = 0;
+    const other = gitRepo('https://github.com/someone/else.git', 'main');
+    const r2 = await run(listedHome(), bash('git push origin HEAD:main', other));
+    expect(r2.json).toBeNull();
+    expect(requests).toHaveLength(0);
+  });
+
+  it('RED: a push that failed leaves no record for a later call: another session\'s push is never reported', async () => {
+    const { dir, home } = pushRepo();
+    seed(home, { ...BOUND, status: 'ready_to_merge' });
+    respond = shipServer({ 'TCK-77': { work_status: 'deploying' } });
+    // this session's push: PreToolUse runs, the push is rejected, so PostToolUse never fires
+    await run(home, { ...bash('git push origin HEAD:main', dir), tool_use_id: 'toolu_push_A' });
+    // meanwhile another worktree pushes main with TCK-77's work (no hook of ours sees it)
+    commitOn(dir, null, 'feat: other session\n\nTicket: TCK-77');
+    sh(dir, 'push', '-q', 'origin', 'HEAD:main');
+    // the next successful Bash call of this session
+    const r = await run(home, { hook_event_name: 'PostToolUse', tool_name: 'Bash', tool_input: { command: 'git fetch -q origin' }, tool_use_id: 'toolu_fetch_B', tool_response: { stdout: '' }, cwd: dir });
+    expect(r.json).toBeNull();
+    expect(fs.existsSync(path.join(home, '.claude', 'tck-bindings', `${HOOK_SID}.push.json`))).toBe(false);
+    // without ids the command must match: `ls` after a failed push reports nothing either
+    await run(home, bash('git push origin HEAD:main', dir));
+    const r2 = await run(home, { hook_event_name: 'PostToolUse', tool_name: 'Bash', tool_input: { command: 'ls' }, tool_response: { stdout: '' }, cwd: dir });
+    expect(r2.json).toBeNull();
+    expect(statusPosts()).toHaveLength(0);
+  });
+
+  it('the same Bash call (same tool_use_id) reads its record back', async () => {
+    const { dir, home } = pushRepo();
+    seed(home, { ...BOUND, status: 'ready_to_merge' });
+    respond = shipServer();
+    commitOn(dir, null, 'feat: x\n\nTicket: TCK-12');
+    const cmd = 'git push origin HEAD:main';
+    await run(home, { ...bash(cmd, dir), tool_use_id: 'toolu_same' });
+    sh(dir, 'push', '-q', 'origin', 'HEAD:main');
+    const r = await run(home, { hook_event_name: 'PostToolUse', tool_name: 'Bash', tool_input: { command: cmd }, tool_use_id: 'toolu_same', tool_response: { stdout: '' }, cwd: dir });
+    expect(r.ctx).toMatch(/holds the work of TCK-12, so TCK-12 is deploying/);
+  });
+
+  it('RED: a branch merged BEFORE this push is not evidence for the bound ticket (a later hotfix moves nothing)', async () => {
+    const { dir, home } = pushRepo();
+    seed(home, { ...BOUND, status: 'ready_to_merge' });
+    commitOn(dir, 'loop/tck-12', 'feat: the work, merged earlier');
+    sh(dir, 'checkout', '-q', 'main');
+    sh(dir, 'merge', '-q', '--no-ff', '-m', 'Merge loop/tck-12', 'loop/tck-12');
+    sh(dir, 'push', '-q', 'origin', 'HEAD:main'); // pushed before, without our hook
+    commitOn(dir, null, 'fix: unrelated hotfix');
+    respond = shipServer({}, [{ key: 'TCK-12', work_status: 'ready_to_merge', branch: 'loop/tck-12' }]);
+    const r = await hookedPush(home, dir);
+    expect(statusPosts()).toHaveLength(0);
+    expect(r.json).toBeNull();
+  });
+
+  it('RED: a fetch in the same command moves origin/main, but only "update by push" counts (push to another branch → nothing)', async () => {
+    const { dir, home, bare } = pushRepo();
+    seed(home, { ...BOUND, status: 'ready_to_merge' });
+    respond = shipServer({ 'TCK-77': { work_status: 'deploying' } });
+    const other = otherClone(bare);
+    commitOn(other, null, 'feat: other session\n\nTicket: TCK-77', 'other.txt');
+    sh(other, 'push', '-q', 'origin', 'HEAD:main');
+    commitOn(dir, 'loop/tck-12', 'feat: mine\n\nTicket: TCK-12');
+    const r = await hookedPush(home, dir, 'git fetch -q origin && git push -q origin HEAD:refs/heads/loop/tck-12');
+    expect(r.json).toBeNull();
+    expect(statusPosts()).toHaveLength(0);
+  });
+
+  it('RED: `pull --rebase && push` counts only this push\'s commits, never the pulled ones', async () => {
+    const { dir, home, bare } = pushRepo();
+    seed(home, { ...BOUND, status: 'ready_to_merge' });
+    respond = shipServer({ 'TCK-77': { work_status: 'deploying' } });
+    const other = otherClone(bare);
+    commitOn(other, null, 'feat: other session\n\nTicket: TCK-77', 'other.txt');
+    sh(other, 'push', '-q', 'origin', 'HEAD:main');
+    commitOn(dir, null, 'feat: mine\n\nTicket: TCK-12');
+    const r = await hookedPush(home, dir, 'git pull -q --rebase origin main && git push -q origin HEAD:main');
+    expect(r.ctx).toMatch(/holds the work of TCK-12, so TCK-12 is deploying/);
+    expect(r.ctx).not.toMatch(/TCK-77/);
+  });
+
+  it('the reconcile after a push still lists a ticket whose branch was merged EARLIER (but never moves the bound one for it)', async () => {
+    const { dir, home } = pushRepo();
+    seed(home, { ...BOUND, status: 'ready_to_merge' });
+    commitOn(dir, 'loop/live-librarian', 'feat: librarian, merged earlier');
+    sh(dir, 'checkout', '-q', 'main');
+    sh(dir, 'merge', '-q', '--no-ff', '-m', 'Merge loop/live-librarian', 'loop/live-librarian');
+    sh(dir, 'push', '-q', 'origin', 'HEAD:main');
+    commitOn(dir, null, 'fix: a later hotfix');
+    respond = shipServer({}, [
+      { key: 'TCK-1831', work_status: 'ready_to_merge', branch: 'loop/live-librarian' },
+      { key: 'TCK-12', work_status: 'ready_to_merge', branch: 'loop/live-librarian' },
+    ]);
+    const r = await hookedPush(home, dir);
+    expect(r.ctx).toMatch(/also holds the work of TCK-1831 \(ready_to_merge\)/);
+    expect(statusPosts()).toHaveLength(0);
+  });
+
+  it('RED: when the push\'s start is unknown (a remote never fetched), the bound ticket never moves', async () => {
+    const { dir, home } = pushRepo();
+    seed(home, { ...BOUND, status: 'implementing' });
+    respond = shipServer();
+    const mirror = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'tck-mirror-')));
+    repos.push(mirror);
+    execFileSync('git', ['init', '-q', '--bare', '-b', 'main', mirror], { stdio: 'ignore' });
+    sh(dir, 'remote', 'add', 'mirror', mirror);
+    commitOn(dir, null, 'feat: x\n\nTicket: TCK-12');
+    const r = await hookedPush(home, dir, 'git push -q mirror HEAD:main');
+    expect(statusPosts()).toHaveLength(0);
+    expect(r.json).toBeNull();
+  });
+
+  it('without a reflog, the push\'s own "old..new  x -> main" line gives the range', async () => {
+    const { dir, home } = pushRepo();
+    seed(home, { ...BOUND, status: 'ready_to_merge' });
+    respond = shipServer();
+    sh(dir, 'config', 'core.logAllRefUpdates', 'false');
+    fs.rmSync(path.join(dir, '.git', 'logs', 'refs', 'remotes'), { recursive: true, force: true });
+    commitOn(dir, null, 'feat: x\n\nTicket: TCK-12');
+    const cmd = 'git push origin HEAD:main';
+    await run(home, bash(cmd, dir));
+    const out = spawnSync('git', ['-C', dir, 'push', 'origin', 'HEAD:main'], { encoding: 'utf8' });
+    expect(out.status).toBe(0);
+    const r = await run(home, { hook_event_name: 'PostToolUse', tool_name: 'Bash', tool_input: { command: cmd }, tool_response: { stdout: out.stdout, stderr: out.stderr }, cwd: dir });
+    expect(r.ctx).toMatch(/holds the work of TCK-12, so TCK-12 is deploying/);
+  });
+
+  it('RED: one command that pushes a listed repo WITHOUT a deploy branch first, then main, still reads main back', async () => {
+    const { dir, home, bare } = pushRepo();
+    // a second listed repo with no deployBranch (the MCP server), pushed first in the same command
+    const mcpBare = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'tck-mcpbare-')));
+    repos.push(mcpBare);
+    execFileSync('git', ['init', '-q', '--bare', '-b', 'main', mcpBare], { stdio: 'ignore' });
+    const mcp = gitRepo(mcpBare, 'main');
+    fs.writeFileSync(path.join(home, '.claude', 'noesis-ticket.json'), JSON.stringify({ enabled: true, repos: [{ remote: bare, deployBranch: 'main' }, { remote: mcpBare }] }));
+    seed(home, { ...BOUND, status: 'ready_to_merge' });
+    respond = shipServer();
+    commitOn(mcp, null, 'feat: mcp side\n\nTicket: TCK-12');
+    commitOn(dir, null, 'feat: app side\n\nTicket: TCK-12');
+    const r = await hookedPush(home, dir, `git -C ${mcp} push -q origin main && git -C ${dir} push -q origin HEAD:main`);
+    expect(r.ctx).toMatch(/The push moved main to [0-9a-f]{12}, and it holds the work of TCK-12, so TCK-12 is deploying/);
+  });
+
+  it('pushRemote skips option values (-o, --push-option) and reads --repo', async () => {
+    const { pushRemote } = await import(HOOK);
+    expect(pushRemote(['origin', 'HEAD:main'])).toBe('origin');
+    expect(pushRemote(['-o', 'ci.skip', 'upstream', 'main'])).toBe('upstream');
+    expect(pushRemote(['--push-option', 'x', 'origin'])).toBe('origin');
+    expect(pushRemote(['--repo=fork', 'main'])).toBe('fork');
+    expect(pushRemote(['-u', 'fork', 'loop/x'])).toBe('fork');
+    expect(pushRemote([])).toBe('origin');
+    expect(pushRemote(['https://github.com/o/r.git', 'HEAD:main'])).toBe('origin');
+  });
+
+  it('a backlog_ship response (binding released) drops the cache when it was this session\'s ticket', async () => {
+    const home = listedHome();
+    seed(home, { ...BOUND, status: 'deploying' });
+    await run(home, { hook_event_name: 'PostToolUse', tool_name: 'mcp__noesis__backlog_ship', tool_response: [{ type: 'text', text: JSON.stringify({ issue: { key: 'TCK-12', work_status: 'shipped', bound_session_id: null } }) }] });
+    expect(fs.existsSync(cacheFile(home))).toBe(false);
   });
 
   // ── ship phrases ─────────────────────────────────────────────────────────────────────
