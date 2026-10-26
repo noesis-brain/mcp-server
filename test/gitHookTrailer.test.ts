@@ -20,6 +20,8 @@ const ROOT = path.resolve(__dirname, '..');
 const HOOK_SRC = path.join(ROOT, 'scripts', 'noesis-ticket-session.mjs');
 const PCM = path.join(ROOT, 'scripts', 'git-hooks', 'prepare-commit-msg');
 const SID = '7c1e2d3f-aaaa-4bbb-8ccc-000000000001';
+/** The test repos' origin, listed in the default switch file: the trailer is only for listed repos. */
+const LISTED = 'https://github.com/noesis-owner/notes-app.git';
 const BOUND = { key: 'TCK-42', status: 'implementing', bound_session_id: SID, machine: "Tester's Mac" };
 
 const dirs: string[] = [];
@@ -32,7 +34,7 @@ function home(opts: { switchFile?: Record<string, unknown> | null; cache?: Recor
   dirs.push(h);
   fs.mkdirSync(path.join(h, '.claude', 'hooks'), { recursive: true });
   fs.copyFileSync(HOOK_SRC, path.join(h, '.claude', 'hooks', 'noesis-ticket-session.mjs'));
-  const sw = opts.switchFile === undefined ? { enabled: true, repos: [] } : opts.switchFile;
+  const sw = opts.switchFile === undefined ? { enabled: true, repos: [{ remote: LISTED }] } : opts.switchFile;
   if (sw) fs.writeFileSync(path.join(h, '.claude', 'noesis-ticket.json'), JSON.stringify(sw));
   const cache = opts.cache ?? { [SID]: BOUND };
   fs.mkdirSync(path.join(h, '.claude', 'tck-bindings'), { recursive: true });
@@ -55,11 +57,12 @@ function cleanEnv(extra: Record<string, string | undefined>): NodeJS.ProcessEnv 
   return env as NodeJS.ProcessEnv;
 }
 
-/** A repo on main with one commit, made before the hook was installed. */
-function repo(): string {
+/** A repo on main with one commit, made before the hook was installed; origin = `remote`. */
+function repo(remote = LISTED): string {
   const d = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'trl-repo-')));
   dirs.push(d);
   plain(d, 'init', '-q', '-b', 'main');
+  plain(d, 'remote', 'add', 'origin', remote);
   plain(d, 'config', 'user.email', 't@example.invalid');
   plain(d, 'config', 'user.name', 't');
   fs.writeFileSync(path.join(d, 'a.txt'), 'a\n');
@@ -147,6 +150,19 @@ describe('prepare-commit-msg: the Ticket trailer (TCK-1838)', () => {
     change(d);
     expect(asSession(d, h, ['commit', '-q', '-m', 'feat: x\n\nTicket: TCK-7']).status).toBe(0);
     expect(trailers(d)).toBe('TCK-7');
+  });
+
+  it('RED: a repo the switch file does not list (a company-like remote) gets no trailer, even with the hook installed', () => {
+    const h = home();
+    const d = repo('https://github.com/tierconnect/bt-bartender.git');
+    change(d);
+    expect(asSession(d, h, ['commit', '-q', '-m', 'fix: company work']).status).toBe(0);
+    expect(trailers(d)).toBe('');
+    const h2 = home({ switchFile: { enabled: true, repos: [] } }); // the setup default: nothing listed
+    const d2 = repo();
+    change(d2);
+    expect(asSession(d2, h2, ['commit', '-q', '-m', 'feat: x']).status).toBe(0);
+    expect(trailers(d2)).toBe('');
   });
 
   it('RED: the switch off (no file, or enabled: false) means no trailer', () => {
@@ -261,9 +277,11 @@ describe('prepare-commit-msg: the Ticket trailer (TCK-1838)', () => {
 
   it('--trailer-key never waits on stdin (a git hook may leave it open)', async () => {
     const h = home();
+    const d = repo(); // git runs the hook at the top of a listed repo
     const started = Date.now();
     const out = await new Promise<{ code: number | null; stdout: string }>((resolve) => {
       const child = spawn(process.execPath, [path.join(h, '.claude', 'hooks', 'noesis-ticket-session.mjs'), '--trailer-key'], {
+        cwd: d,
         env: cleanEnv({ HOME: h, USERPROFILE: h, CLAUDE_CODE_SESSION_ID: SID }),
         stdio: ['pipe', 'pipe', 'ignore'],
       });

@@ -176,8 +176,9 @@ in those repositories only:
   that started before `gateSince`, subagents, `claude -p` runs and the git commands of a running
   `/cc-loop` are never stopped. A bound session's commit gets a one-line confirmation instead.
 - **Commits carry the ticket.** `scripts/git-hooks/prepare-commit-msg` (install it into a
-  repository's `.git/hooks`) adds the trailer `Ticket: TCK-<n>` to the commits of a bound
-  session. After the first commit on a feature branch, the ticket records that branch.
+  listed repository's `.git/hooks`) adds the trailer `Ticket: TCK-<n>` to the commits of a
+  bound session; in a repository the file does not list it adds nothing. After the first commit
+  on a feature branch, the ticket records that branch.
 - **A push to the deploy branch is read back** (repositories with a `deployBranch`). When the
   pushed range holds the bound ticket's work, it moves to Deploying; every other open ticket in
   the range, and every waiting ticket whose branch is already merged, is listed so the user can

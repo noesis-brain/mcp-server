@@ -284,10 +284,14 @@ export function gitCheckpoints(command, cwd) {
 const openEntry = (e) => !!e && typeof e.key === 'string' && /^TCK-\d+$/.test(e.key) && !isClosed(e.status);
 
 /** The key of the open ticket bound to this Claude Code session (CLAUDE_CODE_SESSION_ID), or null.
- *  The cache file is named by the hook-payload id; after /clear that differs from the bound id,
- *  so an entry whose bound_session_id matches counts too (ids compared without case). */
-export function trailerKey(env = process.env) {
-  if (env.TCK_SESSION_HOOK === 'off' || !loadSwitch()) return null;
+ *  Only in a repo the switch file lists: git runs the hook at the top of the working tree, so
+ *  `dir` (the cwd) is the repo being committed to. The cache file is named by the hook-payload id;
+ *  after /clear that differs from the bound id, so an entry whose bound_session_id matches counts
+ *  too (ids compared without case). */
+export function trailerKey(env = process.env, dir = process.cwd()) {
+  if (env.TCK_SESSION_HOOK === 'off') return null;
+  const sw = loadSwitch();
+  if (!sw || !repoOf(dir, sw)) return null;
   const sid = String(env.CLAUDE_CODE_SESSION_ID || '').trim();
   if (!/^[A-Za-z0-9_-]{1,64}$/.test(sid)) return null;
   const own = readCache(sid);
