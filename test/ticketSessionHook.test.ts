@@ -809,6 +809,92 @@ describe('TCK-1838: per-computer switch and the which-ticket checkpoint', () => 
     expect(denied(await run(home, bash('git commit -m x', gitRepo('git@github.com:noesis-owner/notes-app'))))).toBe(true);
   });
 
+  it('INC-3: a folder from $(…) is unknown (falls back to the session folder); shell keywords before git still count', async () => {
+    const home = listedHome();
+    respond = listReply;
+    const listed = gitRepo(LISTED);
+    const other = gitRepo('https://github.com/someone/else.git');
+    for (const c of [
+      'cd "$(git rev-parse --show-toplevel)" && git commit -m x',
+      'if ! git diff --cached --quiet; then git commit -m x; fi',
+      '{ git push origin HEAD:main; }',
+      'for f in a b; do git commit -m "$f"; done',
+    ]) {
+      expect(denied(await run(home, bash(c, listed))), c).toBe(true);
+    }
+    expect((await run(home, bash('ROOT=$(pwd); cd $ROOT/sub && git commit -m x', other))).json).toBeNull();
+  });
+
+  // ── INC-3: the branch record ────────────────────────────────────────────────────────
+  const patchReply = (method: string, url: string, body: any): Reply =>
+    method === 'PATCH' ? { status: 200, body: { issue: { key: 'TCK-12', branch: body.branch } } } : { status: 404, body: {} };
+  const posted = (command: string, cwd: string) => ({ hook_event_name: 'PostToolUse', tool_name: 'Bash', tool_input: { command }, tool_response: { stdout: '', stderr: '' }, cwd });
+
+  it('a bound session\'s first commit on a feature branch records the branch on the ticket, once', async () => {
+    const home = listedHome();
+    seed(home, { ...BOUND, status: 'implementing' });
+    respond = patchReply;
+    const repo = gitRepo(LISTED, 'loop/tck-1838');
+    const r = await run(home, posted('git add a && git commit -m "feat: x"', repo));
+    expect(r.json).toBeNull();
+    expect(requests).toEqual([expect.objectContaining({ method: 'PATCH', url: '/api/mcp/backlog/issues/TCK-12', body: { branch: 'loop/tck-1838' } })]);
+    expect(readCacheFile(home)).toMatchObject({ key: 'TCK-12', branch: 'loop/tck-1838' });
+    requests.length = 0;
+    await run(home, posted('git commit -m "feat: y"', repo));
+    expect(requests).toHaveLength(0); // already recorded
+  });
+
+  it('no branch record: on the deploy branch, in a repo without a deployBranch, unbound, or for a non-commit', async () => {
+    respond = patchReply;
+    const onMain = listedHome();
+    seed(onMain, { ...BOUND, status: 'implementing' });
+    await run(onMain, posted('git commit -m x', gitRepo(LISTED, 'main')));
+    const noDeploy = sandbox({ enabled: true, repos: [{ remote: LISTED }] });
+    seed(noDeploy, { ...BOUND, status: 'implementing' });
+    await run(noDeploy, posted('git commit -m x', gitRepo(LISTED)));
+    await run(listedHome(), posted('git commit -m x', gitRepo(LISTED)));
+    const status = listedHome();
+    seed(status, { ...BOUND, status: 'implementing' });
+    await run(status, posted('git status', gitRepo(LISTED)));
+    expect(requests).toHaveLength(0);
+  });
+
+  it('RED: a status change (or bind/refine) keeps the recorded branch: the next commit sends nothing', async () => {
+    const home = listedHome();
+    seed(home, { ...BOUND, status: 'implementing' });
+    respond = patchReply;
+    const repo = gitRepo(LISTED, 'loop/tck-1838');
+    await run(home, posted('git commit -m x', repo));
+    expect(requests.filter((q) => q.method === 'PATCH')).toHaveLength(1);
+    for (const tool of ['mcp__noesis__backlog_set_status', 'mcp__noesis__backlog_bind', 'mcp__noesis__backlog_refine']) {
+      const issue = { key: 'TCK-12', work_status: 'iterating', bound_session_id: BOUND_SID, bound_machine: "Tester's Mac" }; // no branch field
+      await run(home, { hook_event_name: 'PostToolUse', tool_name: tool, tool_response: [{ type: 'text', text: JSON.stringify({ issue }) }] });
+      expect(readCacheFile(home), tool).toMatchObject({ key: 'TCK-12', status: 'iterating', branch: 'loop/tck-1838' });
+      await run(home, posted('git commit -m y', repo));
+    }
+    expect(requests.filter((q) => q.method === 'PATCH')).toHaveLength(1);
+  });
+
+  it('the server\'s recorded branch counts: a bind that returns branch X makes a commit on X send nothing', async () => {
+    const home = listedHome();
+    respond = patchReply;
+    const issue = { key: 'TCK-12', work_status: 'implementing', bound_session_id: BOUND_SID, bound_machine: "Tester's Mac", branch: 'loop/tck-1838' };
+    await run(home, { hook_event_name: 'PostToolUse', tool_name: 'mcp__noesis__backlog_bind', tool_response: [{ type: 'text', text: JSON.stringify({ issue }) }] });
+    await run(home, posted('git commit -m x', gitRepo(LISTED, 'loop/tck-1838')));
+    expect(requests).toHaveLength(0);
+  });
+
+  it('a refused branch write (e.g. SPEC_FROZEN) is retried at the next commit', async () => {
+    const home = listedHome();
+    seed(home, { ...BOUND, status: 'implementing' });
+    respond = () => ({ status: 409, body: { error_code: 'SPEC_FROZEN' } });
+    const repo = gitRepo(LISTED);
+    await run(home, posted('git commit -m x', repo));
+    expect(readCacheFile(home).branch).toBeUndefined();
+    await run(home, posted('git commit -m y', repo));
+    expect(requests.filter((q) => q.method === 'PATCH')).toHaveLength(2);
+  });
+
   // ── ship phrases ─────────────────────────────────────────────────────────────────────
   it('ship phrases: a bound session gets the ship steps; an unbound one in a listed repo is told to ask', async () => {
     const bound = listedHome();

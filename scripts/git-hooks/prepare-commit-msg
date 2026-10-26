@@ -1,0 +1,44 @@
+#!/bin/sh
+# prepare-commit-msg — add the trailer "Ticket: TCK-<n>" to a commit made by a Claude Code
+# session that is bound to a Noesis Jot ticket (@noesis-brain/mcp-server, TCK-1838).
+#
+# The session id comes from CLAUDE_CODE_SESSION_ID, which Claude Code sets for every Bash
+# command (and so for the git it runs). The ticket comes from the binding cache that the ticket
+# hook keeps: `noesis-ticket-session.mjs --trailer-key` prints the key, or nothing.
+#
+# It never blocks a commit: every path exits 0. It does nothing when:
+#   - the commit is not made from Claude Code (no CLAUDE_CODE_SESSION_ID);
+#   - NOESIS_TICKET=none is set (a bound session's unrelated commit);
+#   - the commit is an amend (--amend, with or without a new message), reuses a message
+#     (-c, -C), or a rebase or cherry-pick replays commits. A revert made by the session
+#     is its own work and does get the trailer;
+#   - node or the ticket hook is missing, or the hook is switched off on this computer;
+#   - the message already has a Ticket: trailer.
+MSG_FILE="$1"
+SOURCE="$2"
+
+[ -n "$CLAUDE_CODE_SESSION_ID" ] || exit 0
+[ "$NOESIS_TICKET" = "none" ] && exit 0
+[ "$SOURCE" = "commit" ] && exit 0
+# `git commit --amend -m …` arrives as SOURCE=message: only the parent git command line shows it.
+case " $(ps -o args= -p "$PPID" 2>/dev/null) " in
+  *" --amend "*|*" --amend="*) exit 0 ;;
+esac
+
+GIT_DIR=$(git rev-parse --git-dir 2>/dev/null) || exit 0
+if [ -d "$GIT_DIR/rebase-merge" ] || [ -d "$GIT_DIR/rebase-apply" ] || [ -f "$GIT_DIR/CHERRY_PICK_HEAD" ]; then
+  exit 0
+fi
+
+command -v node >/dev/null 2>&1 || exit 0
+HOOK="${NOESIS_TICKET_HOOK:-$HOME/.claude/hooks/noesis-ticket-session.mjs}"
+[ -f "$HOOK" ] || exit 0
+
+KEY=$(node "$HOOK" --trailer-key </dev/null 2>/dev/null) || exit 0
+case "$KEY" in
+  TCK-[0-9]*) ;;
+  *) exit 0 ;;
+esac
+
+git interpret-trailers --in-place --if-exists doNothing --trailer "Ticket: $KEY" "$MSG_FILE" 2>/dev/null || true
+exit 0

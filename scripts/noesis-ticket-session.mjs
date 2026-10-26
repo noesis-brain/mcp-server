@@ -17,6 +17,11 @@
 //     /cc-loop (a loop-supervisor marker), which get a note instead.
 //   - the owner's ship phrases ("ship it", "merge to main", "push it", "verify the deployment")
 //     add the ship steps to a bound session's reminder, or ask which ticket an unbound one ships.
+//   - after a bound session's first commit on a branch of a repo with a "deployBranch", the
+//     ticket records that branch (PATCH branch), so a later merge can be traced to it.
+// `node noesis-ticket-session.mjs --trailer-key` prints the key of the open ticket bound to
+// CLAUDE_CODE_SESSION_ID, or nothing; the git prepare-commit-msg hook in scripts/git-hooks/
+// uses it to add the trailer "Ticket: TCK-<n>" to that session's commits.
 //
 // The Jot page shows each ticket's work status and which session, on which computer, is
 // working on it. The model keeps that true through the mcp__noesis__backlog_* tools; this
@@ -188,6 +193,8 @@ export function simpleCommands(cmd) {
 }
 
 const ASSIGN = /^[A-Za-z_][A-Za-z0-9_]*=/;
+// Words that may stand before the program: `if git commit …; then git push; fi`, `! git …`, `{ git push; }`.
+const SKIP_WORDS = new Set(['command', 'exec', 'time', 'nohup', 'if', 'then', 'else', 'elif', 'do', 'while', 'until', '!', '{', '}']);
 const GIT_OPT_WITH_ARG = new Set(['-c', '--git-dir', '--work-tree', '--namespace', '--exec-path', '--config-env']);
 
 /** A folder word with $NAME, ${NAME} and a leading ~ expanded; null when a variable is unknown. */
@@ -200,7 +207,8 @@ function expandWord(word, vars) {
       if (v === undefined) unknown = true;
       return v ?? '';
     });
-  return unknown ? null : out;
+  // `cd "$(git rev-parse --show-toplevel)"`: a command substitution is a folder we cannot know.
+  return unknown || /[$`]/.test(out) ? null : out;
 }
 
 /** The git commit / merge / push calls (and gh pr merge) in a command, each with its folder. */
@@ -218,7 +226,10 @@ export function gitCheckpoints(command, cwd) {
     if (isExport || words.every((x) => ASSIGN.test(x))) {
       for (const a of words.slice(isExport ? 1 : 0)) {
         const eq = a.indexOf('=');
-        if (eq > 0) vars[a.slice(0, eq)] = expandWord(a.slice(eq + 1), vars) ?? '';
+        if (eq <= 0) continue;
+        const v = expandWord(a.slice(eq + 1), vars);
+        if (v === null) delete vars[a.slice(0, eq)]; // unknown value: the variable stays unknown
+        else vars[a.slice(0, eq)] = v;
       }
       continue;
     }
@@ -227,7 +238,7 @@ export function gitCheckpoints(command, cwd) {
       i++;
       while (i < words.length && (ASSIGN.test(words[i]) || words[i].startsWith('-'))) i++;
     }
-    while (['command', 'exec', 'time', 'nohup'].includes(words[i])) i++;
+    while (SKIP_WORDS.has(words[i])) i++;
     const prog = words[i];
     if (prog === 'cd' || prog === 'pushd') {
       const d = words[i + 1];
@@ -258,6 +269,54 @@ export function gitCheckpoints(command, cwd) {
     else if (sub === 'push' && !rest.includes('--dry-run') && !rest.includes('-n')) found.push({ kind: 'push', dir, args: rest });
   }
   return found;
+}
+
+// ── The commit trailer and the branch record ────────────────────────────────────────────
+
+const openEntry = (e) => !!e && typeof e.key === 'string' && /^TCK-\d+$/.test(e.key) && !isClosed(e.status);
+
+/** The key of the open ticket bound to this Claude Code session (CLAUDE_CODE_SESSION_ID), or null.
+ *  The cache file is named by the hook-payload id; after /clear that differs from the bound id,
+ *  so an entry whose bound_session_id matches counts too (ids compared without case). */
+export function trailerKey(env = process.env) {
+  if (env.TCK_SESSION_HOOK === 'off' || !loadSwitch()) return null;
+  const sid = String(env.CLAUDE_CODE_SESSION_ID || '').trim();
+  if (!/^[A-Za-z0-9_-]{1,64}$/.test(sid)) return null;
+  const own = readCache(sid);
+  if (openEntry(own)) return own.key;
+  const want = sid.toLowerCase();
+  try {
+    for (const name of fs.readdirSync(cacheDir())) {
+      if (!/^[A-Za-z0-9_-]+\.json$/.test(name)) continue; // never <sid>.gate.json
+      let e = null;
+      try {
+        e = JSON.parse(fs.readFileSync(path.join(cacheDir(), name), 'utf8'));
+      } catch {
+        continue;
+      }
+      if (openEntry(e) && String(e.bound_session_id || '').toLowerCase() === want) return e.key;
+    }
+  } catch {
+    /* no cache dir */
+  }
+  return null;
+}
+
+/** After a bound session commits on a feature branch of a repo with a deploy branch, record the branch once. */
+async function recordBranch(sessionId, entry, p, sw) {
+  const hit = gitCheckpoints(p.tool_input && p.tool_input.command, p.cwd).find((c) => c.kind === 'commit' || c.kind === 'merge');
+  const repo = hit && repoOf(hit.dir, sw);
+  if (!repo || !repo.deployBranch) return;
+  const branch = git(hit.dir, ['rev-parse', '--abbrev-ref', 'HEAD']);
+  if (!branch || branch === 'HEAD' || branch === repo.deployBranch || entry.branch === branch) return;
+  const cfg = loadConfig(p.cwd);
+  if (!cfg) return;
+  try {
+    await api(cfg, 'PATCH', keyPath(entry.key), { branch });
+  } catch {
+    return; // offline, or the ticket refuses edits: try again at the next commit
+  }
+  writeCache(sessionId, { ...entry, branch });
 }
 
 // ── The "which ticket?" checkpoint ──────────────────────────────────────────────────────
@@ -701,6 +760,11 @@ export async function decide(p) {
   }
 
   if (event === 'PostToolUse') {
+    if (p.tool_name === 'Bash') {
+      const entry = readCache(sid);
+      if (openEntry(entry) && sw.repos.length) await recordBranch(sid, entry, p, sw);
+      return null;
+    }
     if (p.tool_name === 'AskUserQuestion') {
       const answer = ticketAnswer(p);
       const note = answer ? answerNote(sid, answer) : null;
@@ -716,11 +780,15 @@ export async function decide(p) {
       if (!issue) return null;
       const entry = readCache(sid);
       if (issue.bound_session_id) {
+        // Keep the recorded branch (the server's, else the one this cache already holds for the
+        // same ticket), so a status change never makes the next commit send the branch again.
+        const branch = issue.branch || (entry && entry.key === issue.key ? entry.branch : undefined);
         writeCache(sid, {
           key: issue.key,
           status: issue.work_status,
           bound_session_id: issue.bound_session_id,
           machine: issue.bound_machine ?? null,
+          ...(branch ? { branch } : {}),
         });
       } else if (entry && entry.key === issue.key) {
         dropCache(sid);
@@ -739,7 +807,16 @@ const isMain = (() => {
   }
 })();
 
-if (isMain) {
+if (isMain && process.argv.includes('--trailer-key')) {
+  // For the git prepare-commit-msg hook: never read stdin (a git hook's stdin may stay open).
+  try {
+    const key = trailerKey();
+    if (key) process.stdout.write(key);
+  } catch {
+    /* fail open: no trailer */
+  }
+  process.exit(0);
+} else if (isMain) {
   let raw = '';
   process.stdin.on('data', (c) => (raw += c));
   process.stdin.on('end', async () => {
