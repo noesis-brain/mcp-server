@@ -24,7 +24,7 @@ const ALLOW_260 = [
   'mcp__noesis__backlog_unbind',
   'mcp__noesis__backlog_refine',
 ];
-const ALLOW = [...ALLOW_260, 'mcp__noesis__backlog_ship'];
+const ALLOW = [...ALLOW_260, 'mcp__noesis__backlog_ship', 'mcp__noesis__backlog_set_gut'];
 
 let home: string;
 let logs: string[];

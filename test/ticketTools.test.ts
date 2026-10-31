@@ -95,8 +95,8 @@ describe('ticket tools → client', () => {
 
   const run = (name: string, args: Record<string, unknown>) => handlers.get(name)!(args);
 
-  it('registers the five ticket tools', () => {
-    for (const t of ['backlog_bind', 'backlog_set_status', 'backlog_ship', 'backlog_unbind', 'backlog_refine']) expect(handlers.has(t)).toBe(true);
+  it('registers the six ticket tools', () => {
+    for (const t of ['backlog_bind', 'backlog_set_status', 'backlog_ship', 'backlog_unbind', 'backlog_refine', 'backlog_set_gut']) expect(handlers.has(t)).toBe(true);
   });
 
   it('every ticket tool refuses to run without a Claude Code session id', async () => {
@@ -171,6 +171,49 @@ describe('ticket tools → client', () => {
       ['backlogUnbind', 'TCK-5', { ...who, force: true }],
       ['backlogRefine', 'TCK-5', { ...who, text: 'short jot' }],
     ]);
+  });
+
+  it('TCK-1845: backlog_get with a key loads the pictures; images:false returns the text only', async () => {
+    reply = { issue: { key: 'TCK-5', origin_jot: 'see ![p](/api/note-images/tok-1)', title: 't' }, messages: [] };
+    const plain = await run('backlog_get', { key: 'TCK-5', images: false });
+    expect(calls.map((c) => c[0])).toEqual(['backlogGet']);
+    expect(plain.content).toHaveLength(1);
+    expect(plain.content[0].type).toBe('text');
+    calls.length = 0;
+    await run('backlog_get', { key: 'TCK-5' });
+    expect(calls.map((c) => c[0])).toEqual(['backlogGet', 'fetchTicketPicture']);
+    expect(calls[1][1]).toBe('/api/note-images/tok-1');
+  });
+
+  it('TCK-1845: backlog_set_gut sends the caller, the text, the kind and the difficulty', async () => {
+    process.env.CLAUDE_CODE_SESSION_ID = SESSION;
+    await run('backlog_set_gut', { key: 'TCK-5', text: 'Reuse the upload route', kind: 'plan', difficulty: 'XL' });
+    await run('backlog_set_gut', { key: 'TCK-5', text: 'Reused it', kind: 'built' });
+    const who = { session_id: SESSION, machine: 'Test Machine', cwd: '/work/proj' };
+    expect(calls).toEqual([
+      ['backlogSetGut', 'TCK-5', { ...who, text: 'Reuse the upload route', kind: 'plan', difficulty: 'XL' }],
+      ['backlogSetGut', 'TCK-5', { ...who, text: 'Reused it', kind: 'built' }],
+    ]);
+    const gut = z.object(schemas.get('backlog_set_gut')!);
+    expect(gut.safeParse({ key: 'TCK-5', text: 'x', kind: 'later' }).success).toBe(false);
+    expect(gut.safeParse({ key: 'TCK-5', text: 'x', kind: 'plan', difficulty: 'XXL' }).success).toBe(false);
+    delete process.env.CLAUDE_CODE_SESSION_ID;
+    const res = await run('backlog_set_gut', { key: 'TCK-5', text: 'x', kind: 'plan' });
+    expect(res.isError).toBe(true);
+  });
+
+  it('TCK-1845: backlog_refine sends a headline only when one is given; upsert accepts size XL', async () => {
+    process.env.CLAUDE_CODE_SESSION_ID = SESSION;
+    await run('backlog_refine', { key: 'TCK-5', text: 'short jot', headline: 'Paste pictures' });
+    const who = { session_id: SESSION, machine: 'Test Machine', cwd: '/work/proj' };
+    expect(calls).toEqual([['backlogRefine', 'TCK-5', { ...who, text: 'short jot', headline: 'Paste pictures' }]]);
+    expect(z.object(schemas.get('backlog_upsert_issue')!).safeParse({ key: 'TCK-5', size: 'XL' }).success).toBe(true);
+  });
+
+  it('TCK-1845: the bind hints tell Claude to write the gut', async () => {
+    const { BIND_NEXT, BIND_NEXT_LINK } = await import('../src/tools/backlog.js');
+    expect(BIND_NEXT).toMatch(/backlog_set_gut/);
+    expect(BIND_NEXT_LINK).toMatch(/backlog_set_gut/);
   });
 
   it('TCK-1838: backlog_ship sends the caller and the merge commit to /shipped', async () => {

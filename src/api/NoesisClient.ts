@@ -11,6 +11,7 @@ import path from 'path';
 import type { ResolverContext } from '../resolve/noteRef.js';
 import type { ExamData } from '../tools/exam/types.js';
 import { buildExamMarkdown } from '../tools/exam/examNoteTemplate.js';
+import { MAX_PICTURE_BYTES, READABLE_PICTURE_TYPES, type PictureFetch } from '../tools/ticketPictures.js';
 
 // ============================================================
 // Cross-platform OS detection (phase32)
@@ -351,6 +352,11 @@ export function explainTokenError(status: number, body: { error?: string; error_
     return `${message} — extend it in Noesis Settings → API Tokens`;
   }
   return message;
+}
+
+/** The reason text for a picture over the backlog_get size limit. */
+function tooBig(bytes: number): string {
+  return `${(bytes / 1048576).toFixed(1)} MB is over the ${(MAX_PICTURE_BYTES / 1048576).toFixed(2)} MB limit`;
 }
 
 /**
@@ -1392,6 +1398,43 @@ export class NoesisClient {
     return this.request('GET', `/api/mcp/backlog/issues/${encodeURIComponent(key)}`);
   }
 
+  /**
+   * Download one picture linked from a Jot ticket (TCK-1845), for backlog_get's image
+   * blocks. Only a /api/note-images/ link on THIS Noesis server is fetched: the route is
+   * public (the token in the path is the secret), so no API token is sent, and a link to
+   * any other host is never followed from here. The server may redirect to blob storage.
+   */
+  async fetchTicketPicture(url: string): Promise<PictureFetch> {
+    let target: URL;
+    try {
+      target = new URL(url, `${this.baseUrl}/`);
+    } catch {
+      return { ok: false, reason: 'not a valid URL' };
+    }
+    if (target.origin !== new URL(this.baseUrl).origin || !target.pathname.startsWith('/api/note-images/')) {
+      return { ok: false, reason: 'not a picture on this Noesis server' };
+    }
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 10_000);
+    try {
+      const response = await fetch(target, { redirect: 'follow', signal: controller.signal });
+      if (!response.ok) return { ok: false, reason: `HTTP ${response.status}` };
+      const mimeType = (response.headers.get('content-type') || '').split(';')[0].trim().toLowerCase();
+      if (!READABLE_PICTURE_TYPES.includes(mimeType)) {
+        return { ok: false, reason: `a ${mimeType || 'file of unknown type'} cannot be shown as an image` };
+      }
+      const declared = Number(response.headers.get('content-length') || 0);
+      if (declared > MAX_PICTURE_BYTES) return { ok: false, reason: tooBig(declared) };
+      const bytes = Buffer.from(await response.arrayBuffer());
+      if (bytes.length > MAX_PICTURE_BYTES) return { ok: false, reason: tooBig(bytes.length) };
+      return { ok: true, data: bytes.toString('base64'), mimeType, bytes: bytes.length };
+    } catch (e) {
+      return { ok: false, reason: controller.signal.aborted ? 'timed out after 10 s' : (e as Error).message };
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
   async backlogCreate(body: Record<string, unknown>): Promise<any> {
     return this.request('POST', '/api/mcp/backlog/issues', body);
   }
@@ -1470,6 +1513,11 @@ export class NoesisClient {
 
   async backlogRefine(key: string, body: Record<string, unknown>): Promise<any> {
     return this.requestWithCode('PUT', `/api/mcp/backlog/issues/${encodeURIComponent(key)}/refined`, body);
+  }
+
+  /** The team lead gut of a bound ticket (2.8.0). */
+  async backlogSetGut(key: string, body: Record<string, unknown>): Promise<any> {
+    return this.requestWithCode('PUT', `/api/mcp/backlog/issues/${encodeURIComponent(key)}/gut`, body);
   }
 
 }

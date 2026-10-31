@@ -29,7 +29,7 @@ $ARGUMENTS
 
 ### `TCK-<n>` — start a ticket
 
-1. `backlog_get(key)` and read the ticket: the refined text if there is one, otherwise the draft.
+1. `backlog_get(key)` and read the ticket: the refined text if there is one, otherwise the draft. Its pictures (screenshots the user pasted or attached) follow the JSON as images. Look at each one: they are part of the request.
 2. `backlog_bind(key)`. It sets `planning`.
 3. Work on it. Move the status up the ladder as you go.
 
@@ -62,7 +62,11 @@ Rewrite the ticket's text so it matches the agreed plan, and store it with `back
 - the same language as the draft;
 - plain sentences or a short list — no headings, no code fences, no increments, acceptance criteria or plan sections.
 
-Refine once when your plan is ready, just before `ExitPlanMode`. Refine again only if the plan changes or the user asks. On `REFINE_LENGTH`, read `draft_words`, `min` and `max` from the error and rewrite to fit. The user's draft is never changed.
+Refine once when your plan is ready, just before `ExitPlanMode`. Refine again only if the plan changes or the user asks. On `REFINE_LENGTH`, read `draft_words`, `min` and `max` from the error and rewrite to fit. The user's draft is never changed. When the ticket has no title yet, pass `headline`: a short title of about 8 words, in the draft's language.
+
+### The team lead gut
+
+Write it with `backlog_set_gut` when you refine: `kind: "plan"`, at most 40 words on how the ticket can be built. Add a `difficulty`: S (Easy), M (Moderate), L (Hard) or XL (Very hard). When the work is complete, rewrite it with `kind: "built"`, on how it was built.
 
 ### `ship` — the ship step
 

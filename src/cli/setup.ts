@@ -467,6 +467,7 @@ const TICKET_TOOLS_ALLOW = [
   'mcp__noesis__backlog_unbind',
   'mcp__noesis__backlog_refine',
   'mcp__noesis__backlog_ship',
+  'mcp__noesis__backlog_set_gut',
 ];
 
 /** The exact command we register: the copied script, absolute, forward slashes. */

@@ -19,12 +19,14 @@ import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import type { NoesisClient } from '../api/NoesisClient.js';
 import { currentSessionRef } from './claudeSessions.js';
 import { machineLabel } from '../machineLabel.js';
+import { ticketContentWithPictures } from './ticketPictures.js';
 
 // 'rejected' rides along for set_stage's parked disposal and as a backlog_get
 // list filter; it is NOT a stage the loop may reach from un-parked items.
 const STAGE_ENUM = z.enum(['jot', 'ambiguous', 'superseded', 'refined', 'materialized', 'approved', 'running', 'implemented', 'shipped', 'rejected']);
 const KIND_ENUM = z.enum(['feature', 'bug', 'design', 'process', 'research']);
-const SIZE_ENUM = z.enum(['S', 'M', 'L']);
+// Difficulty (2.8.0): S Easy, M Moderate, L Hard, XL Very hard.
+const SIZE_ENUM = z.enum(['S', 'M', 'L', 'XL']);
 
 // Jot work status (2.5.0) — how far a Claude Code session has got with a ticket.
 // Separate from the old `stage` above, which belongs to the retired groom/run workflow.
@@ -60,14 +62,16 @@ export function ticketCaller(): { session_id: string; machine: string; cwd: stri
  *  for the refine-before-ExitPlanMode step. */
 export const BIND_NEXT =
   'Bound. When your plan is ready — before ExitPlanMode — refine this ticket once with backlog_refine ' +
-  "(70%–120% of the draft's words, in the draft's language, plain sentences, no sections or increments). " +
+  "(70%–120% of the draft's words, in the draft's language, plain sentences, no sections or increments), " +
+  'and write the team lead gut with backlog_set_gut (kind plan: how it can be built, at most 40 words, plus a difficulty). ' +
   'Then keep the status current with backlog_set_status as you work.';
 
 /** For a bind at a later status on a ticket not refined yet — a `link` from a session
  *  that may already have a plan, which then refines once (AC9). */
 export const BIND_NEXT_LINK =
   'Bound. If this session already has a plan, refine this ticket once now with backlog_refine ' +
-  "(70%–120% of the draft's words, in the draft's language, plain sentences, no sections or increments). " +
+  "(70%–120% of the draft's words, in the draft's language, plain sentences, no sections or increments), " +
+  'and write the team lead gut with backlog_set_gut if the ticket has none. ' +
   'Keep the status current with backlog_set_status as you work.';
 
 /** For a ticket already refined (a re-link after /clear, a second bind) — repeating the
@@ -98,18 +102,21 @@ function errText(e: unknown): { content: Array<{ type: 'text'; text: string }>; 
 export function registerBacklogTools(server: McpServer, client: NoesisClient): void {
   server.tool(
     'backlog_get',
-    'Read the Backlog: without a key, list issues (+ per-stage counts and open_question_count, optionally filtered by stage or a text query); with a key (TCK-<n>), the full issue including increments, open owner questions, and the bounded message thread (questions + answers linked via answered_by_message_id — what RESOLVE reads).',
+    'Read the Backlog: without a key, list issues (+ per-stage counts and open_question_count, optionally filtered by stage or a text query); with a key (TCK-<n>), the full issue including increments, open owner questions, and the bounded message thread (questions + answers linked via answered_by_message_id — what RESOLVE reads). A ticket\'s pictures (screenshots the owner pasted or attached) follow the JSON as images, each after a line saying where it appears; look at them, they are part of the request.',
     {
       key: z.string().optional().describe('Issue key like TCK-7 (omit to list)'),
       stage: STAGE_ENUM.optional().describe('List filter: only this stage'),
       status: WORK_STATUS_ENUM.optional().describe('List filter: only this work status (the Jot page status)'),
       query: z.string().optional().describe('List filter: title/body text search'),
+      images: z.boolean().optional().describe("With a key: false returns the ticket's text only, without downloading its pictures (default true)"),
     },
     async (args) => {
       try {
-        const data = args.key
-          ? await client.backlogGet(args.key)
-          : await client.backlogList({ stage: args.stage, status: args.status, q: args.query });
+        if (args.key) {
+          const issue = await client.backlogGet(args.key);
+          return args.images === false ? jsonText(issue) : await ticketContentWithPictures(issue, client);
+        }
+        const data = await client.backlogList({ stage: args.stage, status: args.status, q: args.query });
         return jsonText(data);
       } catch (e) {
         return errText(e);
@@ -362,12 +369,41 @@ export function registerBacklogTools(server: McpServer, client: NoesisClient): v
     {
       key: z.string().describe('Ticket key like TCK-7'),
       text: z.string().describe('The refined ticket text, about as long as the draft'),
+      headline: z
+        .string()
+        .max(120)
+        .optional()
+        .describe("A short title for the ticket (about 8 words, in the draft's language). Stored only when the ticket has no title yet: the user's own title is never replaced."),
     },
     async (args) => {
       try {
         const who = ticketCaller();
         if (!who) return errText(new Error(NO_SESSION));
-        return jsonText(await client.backlogRefine(args.key, { ...who, text: args.text }));
+        const body: Record<string, unknown> = { ...who, text: args.text };
+        if (args.headline !== undefined) body.headline = args.headline;
+        return jsonText(await client.backlogRefine(args.key, body));
+      } catch (e) {
+        return errText(e);
+      }
+    }
+  );
+
+  server.tool(
+    'backlog_set_gut',
+    "Write the team lead gut of the Jot ticket bound to THIS session: at most 40 words (each Chinese, Japanese or Korean character counts as one word), in the draft's language. kind 'plan' says how the ticket can be built: write it with the refine, before ExitPlanMode. kind 'built' says how it was built: rewrite it when the work is complete (for example at LOOP COMPLETE). difficulty rates the work: S Easy, M Moderate, L Hard, XL Very hard. The user can edit the gut on the page; the newest write wins. Errors: GUT_LENGTH (over 40 words), NOT_BOUND, BOUND_ELSEWHERE, TICKET_CLOSED.",
+    {
+      key: z.string().describe('Ticket key like TCK-7'),
+      text: z.string().describe('At most 40 words: how it can be built (plan) or how it was built (built)'),
+      kind: z.enum(['plan', 'built']).describe("'plan' before the work, 'built' after it"),
+      difficulty: SIZE_ENUM.optional().describe('S Easy · M Moderate · L Hard · XL Very hard'),
+    },
+    async (args) => {
+      try {
+        const who = ticketCaller();
+        if (!who) return errText(new Error(NO_SESSION));
+        const body: Record<string, unknown> = { ...who, text: args.text, kind: args.kind };
+        if (args.difficulty !== undefined) body.difficulty = args.difficulty;
+        return jsonText(await client.backlogSetGut(args.key, body));
       } catch (e) {
         return errText(e);
       }
