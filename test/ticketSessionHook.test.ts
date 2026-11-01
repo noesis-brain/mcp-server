@@ -952,7 +952,7 @@ describe('TCK-1838: per-computer switch and the which-ticket checkpoint', () => 
     sh(dir, 'merge', '-q', '--no-ff', '-m', 'Merge loop/tck-12', 'loop/tck-12');
     const r = await hookedPush(home, dir);
     expect(statusPosts()).toEqual([expect.objectContaining({ url: '/api/mcp/backlog/issues/TCK-12/status', body: expect.objectContaining({ status: 'deploying', session_id: BOUND_SID }) })]);
-    expect(r.ctx).toMatch(/The push moved main to [0-9a-f]{12}, and it holds the work of TCK-12, so TCK-12 is deploying\. Verify the live deployment; then, with the owner's yes, set TCK-12 to shipped/);
+    expect(r.ctx).toMatch(/The push moved main to [0-9a-f]{12}, and it holds the work of TCK-12, so TCK-12 is deploying\. Verify the live deployment; as soon as it passes, set TCK-12 to shipped yourself \(mcp__noesis__backlog_set_status\) — the owner's "ship it" already covers it, so do not ask again, and never say the session can close while it is still deploying\./);
     expect(readCacheFile(home).status).toBe('deploying');
     expect(fs.existsSync(path.join(home, '.claude', 'tck-bindings', `${HOOK_SID}.push.json`))).toBe(false);
   });

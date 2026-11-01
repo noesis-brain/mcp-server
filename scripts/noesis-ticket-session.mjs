@@ -489,8 +489,8 @@ async function afterPush(sessionId, entry, rec, cwd, response) {
     const now = await setStatus(sessionId, live, 'deploying', cwd);
     lines.push(
       now
-        ? `[tck-session] The push moved ${rec.deployBranch} to ${short}, and it holds the work of ${live.key}, so ${live.key} is ${now}. Verify the live deployment; then, with the owner's yes, set ${live.key} to shipped (mcp__noesis__backlog_set_status).`
-        : `[tck-session] The push moved ${rec.deployBranch} to ${short}, and it holds the work of ${live.key}, but the hook could not set ${live.key} to deploying (the server refused or did not answer). Set it yourself (mcp__noesis__backlog_set_status), verify the live deployment, then set it to shipped with the owner's yes.`,
+        ? `[tck-session] The push moved ${rec.deployBranch} to ${short}, and it holds the work of ${live.key}, so ${live.key} is ${now}. Verify the live deployment; as soon as it passes, set ${live.key} to shipped yourself (mcp__noesis__backlog_set_status) — the owner's "ship it" already covers it, so do not ask again, and never say the session can close while it is still deploying.`
+        : `[tck-session] The push moved ${rec.deployBranch} to ${short}, and it holds the work of ${live.key}, but the hook could not set ${live.key} to deploying (the server refused or did not answer). Set it yourself (mcp__noesis__backlog_set_status), verify the live deployment, then set it to shipped as soon as the check passes — the owner's "ship it" already covers it.`,
     );
   }
   const keys = [...new Set([...trailerKeys, ...merged.map((m) => m.issue.key)])].filter((k) => !(live && k === live.key)).slice(0, 10);
