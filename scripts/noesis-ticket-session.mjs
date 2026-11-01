@@ -26,7 +26,12 @@
 //   - SessionStart (startup, resume, clear — never compact), in a listed repo, at most once every
 //     6 hours: bindings of other sessions idle for 24 hours are reported (never released), and
 //     tickets at ready_to_merge / deploying whose branch is already in the deploy branch are
-//     listed for the owner (the reconcile). After /clear: the tickets bound to this folder.
+//     listed for the owner (the reconcile). At most once a day: every ticket at ready_to_merge
+//     for a day or more, bound or not, is put to the owner with a "Waiting" question (TCK-1858).
+//     After /clear: the tickets bound to this folder.
+//   - a ticket tool that leaves this session's ticket at ready_to_merge gets one line: end the
+//     turn with a "Ship" question. The answer "Ship it now" (to "Ship" or "Waiting") counts as
+//     the owner's "ship it" and adds the ship steps (TCK-1858).
 // `node noesis-ticket-session.mjs --trailer-key` prints the key of the open ticket bound to
 // CLAUDE_CODE_SESSION_ID, or nothing; the git prepare-commit-msg hook in scripts/git-hooks/
 // uses it to add the trailer "Ticket: TCK-<n>" to that session's commits.
@@ -97,6 +102,12 @@ const NEW_TICKET = 'Create a new ticket from my words';
 const OPEN = ['created', 'planning', 'ready_to_implement', 'implementing', 'iterating', 'ready_to_merge', 'deploying'];
 // The owner's words for "start the ship step".
 const SHIP_PHRASE = /\b(?:ship it|merge (?:it |this )?(?:in)?to main|push it|verify the deploy(?:ment)?)\b/i;
+// The two questions that put a ready_to_merge ticket to the owner (TCK-1858): "Ship" when a
+// session sets it, "Waiting" at a session start for one that has waited a day. The answer
+// SHIP_NOW counts as the owner saying "ship it".
+const SHIP_HEADER = 'Ship';
+const WAIT_HEADER = 'Waiting';
+const SHIP_NOW = 'Ship it now';
 
 // ── The per-computer switch ─────────────────────────────────────────────────────────────
 
@@ -400,19 +411,32 @@ function notePush(sessionId, hit, toolUseId, command) {
   }
 }
 
+/** The open tickets at one status, asked once per status for the life of this process (one hook
+ *  event), so a session start's reconcile and waiting list share one request. null = the server
+ *  did not answer. */
+const listed = new Map();
+function listByStatus(cfg, status) {
+  if (!listed.has(status)) {
+    listed.set(
+      status,
+      api(cfg, 'GET', `/api/mcp/backlog/issues?status=${status}`).then(
+        (data) => (data && Array.isArray(data.issues) ? data.issues : []),
+        () => null,
+      ),
+    );
+  }
+  return listed.get(status);
+}
+
 /** Open tickets at ready_to_merge / deploying whose recorded branch is contained in `tip` (the
  *  reconcile). `fresh` = this push brought it in: it was not already in `before`. Only a fresh
  *  branch is evidence that moves the bound ticket; every merged one is listed for the owner. */
 async function mergedTickets(cfg, dir, remote, deployBranch, tip, before) {
   const found = [];
   for (const status of ['ready_to_merge', 'deploying']) {
-    let data;
-    try {
-      data = await api(cfg, 'GET', `/api/mcp/backlog/issues?status=${status}`);
-    } catch {
-      continue;
-    }
-    for (const i of (data && Array.isArray(data.issues) ? data.issues : [])) {
+    const issues = await listByStatus(cfg, status);
+    if (!issues) continue;
+    for (const i of issues) {
       if (!i || !i.key || typeof i.branch !== 'string' || !i.branch || i.branch === deployBranch) continue;
       const ref = [`refs/heads/${i.branch}`, `refs/remotes/${remote}/${i.branch}`].find((r) => git(dir, ['rev-parse', '--verify', '-q', r]));
       if (!ref || !gitOk(dir, ['merge-base', '--is-ancestor', ref, tip])) continue;
@@ -614,8 +638,8 @@ const loopNote = (hit) =>
 const commitNote = (entry) =>
   `[tck-session] This commit belongs to ${entry.key} (status: ${entry.status}); it will carry the trailer "Ticket: ${entry.key}". If it is other work, tell the owner; with their OK, commit it with NOESIS_TICKET=none in front of the command (no trailer).`;
 
-/** The owner's answer to the hook's "Ticket" question, from an AskUserQuestion call. */
-export function ticketAnswer(p) {
+/** Each question of an AskUserQuestion call with the owner's answer: [{ header, question, answer }]. */
+function askAnswers(p) {
   const pick = (v) => {
     if (typeof v === 'string') {
       try {
@@ -630,11 +654,43 @@ export function ticketAnswer(p) {
   const input = pick(p.tool_input) || {};
   const qs = Array.isArray(res.questions) ? res.questions : Array.isArray(input.questions) ? input.questions : [];
   const answers = (res.answers && typeof res.answers === 'object' ? res.answers : input.answers) || {};
-  const q = qs.find((x) => x && String(x.header || '').trim().toLowerCase() === ASK_HEADER.toLowerCase());
-  if (!q) return null;
-  const a = answers[q.question];
-  return typeof a === 'string' ? a.trim() : null;
+  return qs
+    .filter((x) => x && typeof x.question === 'string')
+    .map((x) => ({ header: String(x.header || '').trim(), question: x.question, answer: typeof answers[x.question] === 'string' ? answers[x.question].trim() : null }));
 }
+
+/** The owner's answer to the hook's "Ticket" question, from an AskUserQuestion call. */
+export function ticketAnswer(p) {
+  const q = askAnswers(p).find((x) => x.header.toLowerCase() === ASK_HEADER.toLowerCase());
+  return q ? q.answer : null;
+}
+
+/** The tickets the owner answered "Ship it now" for, in the "Ship" or "Waiting" question: the key
+ *  the question names, or for a "Ship" question without one, this session's ticket. */
+export function shipNowKeys(p, entry) {
+  const keys = [];
+  for (const q of askAnswers(p)) {
+    const h = q.header.toLowerCase();
+    if (h !== SHIP_HEADER.toLowerCase() && h !== WAIT_HEADER.toLowerCase()) continue;
+    if (!q.answer || !q.answer.toLowerCase().startsWith(SHIP_NOW.toLowerCase())) continue;
+    const m = q.question.match(/\bTCK-\d+\b/i);
+    const key = m ? m[0].toUpperCase() : h === SHIP_HEADER.toLowerCase() && entry ? entry.key : null;
+    if (key && !keys.includes(key)) keys.push(key);
+  }
+  return keys;
+}
+
+/** "Ship it now" counts as "ship it": the ship steps, after a bind when the ticket is not this session's. */
+function shipNowNote(key, entry) {
+  const live = entry && !isClosed(entry.status) ? entry : null;
+  if (live && live.key === key) return `[tck-session] ${shipNote(live)}`;
+  const busy = live ? ` This session holds ${live.key}: ask the owner before you switch (backlog_bind with switch: true).` : '';
+  return `[tck-session] The owner said "${SHIP_NOW}" for ${key}. Bind it here first (mcp__noesis__backlog_bind, status "ready_to_merge"; force: true when another session holds it).${busy} ${shipNote({ key })}`;
+}
+
+/** A ticket just set to ready_to_merge: the owner is asked now, with a question, not in a sentence. */
+const handOffNote = (key) =>
+  `[tck-session] ${key} is now ready_to_merge: only the owner's "ship it" is left. End this turn with AskUserQuestion, header "${SHIP_HEADER}", question "Ship ${key} now?", options "${SHIP_NOW}" and "Not yet" — a sentence at the end of a reply is easy to miss, and nothing asks again until the waiting list a day later. If the owner must still do something first (create a store, set a key, answer a question), it is not ready_to_merge: set it to iterating and post that step on the ticket (mcp__noesis__backlog_post_message, kind "question").`;
 
 function answerNote(sessionId, answer) {
   const lower = answer.toLowerCase();
@@ -885,19 +941,24 @@ const out = (event, additionalContext) =>
   additionalContext ? { hookSpecificOutput: { hookEventName: event, additionalContext } } : null;
 const pre = (fields) => ({ hookSpecificOutput: { hookEventName: 'PreToolUse', ...fields } });
 
-// ── Session start: stale bindings, the reconcile, the /clear hint ──────────────────────────
+// ── Session start: stale bindings, the reconcile, the waiting list, the /clear hint ────────
 
 const STALE_MS = 24 * 60 * 60 * 1000;
 const START_CHECK_MS = 6 * 60 * 60 * 1000;
+/** A ticket at ready_to_merge this long is put to the owner again, and the list comes at most
+ *  this often: the owner decides once a day, not at every start. */
+const WAITING_MS = 24 * 60 * 60 * 1000;
 /** The stale check covers every binding on this computer: one stamp. The reconcile is per repository:
- *  one stamp each, so a start in one listed repo never uses up another's. */
+ *  one stamp each, so a start in one listed repo never uses up another's. The waiting list covers
+ *  every ticket of the account: one stamp. */
 const staleStampPath = () => path.join(cacheDir(), '.session-start-stale');
 const reconcileStampPath = (repo) => path.join(cacheDir(), `.session-start-reconcile-${String(repo.remote).replace(/[^A-Za-z0-9_-]+/g, '_')}`);
+const waitingStampPath = () => path.join(cacheDir(), '.session-start-waiting');
 
-/** True at most once every START_CHECK_MS per stamp; the stamp is written first, so parallel starts do not all run. */
-function dueAndStamp(file) {
+/** True at most once every `windowMs` per stamp; the stamp is written first, so parallel starts do not all run. */
+function dueAndStamp(file, windowMs = START_CHECK_MS) {
   try {
-    if (Date.now() - fs.statSync(file).mtimeMs < START_CHECK_MS) return false;
+    if (Date.now() - fs.statSync(file).mtimeMs < windowMs) return false;
   } catch {
     /* never ran */
   }
@@ -1000,6 +1061,8 @@ async function staleBindings(cfg, ownSid, skip) {
       }
       continue;
     }
+    // A ready_to_merge binding waits for the owner, not for its session: the waiting list asks about it.
+    if (issue.work_status === 'ready_to_merge') continue;
     found.push({ key: g.key, status: issue.work_status, machine: issue.bound_machine, sid: g.bound, hours: Math.floor(idle / 3600000) });
   }
   return found;
@@ -1019,6 +1082,37 @@ async function startReconcile(cfg, repo) {
   if (!tip) return { tip: null, list: [] };
   const merged = await mergedTickets(cfg, repo.dir, 'origin', repo.deployBranch, tip, null);
   return { tip, list: merged.map((m) => m.issue) };
+}
+
+/** Tickets at ready_to_merge for WAITING_MS or more, bound or not, on any computer, oldest first.
+ *  They wait for the owner's "ship it", and nothing else brings them back: the session that set
+ *  the status has often ended (TCK-1858). `skip` holds keys this start already names. */
+async function waitingTickets(cfg, skip) {
+  const issues = await listByStatus(cfg, 'ready_to_merge');
+  const now = Date.now();
+  return (issues || [])
+    .map((i) => ({ issue: i, at: i ? Date.parse(i.work_status_at) : NaN }))
+    .filter((w) => w.issue && w.issue.key && w.issue.work_status === 'ready_to_merge' && !skip.has(w.issue.key) && now - w.at >= WAITING_MS)
+    .sort((a, b) => a.at - b.at)
+    .map((w) => ({ ...w.issue, days: Math.floor((now - w.at) / 86400000) }));
+}
+
+function waitingNote(list) {
+  const fmt = (i) => {
+    const facts = [`${i.days} d`];
+    if (i.branch) facts.push(i.branch);
+    if (i.pr_number) facts.push(`PR #${i.pr_number}`);
+    facts.push(i.bound_session_id ? `session ${String(i.bound_session_id).slice(0, 8)}${i.bound_machine ? ` on ${i.bound_machine}` : ''}` : 'no session');
+    const title = String(i.headline || i.title || '').replace(/\s+/g, ' ').trim();
+    return `${i.key} (${facts.join(', ')})${title ? `: ${title.length > 60 ? title.slice(0, 59) + '…' : title}` : ''}`;
+  };
+  const shown = list.slice(0, 10);
+  const more = list.length > shown.length ? ` and ${list.length - shown.length} more on the Jot page` : '';
+  return [
+    `[tck-session] Waiting for the owner's "ship it" for a day or more: ${shown.map(fmt).join('; ')}${more}.`,
+    `Nothing else brings these back, so put them to the owner at the start of your first reply: AskUserQuestion with the header "${WAIT_HEADER}", one question per ticket (the four oldest), each naming its key, with the options "${SHIP_NOW}", "Back to Iterating", "Leave it".`,
+    `${SHIP_NOW}: bind it here (mcp__noesis__backlog_bind, status "ready_to_merge"; force: true when another session holds it, since the owner's answer is the yes), then the ship steps. Back to Iterating: something is missing; bind it here with status "iterating" the same way, post what is missing on the ticket (mcp__noesis__backlog_post_message, kind "question"), then release it (mcp__noesis__backlog_unbind) unless the owner works on it here. Leave it: change nothing; it is listed again in a day. If this session already holds a ticket, ask the owner before you bind another one.`,
+  ].join('\n');
 }
 
 /** After /clear: the open tickets bound to this folder, which this session may need to link again. */
@@ -1059,12 +1153,13 @@ async function sessionStart(p, sw) {
       lines.push(
         `[tck-session] Bindings with no activity for 24 hours or more: ${stale
           .map((b) => `${b.key} (${b.status}, session ${b.sid.slice(0, 8)}${b.machine ? ` on ${b.machine}` : ''}, idle ${b.hours} h)`)
-          .join(', ')}. Tell the owner. For each one that is not at ready_to_merge, ask whether to release it (mcp__noesis__backlog_unbind with force: true); a ready_to_merge one is only waiting for "ship it". Never release a binding without the owner's yes.`,
+          .join(', ')}. Tell the owner, and ask whether to release each one (mcp__noesis__backlog_unbind with force: true). Never release a binding without the owner's yes.`,
       );
     }
   }
   if (repo.deployBranch && dueAndStamp(reconcileStampPath(repo))) {
     const rec = await startReconcile(cfg, repo);
+    for (const i of rec.list) named.add(i.key); // merged: shipping it needs no "ship it" question
     if (rec.list.length) {
       lines.push(
         `[tck-session] These tickets still wait, but their branch is already in ${repo.deployBranch} (${rec.tip.slice(0, 12)}): ${rec.list
@@ -1072,6 +1167,10 @@ async function sessionStart(p, sw) {
           .join(', ')}. Ask the owner whether to mark each one Shipped; on a yes, call mcp__noesis__backlog_ship(key, commit: "${rec.tip}").`,
       );
     }
+  }
+  if (dueAndStamp(waitingStampPath(), WAITING_MS)) {
+    const waiting = await waitingTickets(cfg, named);
+    if (waiting.length) lines.push(waitingNote(waiting));
   }
   return lines.length ? out('SessionStart', lines.join('\n')) : null;
 }
@@ -1160,8 +1259,10 @@ export async function decide(p) {
     }
     if (p.tool_name === 'AskUserQuestion') {
       const answer = ticketAnswer(p);
-      const note = answer ? answerNote(sid, answer) : null;
-      return note ? out(event, note) : null;
+      const notes = [answer ? answerNote(sid, answer) : null];
+      const entry = readCache(sid);
+      for (const key of shipNowKeys(p, entry)) notes.push(shipNowNote(key, entry));
+      return out(event, notes.filter(Boolean).join('\n'));
     }
     if (p.tool_name === 'ExitPlanMode') {
       const entry = readCache(sid);
@@ -1183,6 +1284,8 @@ export async function decide(p) {
           machine: issue.bound_machine ?? null,
           ...(branch ? { branch } : {}),
         });
+        const handOff = issue.work_status === 'ready_to_merge' && /_(bind|set_status)$/.test(p.tool_name) && process.env.CLAUDE_CODE_SESSION_ATTENDED !== '0';
+        if (handOff) return out(event, handOffNote(issue.key));
       } else if (entry && entry.key === issue.key) {
         dropCache(sid);
       }

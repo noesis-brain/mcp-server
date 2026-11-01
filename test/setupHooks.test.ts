@@ -256,7 +256,7 @@ describe('--all', () => {
   it('turns on every opt-in: the restructure rule, the capture hook and the ticket hook', async () => {
     await setup('--all');
     const md = fs.readFileSync(claude('CLAUDE.md'), 'utf8');
-    expect(md).toContain('<!-- noesis-mcp-server:start v4 -->');
+    expect(md).toContain('<!-- noesis-mcp-server:start v5 -->');
     expect(md).toMatch(/<!-- noesis-mcp-server:restructure-on-sync:start v\d+ -->/);
     const s = readSettings();
     expect(commands(s, 'SessionEnd').some((c) => c.includes('noesis-capture-session-end'))).toBe(true);

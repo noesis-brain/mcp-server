@@ -185,6 +185,11 @@ in those repositories only:
   confirm it and ship it with `backlog_ship`. The hook never sets Shipped itself.
 - **At a session start** (at most every 6 hours) it reports bindings with no activity for 24
   hours, and waiting tickets whose branch was merged on GitHub. It never releases anything.
+- **Ready to merge comes back to the user.** When a session sets a ticket to Ready to merge, the
+  hook tells it to end the turn with a `Ship` question ("Ship it now" or "Not yet"). At most once
+  a day, a session start lists every ticket that has waited at Ready to merge for a day or more,
+  on any computer, and asks about each one in a `Waiting` question. The answer "Ship it now"
+  counts as "ship it".
 
 The hook reads `NOESIS_API_URL` / `NOESIS_API_TOKEN` from the `noesis` server entry in
 `~/.claude.json` (where `claude mcp add` stores it). It keeps small per-session files in

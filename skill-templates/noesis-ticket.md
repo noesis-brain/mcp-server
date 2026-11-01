@@ -19,7 +19,7 @@ $ARGUMENTS
 | `ready_to_implement` | your plan is presented and waits for the user's approval |
 | `implementing` | the user approved the plan and you are building it |
 | `iterating` | the first version is delivered; the user is testing it and asking for changes |
-| `ready_to_merge` | you judge the work complete: every piece of feedback is done, or a `/cc-loop` reached LOOP COMPLETE. You wait for the user to say "ship it" |
+| `ready_to_merge` | you judge the work complete: every piece of feedback is done, or a `/cc-loop` reached LOOP COMPLETE. Only the user's "ship it" is left: ask for it with a question (see "Waiting for ship it" below). If the user must do something first (create a store, set a key, answer a question), post that step on the ticket as a question and keep the status at `iterating` |
 | `deploying` | you are merging, pushing and verifying the deployment |
 | `shipped` | the change is live in production |
 
@@ -42,7 +42,8 @@ Use it when this session is already working and the ticket was never handed over
    - a plan presented and waiting → `ready_to_implement`;
    - an approved plan, and code being changed → `implementing`;
    - a first version delivered, and the user giving feedback → `iterating`;
-   - a `/cc-loop` whose state file says COMPLETE → `ready_to_merge`.
+   - a `/cc-loop` whose state file says COMPLETE → `ready_to_merge`;
+   - a `/cc-loop` that is COMPLETE-PARTIAL, or work that waits on a step of the user's → `iterating`, with the open step posted on the ticket (`backlog_post_message`, kind `question`).
 2. `backlog_bind(key, status)`. Pass `force` only when the user wrote `--force`.
 3. If the session has already made a plan, refine the ticket once (see `refine`).
 
@@ -76,6 +77,14 @@ It starts when the user says "ship it", "merge to main", "push it" or "verify th
 2. Merge and push. With the ticket hook, the push is read back: a bound ticket whose work is in the pushed range moves to `deploying` by itself, and every other open ticket in the range is listed.
 3. Verify the live deployment.
 4. With the user's yes, set the ticket to `shipped`. For each other ticket the hook listed, ask the user, then call `backlog_ship(key, commit)` with the commit the hook names. It ships a ticket at `ready_to_merge` or `deploying` whose work is merged, even when another (often ended) session holds it.
+5. When you commit or push work that belongs to another open ticket (for example, changes its session left uncommitted), name that ticket to the user. With the user's yes, ship it with `backlog_ship(key, commit)` once the commit is where it runs.
+
+### Waiting for ship it
+
+`ready_to_merge` waits for the user, and the session that set it often ends before the user answers. So the user is asked with a question, never in a sentence at the end of a reply:
+
+- When you set `ready_to_merge` (or bind a ticket at it), end the turn with one AskUserQuestion: header `Ship`, question "Ship TCK-<n> now?", options "Ship it now" and "Not yet". "Ship it now" counts as "ship it": go on with the ship step.
+- With the ticket hook, at most once a day a session start lists every ticket that has waited at `ready_to_merge` for a day or more, on any computer, bound or not. Ask the user about each one in one AskUserQuestion with the header `Waiting`, one question per ticket (the four oldest), each naming its key, with the options "Ship it now", "Back to Iterating" and "Leave it". The hook's line says what each answer means.
 
 ### `reset`
 

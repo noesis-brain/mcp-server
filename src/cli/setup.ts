@@ -49,7 +49,7 @@ interface BlockSpec {
 }
 
 // Core conventions — always installed (unless --skills-only).
-const CORE_BLOCK_VERSION = 'v4'; // v2 (2.5.0): + Noesis tickets section; v3 (2.6.0): + new work in a bound session; v4 (2.7.0): + the "which ticket?" checkpoint and ship
+const CORE_BLOCK_VERSION = 'v5'; // v2 (2.5.0): + Noesis tickets section; v3 (2.6.0): + new work in a bound session; v4 (2.7.0): + the "which ticket?" checkpoint and ship; v5 (2.9.0): + ready_to_merge means only "ship it" is left, and the Ship / Waiting questions
 const CORE_BLOCK: BlockSpec = {
   templateFile: 'claude-md-block.md',
   startMarker: `<!-- noesis-mcp-server:start ${CORE_BLOCK_VERSION} -->`,

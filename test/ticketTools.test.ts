@@ -336,7 +336,7 @@ describe('noesis-mcp setup installs the ticket skill and the v3 conventions bloc
     expect(skill).toContain('link TCK-<n> [status] [--force]');
     expect(skill).toContain('70%–120%');
     const md = fs.readFileSync(path.join(home, '.claude', 'CLAUDE.md'), 'utf8');
-    expect(md).toContain('<!-- noesis-mcp-server:start v4 -->');
+    expect(md).toContain('<!-- noesis-mcp-server:start v5 -->');
     expect(md).toContain('### Noesis tickets (Jot page, TCK-<n>)');
     expect(md).toContain('New work in a bound session');
     expect(md).toContain('TICKET_CLOSED');

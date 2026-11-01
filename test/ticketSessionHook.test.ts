@@ -1359,4 +1359,110 @@ describe('TCK-1838: per-computer switch and the which-ticket checkpoint', () => 
     expect(other.json).toBeNull();
     expect(requests).toHaveLength(0);
   });
+
+  // ── TCK-1858: a ticket waiting at ready_to_merge comes back to the owner ─────────────
+  // Four tickets sat at ready_to_merge for days (TCK-1853, TCK-1819, TCK-235, TCK-237): the
+  // "ship it?" lived in one sentence at the end of one session, and nothing asked again.
+  const ago = (hours: number) => new Date(Date.now() - hours * 3600 * 1000).toISOString();
+  const waitingStamp = (home: string) => path.join(home, '.claude', 'tck-bindings', '.session-start-waiting');
+
+  it('RED (TCK-1819 / TCK-235 case): unmerged tickets at ready_to_merge for a day or more are put to the owner, oldest first', async () => {
+    const { dir, home } = pushRepo();
+    respond = startServer({}, [], [
+      { key: 'TCK-1819', work_status: 'ready_to_merge', work_status_at: ago(48), branch: 'loop/note-podcast', bound_session_id: '1c9720f5-f4d1', bound_machine: 'Mac', title: 'Provide a feature to create Podcast from a note with prompt.' },
+      { key: 'TCK-235', work_status: 'ready_to_merge', work_status_at: ago(24 * 108), branch: 'loop/tck-235', pr_number: 18, bound_session_id: null, title: 'Long video: paste a transcript' },
+      { key: 'TCK-1860', work_status: 'ready_to_merge', work_status_at: ago(2), branch: 'loop/fresh', title: 'Just finished' },
+    ]);
+    const r = await run(home, start(dir));
+    expect(r.ctx).toMatch(/Waiting for the owner's "ship it" for a day or more: TCK-235 \(108 d, loop\/tck-235, PR #18, no session\): Long video: paste a transcript; TCK-1819 \(2 d, loop\/note-podcast, session 1c9720f5 on Mac\): Provide a feature/);
+    expect(r.ctx).not.toMatch(/TCK-1860/); // two hours: the session that set it may still be waiting for the answer
+    expect(r.ctx).toMatch(/AskUserQuestion with the header "Waiting"/);
+    expect(r.ctx).toMatch(/"Ship it now", "Back to Iterating", "Leave it"/);
+    expect(requests.some((q) => q.method !== 'GET')).toBe(false); // the hook moves nothing itself
+    // The reconcile and the waiting list share one request.
+    expect(requests.filter((q) => q.url === '/api/mcp/backlog/issues?status=ready_to_merge')).toHaveLength(1);
+  });
+
+  it('a waiting ticket whose branch is already merged is named once, by the reconcile', async () => {
+    const { dir, home } = pushRepo();
+    commitOn(dir, 'loop/tck-237', 'feat: codebases dialog');
+    sh(dir, 'checkout', '-q', 'main');
+    sh(dir, 'merge', '-q', '--no-ff', '-m', 'Merge pull request #19', 'loop/tck-237');
+    sh(dir, 'push', '-q', 'origin', 'HEAD:main');
+    respond = startServer({}, [], [{ key: 'TCK-237', work_status: 'ready_to_merge', work_status_at: ago(72), branch: 'loop/tck-237' }]);
+    const r = await run(home, start(dir));
+    expect(r.ctx).toMatch(/These tickets still wait, but their branch is already in main/);
+    expect(r.ctx).not.toMatch(/Waiting for the owner's "ship it"/);
+  });
+
+  it('the waiting list comes once a day on this computer: not at a resume, not in another listed repo, again after 24 h', async () => {
+    const a = pushRepo();
+    const b = pushRepo();
+    const home = a.home;
+    const remoteA = JSON.parse(fs.readFileSync(path.join(a.home, '.claude', 'noesis-ticket.json'), 'utf8')).repos[0].remote;
+    fs.writeFileSync(path.join(home, '.claude', 'noesis-ticket.json'), JSON.stringify({ enabled: true, repos: [{ remote: remoteA, deployBranch: 'main' }, { remote: b.bare, deployBranch: 'main' }] }));
+    respond = startServer({}, [], [{ key: 'TCK-1819', work_status: 'ready_to_merge', work_status_at: ago(48), branch: 'loop/note-podcast' }]);
+    expect((await run(home, start(a.dir))).ctx).toMatch(/Waiting for the owner's "ship it"/);
+    expect((await run(home, start(a.dir, 'resume'))).json).toBeNull();
+    expect((await run(home, start(b.dir))).json).toBeNull(); // b's reconcile runs; the daily list does not
+    const t = (Date.now() - 25 * 3600 * 1000) / 1000;
+    fs.utimesSync(waitingStamp(home), t, t);
+    expect((await run(home, start(a.dir, 'resume'))).ctx).toMatch(/for a day or more: TCK-1819 \(2 d, loop\/note-podcast, no session\)/);
+  });
+
+  it('RED: an idle binding at ready_to_merge is no longer "only waiting for ship it"; the waiting list asks instead', async () => {
+    const { dir, home } = pushRepo();
+    otherCache(home, '1c9720f5-old', { key: 'TCK-1819', status: 'ready_to_merge', bound_session_id: '1c9720f5-old', machine: 'Mac' }, 30);
+    respond = startServer(
+      { 'TCK-1819': { work_status: 'ready_to_merge', bound_session_id: '1c9720f5-old', bound_machine: 'Mac' } },
+      [],
+      [{ key: 'TCK-1819', work_status: 'ready_to_merge', work_status_at: ago(30), branch: 'loop/note-podcast', bound_session_id: '1c9720f5-old', bound_machine: 'Mac' }],
+    );
+    const r = await run(home, start(dir));
+    expect(r.ctx).not.toMatch(/Bindings with no activity/);
+    expect(r.ctx).not.toMatch(/only waiting for/);
+    expect(r.ctx).toMatch(/TCK-1819 \(1 d, loop\/note-podcast, session 1c9720f5 on Mac\)/);
+  });
+
+  const toolResult = (tool: string, status: string) => ({
+    hook_event_name: 'PostToolUse',
+    tool_name: `mcp__noesis__backlog_${tool}`,
+    tool_response: [{ type: 'text', text: JSON.stringify({ issue: { key: 'TCK-12', work_status: status, bound_session_id: BOUND_SID, bound_machine: "Tester's Mac" } }) }],
+  });
+
+  it('RED (TCK-1853 case): setting ready_to_merge asks for "ship it" with a question, never in prose', async () => {
+    const home = sandbox(); // no listed repo: the TCK-1853 work was in an unlisted config repo
+    seed(home, { ...BOUND, status: 'iterating' });
+    const r = await run(home, toolResult('set_status', 'ready_to_merge'));
+    expect(r.ctx).toMatch(/TCK-12 is now ready_to_merge: only the owner's "ship it" is left\. End this turn with AskUserQuestion, header "Ship"/);
+    expect(r.ctx).toMatch(/options "Ship it now" and "Not yet"/);
+    expect(r.ctx).toMatch(/set it to iterating and post that step on the ticket/);
+    expect(readCacheFile(home).status).toBe('ready_to_merge'); // the cache still follows the tool
+    // Bound straight at ready_to_merge (the TCK-1819 case): the same question.
+    expect((await run(home, toolResult('bind', 'ready_to_merge'))).ctx).toMatch(/header "Ship"/);
+    // Any other status, and an unattended run (nobody to ask): nothing.
+    expect((await run(home, toolResult('set_status', 'iterating'))).json).toBeNull();
+    expect((await run(home, toolResult('set_status', 'ready_to_merge'), { CLAUDE_CODE_SESSION_ATTENDED: '0' })).json).toBeNull();
+    expect(requests).toHaveLength(0);
+  });
+
+  const answered = (header: string, question: string, answer: string) => ({
+    hook_event_name: 'PostToolUse',
+    tool_name: 'AskUserQuestion',
+    tool_input: { questions: [{ question, header, options: [{ label: 'Ship it now' }, { label: 'Not yet' }], multiSelect: false }] },
+    tool_response: { questions: [{ question, header, options: [], multiSelect: false }], answers: { [question]: answer }, annotations: {} },
+  });
+
+  it('the answer "Ship it now" counts as "ship it": the bound ticket gets the ship steps, a waiting one is bound first', async () => {
+    const home = sandbox();
+    seed(home, { ...BOUND, status: 'ready_to_merge' });
+    expect((await run(home, answered('Ship', 'Ship TCK-12 now?', 'Ship it now'))).ctx).toMatch(/The ship steps for TCK-12: set it to deploying/);
+    expect((await run(home, answered('Ship', 'Ship TCK-12 now?', 'Not yet'))).json).toBeNull();
+    const w = await run(home, answered('Waiting', 'TCK-235 has waited 108 days at Ready to merge. What should happen to it?', 'Ship it now'));
+    expect(w.ctx).toMatch(/The owner said "Ship it now" for TCK-235\. Bind it here first/);
+    expect(w.ctx).toMatch(/This session holds TCK-12: ask the owner before you switch/);
+    expect(w.ctx).toMatch(/set it to deploying/);
+    expect((await run(home, answered('Waiting', 'TCK-235 has waited 108 days. What should happen to it?', 'Leave it'))).json).toBeNull();
+    expect(requests).toHaveLength(0);
+  });
 });
