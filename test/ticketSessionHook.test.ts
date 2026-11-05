@@ -382,7 +382,7 @@ describe('TCK-1835: forward only, closed tickets, re-check, plan-mode line, conf
     expect(requests).toHaveLength(0);
   });
 
-  for (const status of ['shipped', 'dropped']) {
+  for (const status of ['shipped', 'merged', 'dropped']) {
     it(`RED: a cached ${status} ticket never moves, and the reminder says to release it`, async () => {
       const home = sandbox();
       seed(home, { ...BOUND, status });
@@ -392,7 +392,8 @@ describe('TCK-1835: forward only, closed tickets, re-check, plan-mode line, conf
       await run(home, { hook_event_name: 'PreToolUse', tool_name: 'Read', permission_mode: 'plan' });
       const r = await run(home, { hook_event_name: 'UserPromptSubmit', permission_mode: 'plan', prompt: 'a new idea' });
       expect(requests).toHaveLength(0);
-      expect(r.ctx).toMatch(new RegExp(`still bound to TCK-12, which is ${status === 'shipped' ? 'Shipped' : 'Dropped'}`));
+      const label = { shipped: 'Shipped', merged: 'Merged', dropped: 'Dropped' }[status];
+      expect(r.ctx).toMatch(new RegExp(`still bound to TCK-12, which is ${label}`));
       expect(r.ctx).toMatch(/backlog_unbind/);
       expect(r.ctx).not.toMatch(/Keep it current/);
     });
@@ -1172,6 +1173,20 @@ describe('TCK-1838: per-computer switch and the which-ticket checkpoint', () => 
     seed(home, { ...BOUND, status: 'deploying' });
     await run(home, { hook_event_name: 'PostToolUse', tool_name: 'mcp__noesis__backlog_ship', tool_response: [{ type: 'text', text: JSON.stringify({ issue: { key: 'TCK-12', work_status: 'shipped', bound_session_id: null } }) }] });
     expect(fs.existsSync(cacheFile(home))).toBe(false);
+  });
+
+  it('TCK-1889: a backlog_merge response (binding released) drops the cache when it was this session\'s ticket', async () => {
+    const home = listedHome();
+    seed(home, { ...BOUND, status: 'planning' });
+    await run(home, { hook_event_name: 'PostToolUse', tool_name: 'mcp__noesis__backlog_merge', tool_response: [{ type: 'text', text: JSON.stringify({ issue: { key: 'TCK-12', work_status: 'merged', merged_into: 'TCK-20', bound_session_id: null } }) }] });
+    expect(fs.existsSync(cacheFile(home))).toBe(false);
+  });
+
+  it('TCK-1889: merging ANOTHER ticket keeps this session\'s cache', async () => {
+    const home = listedHome();
+    seed(home, { ...BOUND, status: 'implementing' });
+    await run(home, { hook_event_name: 'PostToolUse', tool_name: 'mcp__noesis__backlog_merge', tool_response: [{ type: 'text', text: JSON.stringify({ issue: { key: 'TCK-30', work_status: 'merged', merged_into: 'TCK-12', bound_session_id: null } }) }] });
+    expect(readCacheFile(home).key).toBe('TCK-12');
   });
 
   // ── INC-6: session start — stale bindings, the reconcile, the /clear hint ─────────────

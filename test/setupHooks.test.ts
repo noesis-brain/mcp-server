@@ -13,7 +13,7 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 
 const SCRIPT = path.resolve(__dirname, '..', 'scripts', 'noesis-ticket-session.mjs');
-const POST_MATCHER = 'ExitPlanMode|Bash|AskUserQuestion|mcp__noesis__backlog_(bind|set_status|unbind|refine|ship)';
+const POST_MATCHER = 'ExitPlanMode|Bash|AskUserQuestion|mcp__noesis__backlog_(bind|set_status|unbind|refine|ship|merge)';
 const START_MATCHER = 'startup|resume|clear';
 /** The 2.6.0 registration, for the upgrade test. */
 const POST_MATCHER_260 = 'ExitPlanMode|mcp__noesis__backlog_(bind|set_status|unbind|refine)';
@@ -24,7 +24,7 @@ const ALLOW_260 = [
   'mcp__noesis__backlog_unbind',
   'mcp__noesis__backlog_refine',
 ];
-const ALLOW = [...ALLOW_260, 'mcp__noesis__backlog_ship', 'mcp__noesis__backlog_set_gut'];
+const ALLOW = [...ALLOW_260, 'mcp__noesis__backlog_ship', 'mcp__noesis__backlog_merge', 'mcp__noesis__backlog_set_gut'];
 
 let home: string;
 let logs: string[];
@@ -74,7 +74,7 @@ afterEach(() => {
 });
 
 describe('--with-ticket-hook', () => {
-  it('installs the copied script, four events, the six allowed tools and the switch file; a re-run changes nothing', async () => {
+  it('installs the copied script, four events, the allowed ticket tools and the switch file; a re-run changes nothing', async () => {
     const line = await setup('--with-ticket-hook');
     expect(line).toMatch(/Ticket hook: settings created, script created, switch file created/);
     expect(JSON.parse(fs.readFileSync(switchPath(), 'utf8'))).toEqual({ enabled: true, repos: [] });
@@ -118,6 +118,26 @@ describe('--with-ticket-hook', () => {
       { matcher: START_MATCHER, hooks: [{ type: 'command', command: cmd }] },
     ]);
     expect(s.permissions.allow).toEqual(['Bash(ls:*)', ...ALLOW]);
+    expect(await setup('--with-ticket-hook')).toMatch(/settings unchanged/);
+  });
+
+  it('TCK-1889: upgrades a 2.9.0 install — the PostToolUse matcher gains backlog_merge, which is allowed too', async () => {
+    const cmd = canonical();
+    const POST_MATCHER_290 = 'ExitPlanMode|Bash|AskUserQuestion|mcp__noesis__backlog_(bind|set_status|unbind|refine|ship)';
+    writeSettings({
+      hooks: {
+        UserPromptSubmit: [{ matcher: '', hooks: [{ type: 'command', command: cmd }] }],
+        PreToolUse: [{ matcher: '*', hooks: [{ type: 'command', command: cmd }] }],
+        PostToolUse: [{ matcher: POST_MATCHER_290, hooks: [{ type: 'command', command: cmd }] }],
+        SessionStart: [{ matcher: START_MATCHER, hooks: [{ type: 'command', command: cmd }] }],
+      },
+      permissions: { allow: [...ALLOW_260, 'mcp__noesis__backlog_ship', 'mcp__noesis__backlog_set_gut'] },
+    });
+    expect(await setup('--with-ticket-hook')).toMatch(/settings upgraded/);
+    const s = readSettings();
+    expect(s.hooks.PostToolUse).toEqual([{ matcher: POST_MATCHER, hooks: [{ type: 'command', command: cmd }] }]);
+    expect(POST_MATCHER).toContain('|merge)');
+    expect(s.permissions.allow).toContain('mcp__noesis__backlog_merge');
     expect(await setup('--with-ticket-hook')).toMatch(/settings unchanged/);
   });
 
@@ -256,7 +276,7 @@ describe('--all', () => {
   it('turns on every opt-in: the restructure rule, the capture hook and the ticket hook', async () => {
     await setup('--all');
     const md = fs.readFileSync(claude('CLAUDE.md'), 'utf8');
-    expect(md).toContain('<!-- noesis-mcp-server:start v5 -->');
+    expect(md).toContain('<!-- noesis-mcp-server:start v6 -->');
     expect(md).toMatch(/<!-- noesis-mcp-server:restructure-on-sync:start v\d+ -->/);
     const s = readSettings();
     expect(commands(s, 'SessionEnd').some((c) => c.includes('noesis-capture-session-end'))).toBe(true);

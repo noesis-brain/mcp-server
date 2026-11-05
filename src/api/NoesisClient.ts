@@ -1511,6 +1511,11 @@ export class NoesisClient {
     return this.requestWithCode('POST', `/api/mcp/backlog/issues/${encodeURIComponent(key)}/shipped`, body);
   }
 
+  /** Mark a ticket Merged into another ticket (2.10.0). */
+  async backlogMerge(key: string, body: Record<string, unknown>): Promise<any> {
+    return this.requestWithCode('POST', `/api/mcp/backlog/issues/${encodeURIComponent(key)}/merge`, body);
+  }
+
   async backlogRefine(key: string, body: Record<string, unknown>): Promise<any> {
     return this.requestWithCode('PUT', `/api/mcp/backlog/issues/${encodeURIComponent(key)}/refined`, body);
   }

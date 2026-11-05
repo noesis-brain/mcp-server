@@ -13,6 +13,7 @@
  * and the working folder; the server decides who may change what.
  * 2.6.0: a Shipped or Dropped ticket never moves (TICKET_CLOSED), and closing a ticket
  * releases its binding.
+ * 2.10.0: backlog_merge marks a ticket Merged into another ticket, a third closed status.
  */
 import { z } from 'zod';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
@@ -30,9 +31,10 @@ const SIZE_ENUM = z.enum(['S', 'M', 'L', 'XL']);
 
 // Jot work status (2.5.0) — how far a Claude Code session has got with a ticket.
 // Separate from the old `stage` above, which belongs to the retired groom/run workflow.
+// merged (2.10.0): built as part of another ticket; only backlog_merge sets it.
 const WORK_STATUS_ENUM = z.enum([
   'created', 'planning', 'ready_to_implement', 'implementing', 'iterating',
-  'ready_to_merge', 'deploying', 'shipped', 'dropped',
+  'ready_to_merge', 'deploying', 'shipped', 'merged', 'dropped',
 ]);
 // created and dropped are the user's decisions (a new jot, an abandoned idea): OWNER_GATE.
 const CLAUDE_STATUS_ENUM = z.enum([
@@ -48,7 +50,7 @@ export const STATUS_LADDER =
   'ready_to_merge = YOU judge the work complete (all feedback done, or a /cc-loop reached LOOP COMPLETE); waiting for the user to say ship it · ' +
   'deploying = merging, pushing and verifying the deployment · ' +
   'shipped = the change is live in production. ' +
-  'created and dropped are the user\'s to set.';
+  'created and dropped are the user\'s to set; merged (built as part of another ticket) is set only by backlog_merge.';
 
 /** Who is calling: this Claude Code session, this computer, this folder. */
 export function ticketCaller(): { session_id: string; machine: string; cwd: string } | null {
@@ -287,7 +289,7 @@ export function registerBacklogTools(server: McpServer, client: NoesisClient): v
 
   server.tool(
     'backlog_bind',
-    "Bind a Jot ticket to THIS Claude Code session: records the session id, this computer's name and the working folder, and sets the ticket's work status. Call it when the user hands you a ticket (pastes 'TCK-<n>: …', or asks you to read, plan or work on TCK-<n>), or links the running session to one (/noesis-ticket link). With no status the ticket is set to planning; when you link a session that is already further along, pass the status it has really reached. Errors: BOUND_ELSEWHERE — another session or computer holds it; take it over (force) only if the user asks. SESSION_BUSY — this session already holds another ticket; switch only if the user hands over this one. RESET_BY_OWNER — the user reset this session's binding on the page; bind again (force) only if the user asks. TICKET_CLOSED — the ticket is Shipped or Dropped: never retry or force it; only the user reopens it, on the page; for new work create a new ticket that names it. Status ladder: " + STATUS_LADDER,
+    "Bind a Jot ticket to THIS Claude Code session: records the session id, this computer's name and the working folder, and sets the ticket's work status. Call it when the user hands you a ticket (pastes 'TCK-<n>: …', or asks you to read, plan or work on TCK-<n>), or links the running session to one (/noesis-ticket link). With no status the ticket is set to planning; when you link a session that is already further along, pass the status it has really reached. Errors: BOUND_ELSEWHERE — another session or computer holds it; take it over (force) only if the user asks. SESSION_BUSY — this session already holds another ticket; switch only if the user hands over this one. RESET_BY_OWNER — the user reset this session's binding on the page; bind again (force) only if the user asks. TICKET_CLOSED — the ticket is Shipped, Merged or Dropped: never retry or force it; only the user reopens it, on the page; for new work create a new ticket that names it. Status ladder: " + STATUS_LADDER,
     {
       key: z.string().describe('Ticket key like TCK-7'),
       status: CLAUDE_STATUS_ENUM.optional().describe('Status to set; omit to start at planning'),
@@ -310,7 +312,7 @@ export function registerBacklogTools(server: McpServer, client: NoesisClient): v
 
   server.tool(
     'backlog_set_status',
-    'Set the work status of the Jot ticket bound to THIS session (bind it first with backlog_bind). Keep it current as you work. Status ladder: ' + STATUS_LADDER + ' Errors: NOT_BOUND (bind first; if the user reset the binding, ask before binding again), BOUND_ELSEWHERE (another session holds it), OWNER_GATE (created/dropped are the user\'s), TICKET_CLOSED (the ticket is Shipped or Dropped: it never moves; only the user reopens it). Setting shipped releases the binding.',
+    'Set the work status of the Jot ticket bound to THIS session (bind it first with backlog_bind). Keep it current as you work. Status ladder: ' + STATUS_LADDER + ' Errors: NOT_BOUND (bind first; if the user reset the binding, ask before binding again), BOUND_ELSEWHERE (another session holds it), OWNER_GATE (created/dropped are the user\'s), TICKET_CLOSED (the ticket is Shipped, Merged or Dropped: it never moves; only the user reopens it). Setting shipped releases the binding.',
     {
       key: z.string().describe('Ticket key like TCK-7'),
       status: CLAUDE_STATUS_ENUM,
@@ -328,7 +330,7 @@ export function registerBacklogTools(server: McpServer, client: NoesisClient): v
 
   server.tool(
     'backlog_ship',
-    "Ship a Jot ticket whose work is merged into the deploy branch (main): the merge commit is the evidence, so it works whether or not a session — often one that has ended — holds the ticket. Use it when the ticket hook lists a merged ticket that is not bound to THIS session, and only after the user says yes. Only a ticket at ready_to_merge or deploying ships (409 NOT_READY otherwise); a Dropped ticket is TICKET_CLOSED; a Shipped one is a no-op. Shipping releases the binding. For the ticket bound to this session, keep using backlog_set_status.",
+    "Ship a Jot ticket whose work is merged into the deploy branch (main): the merge commit is the evidence, so it works whether or not a session — often one that has ended — holds the ticket. Use it when the ticket hook lists a merged ticket that is not bound to THIS session, and only after the user says yes. Only a ticket at ready_to_merge or deploying ships (409 NOT_READY otherwise); a Merged or Dropped ticket is TICKET_CLOSED; a Shipped one is a no-op. Shipping releases the binding. For the ticket bound to this session, keep using backlog_set_status.",
     {
       key: z.string().describe('Ticket key like TCK-7'),
       commit: z.string().describe('The commit on the deploy branch that holds the work (7-40 hex digits)'),
@@ -338,6 +340,24 @@ export function registerBacklogTools(server: McpServer, client: NoesisClient): v
         const who = ticketCaller();
         if (!who) return errText(new Error(NO_SESSION));
         return jsonText(await client.backlogShip(args.key, { ...who, commit: args.commit }));
+      } catch (e) {
+        return errText(e);
+      }
+    }
+  );
+
+  server.tool(
+    'backlog_merge',
+    "Mark a Jot ticket Merged into another ticket (into), after the user agreed to merge them: the surviving ticket now holds the merged ticket's words and a References line that names it, and one loop builds both. Call it right after the merge, so the merged ticket leaves the Open list instead of waiting for the user to delete it. It needs no binding on either ticket. Only a ticket at created or planning can be merged (409 NOT_MERGEABLE otherwise; BOUND_ELSEWHERE if another session holds it). The target must be another open ticket of the user's (400 MERGE_SELF, 409 MERGE_TARGET_CLOSED, 404 if it does not exist). Merged is a closed status: the ticket never moves again (TICKET_CLOSED), its row links to the target, and only the user reopens it. A binding this session holds on the merged ticket is released. Calling it again with the same target is a no-op.",
+    {
+      key: z.string().describe('The ticket being merged, like TCK-1885'),
+      into: z.string().describe('The surviving ticket that now holds its words, like TCK-1886'),
+    },
+    async (args) => {
+      try {
+        const who = ticketCaller();
+        if (!who) return errText(new Error(NO_SESSION));
+        return jsonText(await client.backlogMerge(args.key, { ...who, into: args.into }));
       } catch (e) {
         return errText(e);
       }
@@ -365,7 +385,7 @@ export function registerBacklogTools(server: McpServer, client: NoesisClient): v
 
   server.tool(
     'backlog_refine',
-    "Store your refinement of a Jot ticket's text (the ticket must be bound to this session). It must stay a jot: 70%–120% of the draft's word count (5 words of slack for short drafts; each Chinese, Japanese or Korean character counts as one word), in the draft's language, plain sentences or a short list — no headings, no code fences, no increments, acceptance criteria or plan sections. Refine once when your plan is ready (just before ExitPlanMode), and again only if the plan changes or the user asks. The user's draft is never changed; the page shows your text with the draft kept under it. Errors: REFINE_LENGTH (the details give draft_words, min, max and got — rewrite to fit), REFINE_FORMAT, TICKET_CLOSED (a Shipped or Dropped ticket is never refined).",
+    "Store your refinement of a Jot ticket's text (the ticket must be bound to this session). It must stay a jot: 70%–120% of the draft's word count (5 words of slack for short drafts; each Chinese, Japanese or Korean character counts as one word), in the draft's language, plain sentences or a short list — no headings, no code fences, no increments, acceptance criteria or plan sections. Refine once when your plan is ready (just before ExitPlanMode), and again only if the plan changes or the user asks. The user's draft is never changed; the page shows your text with the draft kept under it. Errors: REFINE_LENGTH (the details give draft_words, min, max and got — rewrite to fit), REFINE_FORMAT, TICKET_CLOSED (a Shipped, Merged or Dropped ticket is never refined).",
     {
       key: z.string().describe('Ticket key like TCK-7'),
       text: z.string().describe('The refined ticket text, about as long as the draft'),

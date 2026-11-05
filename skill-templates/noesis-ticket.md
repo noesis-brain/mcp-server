@@ -5,7 +5,7 @@ argument-hint: TCK-<n> | link TCK-<n> [status] [--force] | status [<status>] | r
 
 The Noesis Jot page is the user's quick-note board. Each ticket (TCK-<n>) shows a work status and which Claude Code session, on which computer, is working on it. This skill keeps that page true while you work.
 
-The ticket tools (`mcp__noesis__backlog_bind`, `backlog_set_status`, `backlog_ship`, `backlog_unbind`, `backlog_refine`, `backlog_get`) are bookkeeping on the user's own ticket, which the user asked for. Calling them in plan mode is expected.
+The ticket tools (`mcp__noesis__backlog_bind`, `backlog_set_status`, `backlog_ship`, `backlog_merge`, `backlog_unbind`, `backlog_refine`, `backlog_get`) are bookkeeping on the user's own ticket, which the user asked for. Calling them in plan mode is expected.
 
 ## Arguments
 
@@ -22,6 +22,7 @@ $ARGUMENTS
 | `ready_to_merge` | you judge the work complete: every piece of feedback is done, or a `/cc-loop` reached LOOP COMPLETE. Only the user's "ship it" is left: ask for it with a question (see "Waiting for ship it" below). If the user must do something first (create a store, set a key, answer a question), post that step on the ticket as a question and keep the status at `iterating` |
 | `deploying` | you are merging, pushing and verifying the deployment |
 | `shipped` | the change is live in production |
+| `merged` | the ticket's request is built as part of another ticket; set it with `backlog_merge(key, into)` (see "Merging two tickets" below) |
 
 `created` and `dropped` are the user's to set, on the page. Never skip a step you actually went through, and never claim a status you have not reached.
 
@@ -104,7 +105,16 @@ This is the standard procedure, not a special case. When this session holds a ti
   2. Create the new ticket with `backlog_upsert_issue`. Its text is the user's own words for the new request.
   3. A short session: `backlog_bind(new key, switch: true)`, which releases the old ticket. A long session: `backlog_unbind` the old ticket and leave the new one for a new session, which binds it there.
 - **Not sure:** ask the user once.
-- **A closed ticket never moves.** If the bound ticket is `shipped` or `dropped` and a new plan starts, release it or switch before you present the plan. The server refuses a status change, a bind or a refinement of a closed ticket (`TICKET_CLOSED`), and closing a ticket releases its binding.
+- **A closed ticket never moves.** If the bound ticket is `shipped`, `merged` or `dropped` and a new plan starts, release it or switch before you present the plan. The server refuses a status change, a bind or a refinement of a closed ticket (`TICKET_CLOSED`), and closing a ticket releases its binding.
+
+## Merging two tickets
+
+When the user agrees to merge two tickets into one, built in the same session and the same loop:
+
+1. The surviving ticket gets the user's words for each request, in order, and one References line that names the merged ticket.
+2. Mark the other ticket with `backlog_merge(key, into)`. It leaves the Open list at once, and its row on the page links to the surviving ticket. No binding is needed on either ticket.
+
+Only a ticket at `created` or `planning` can be merged (`NOT_MERGEABLE`), and the target must be another open ticket. `merged` is a closed status, like `shipped` and `dropped`: only the user reopens it, on the page. Never mark a merged ticket `dropped`: Dropped means "we decided not to do this".
 
 ## When the hook asks which ticket
 
@@ -123,7 +133,7 @@ A bound session's commits carry the trailer `Ticket: TCK-<n>` when the repositor
 
 - One ticket per session. `SESSION_BUSY` means this session holds another ticket: switch (`switch: true`) only when the user clearly hands over the new one, never because a ticket is merely mentioned.
 - `RESET_BY_OWNER` means the user reset this session's binding on the page. Bind again (`force: true`) only if the user asks.
-- `TICKET_CLOSED` means the ticket is Shipped or Dropped. Do not retry and do not force it: only the user reopens a ticket, on the Jot page. For new work, create a new ticket that names the closed one.
+- `TICKET_CLOSED` means the ticket is Shipped, Merged or Dropped. Do not retry and do not force it: only the user reopens a ticket, on the Jot page. For new work, create a new ticket that names the closed one.
 - With the optional ticket hook (`noesis-mcp setup --with-ticket-hook`), the plan steps move by themselves: Ready to implement at `ExitPlanMode` (only from `planning`), Implementing when the plan is approved, and `planning` again when a presented plan is rejected. A push that carries the bound ticket's work moves it to `deploying`. The hook changes no other status and never sets `shipped`, so set every other one yourself — including `planning` before you re-plan a ticket that is further along.
 - At a session start the hook may report bindings idle for 24 hours, and waiting tickets whose branch is already merged. Tell the user; release a binding (`backlog_unbind` with `force`) or ship a ticket (`backlog_ship`) only on the user's yes.
 - Never put the full plan on the ticket. Nobody reads the long version; the ticket stays a jot.

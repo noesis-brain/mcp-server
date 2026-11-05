@@ -136,7 +136,7 @@ ticket hook keeps the ticket's status true without relying on the model's memory
 - every prompt gets a short reminder of the bound ticket and its status;
 - the plan steps move by themselves: Ready to implement when a plan is presented (from
   Planning), Implementing when you approve it, back to Planning when you reject it;
-- a Shipped or Dropped ticket never moves, and a new plan in a session that is past Planning
+- a Shipped, Merged or Dropped ticket never moves, and a new plan in a session that is past Planning
   is reminded of the "new work in a bound session" procedure of `/noesis-ticket`.
 
 `setup` copies the hook to `~/.claude/hooks/noesis-ticket-session.mjs`, registers it for four
@@ -277,7 +277,7 @@ The server exposes 19 MCP tools, grouped by domain:
 - `backlog_unbind` — release this session's binding
 - `backlog_refine` — store a refinement of the ticket text, within 70%–120% of the draft's words
 
-The `/noesis-ticket` skill drives them: start a ticket, `link` the session you are already in, set the status, refine, reset, or list. It also holds the procedure for new work in a bound session. A Shipped or Dropped ticket never moves (`TICKET_CLOSED`), and closing a ticket releases its binding.
+The `/noesis-ticket` skill drives them: start a ticket, `link` the session you are already in, set the status, refine, reset, or list. It also holds the procedure for new work in a bound session. A Shipped, Merged or Dropped ticket never moves (`TICKET_CLOSED`), and closing a ticket releases its binding.
 
 ### Catalogs + relations
 

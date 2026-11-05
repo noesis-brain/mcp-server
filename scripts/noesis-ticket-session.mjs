@@ -50,7 +50,7 @@
 //     ready_to_implement -> implementing; any later tool or prompt still in plan mode while the
 //     ticket says ready_to_implement moves it back to planning (the plan was rejected). A ticket
 //     at any other status is left alone, so a plan never drags an Iterating ticket backwards.
-//   - A Shipped or Dropped ticket never moves. The server refuses it too (TICKET_CLOSED), and
+//   - A Shipped, Merged or Dropped ticket never moves. The server refuses it too (TICKET_CLOSED), and
 //     closing a ticket releases its binding, which drops this session's cache.
 //
 // Session ids: the MCP server stamps CLAUDE_CODE_SESSION_ID, which it read once at spawn, so
@@ -77,8 +77,8 @@ export const HOOK_VERSION = 2;
 const TIMEOUT_MS = 2500;
 export const RECHECK_MS = 60 * 1000;
 const PRUNE_MS = 14 * 24 * 60 * 60 * 1000;
-const TICKET_TOOL = /^mcp__noesis__backlog_(bind|set_status|unbind|refine|ship)$/;
-const CLOSED = ['shipped', 'dropped'];
+const TICKET_TOOL = /^mcp__noesis__backlog_(bind|set_status|unbind|refine|ship|merge)$/;
+const CLOSED = ['shipped', 'merged', 'dropped'];
 /** Past Planning: a new plan in plan mode may be new work, not this ticket's. */
 const PAST_PLANNING = ['implementing', 'iterating', 'ready_to_merge', 'deploying'];
 const LADDER =
@@ -94,7 +94,8 @@ const HANDOVER = [
 ];
 
 const isClosed = (status) => CLOSED.includes(status);
-const closedLabel = (status) => (status === 'dropped' ? 'Dropped' : 'Shipped');
+const CLOSED_LABEL = { shipped: 'Shipped', merged: 'Merged', dropped: 'Dropped' };
+const closedLabel = (status) => CLOSED_LABEL[status] || 'Shipped';
 
 const ASK_HEADER = 'Ticket';
 const NO_TICKET = 'No ticket for this work';

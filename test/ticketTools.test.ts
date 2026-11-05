@@ -95,8 +95,8 @@ describe('ticket tools → client', () => {
 
   const run = (name: string, args: Record<string, unknown>) => handlers.get(name)!(args);
 
-  it('registers the six ticket tools', () => {
-    for (const t of ['backlog_bind', 'backlog_set_status', 'backlog_ship', 'backlog_unbind', 'backlog_refine', 'backlog_set_gut']) expect(handlers.has(t)).toBe(true);
+  it('registers the seven ticket tools', () => {
+    for (const t of ['backlog_bind', 'backlog_set_status', 'backlog_ship', 'backlog_merge', 'backlog_unbind', 'backlog_refine', 'backlog_set_gut']) expect(handlers.has(t)).toBe(true);
   });
 
   it('every ticket tool refuses to run without a Claude Code session id', async () => {
@@ -107,6 +107,7 @@ describe('ticket tools → client', () => {
       ['backlog_unbind', { key: 'TCK-5' }],
       ['backlog_refine', { key: 'TCK-5', text: 'x' }],
       ['backlog_ship', { key: 'TCK-5', commit: 'abc1234' }],
+      ['backlog_merge', { key: 'TCK-5', into: 'TCK-6' }],
     ] as const) {
       const res = await run(name, args);
       expect(res.isError).toBe(true);
@@ -224,6 +225,23 @@ describe('ticket tools → client', () => {
     expect(ship.safeParse({ key: 'TCK-1' }).success).toBe(false); // the commit is required
   });
 
+  it('TCK-1889: backlog_merge sends the caller and the surviving ticket to /merge', async () => {
+    process.env.CLAUDE_CODE_SESSION_ID = SESSION;
+    await run('backlog_merge', { key: 'TCK-1885', into: 'TCK-1886' });
+    expect(calls).toEqual([['backlogMerge', 'TCK-1885', { session_id: SESSION, machine: 'Test Machine', cwd: '/work/proj', into: 'TCK-1886' }]]);
+    const merge = z.object(schemas.get('backlog_merge')!);
+    expect(merge.safeParse({ key: 'TCK-1' }).success).toBe(false); // the target is required
+  });
+
+  it('TCK-1889: merged is set only by backlog_merge, and backlog_get can list it', () => {
+    const status = z.object(schemas.get('backlog_set_status')!);
+    expect(status.safeParse({ key: 'TCK-1', status: 'merged' }).success).toBe(false);
+    const bind = z.object(schemas.get('backlog_bind')!);
+    expect(bind.safeParse({ key: 'TCK-1', status: 'merged' }).success).toBe(false);
+    const get = z.object(schemas.get('backlog_get')!);
+    expect(get.safeParse({ status: 'merged' }).success).toBe(true);
+  });
+
   it('Claude Code cannot even ask for created or dropped', () => {
     const status = z.object(schemas.get('backlog_set_status')!);
     expect(status.safeParse({ key: 'TCK-1', status: 'dropped' }).success).toBe(false);
@@ -336,7 +354,7 @@ describe('noesis-mcp setup installs the ticket skill and the v3 conventions bloc
     expect(skill).toContain('link TCK-<n> [status] [--force]');
     expect(skill).toContain('70%–120%');
     const md = fs.readFileSync(path.join(home, '.claude', 'CLAUDE.md'), 'utf8');
-    expect(md).toContain('<!-- noesis-mcp-server:start v5 -->');
+    expect(md).toContain('<!-- noesis-mcp-server:start v6 -->');
     expect(md).toContain('### Noesis tickets (Jot page, TCK-<n>)');
     expect(md).toContain('New work in a bound session');
     expect(md).toContain('TICKET_CLOSED');
@@ -347,6 +365,10 @@ describe('noesis-mcp setup installs the ticket skill and the v3 conventions bloc
     expect(skill).toMatch(/header is exactly `Ticket`/);
     expect(skill).toContain('### `ship` — the ship step');
     expect(skill).toContain('backlog_ship(key, commit)');
+    // TCK-1889: merging marks the other ticket Merged, in both
+    expect(skill).toContain('## Merging two tickets');
+    expect(skill).toContain('backlog_merge(key, into)');
+    expect(md).toContain('mcp__noesis__backlog_merge(key, into)');
     expect(md).toContain('mcp__noesis__backlog_ship');
     expect(md).toContain('~/.claude/noesis-ticket.json');
     expect(md).not.toMatch(/Claude Code/); // client-neutral: the block also feeds Copilot

@@ -49,7 +49,7 @@ interface BlockSpec {
 }
 
 // Core conventions — always installed (unless --skills-only).
-const CORE_BLOCK_VERSION = 'v5'; // v2 (2.5.0): + Noesis tickets section; v3 (2.6.0): + new work in a bound session; v4 (2.7.0): + the "which ticket?" checkpoint and ship; v5 (2.9.0): + ready_to_merge means only "ship it" is left, and the Ship / Waiting questions
+const CORE_BLOCK_VERSION = 'v6'; // v2 (2.5.0): + Noesis tickets section; v3 (2.6.0): + new work in a bound session; v4 (2.7.0): + the "which ticket?" checkpoint and ship; v5 (2.9.0): + ready_to_merge means only "ship it" is left, and the Ship / Waiting questions; v6 (2.10.0): + backlog_merge and the Merged status
 const CORE_BLOCK: BlockSpec = {
   templateFile: 'claude-md-block.md',
   startMarker: `<!-- noesis-mcp-server:start ${CORE_BLOCK_VERSION} -->`,
@@ -435,7 +435,7 @@ async function resolveCaptureChoice(options: SetupOptions, alreadyInstalled: boo
 // plan steps (back to Planning after a rejected plan, and no other status), and a closed ticket never moves. The copy (not the package
 // path, as the capture hook uses) gives a stable path that survives an npx cache or a
 // moved checkout; every setup run while the hook is installed refreshes the copy, so an
-// upgrade never leaves an old hook behind. It also allows the six ticket tools, so the
+// upgrade never leaves an old hook behind. It also allows the ticket tools, so the
 // bookkeeping never stops at a permission prompt, and writes the per-computer switch file
 // ~/.claude/noesis-ticket.json ({"enabled": true, "repos": []}) when there is none. Listing
 // repos there turns on the "which ticket?" checkpoint, the commit trailer, the push read-back
@@ -452,7 +452,7 @@ const TICKET_HOOK_EVENTS: ReadonlyArray<{ event: string; matcher: string }> = [
   { event: 'UserPromptSubmit', matcher: '' },
   { event: 'PreToolUse', matcher: '*' },
   // Bash: the branch record and the push read-back; AskUserQuestion: the owner's "Ticket" answer.
-  { event: 'PostToolUse', matcher: 'ExitPlanMode|Bash|AskUserQuestion|mcp__noesis__backlog_(bind|set_status|unbind|refine|ship)' },
+  { event: 'PostToolUse', matcher: 'ExitPlanMode|Bash|AskUserQuestion|mcp__noesis__backlog_(bind|set_status|unbind|refine|ship|merge)' },
   // Stale bindings, the reconcile and the /clear hint; never on compact.
   { event: 'SessionStart', matcher: 'startup|resume|clear' },
 ];
@@ -467,6 +467,7 @@ const TICKET_TOOLS_ALLOW = [
   'mcp__noesis__backlog_unbind',
   'mcp__noesis__backlog_refine',
   'mcp__noesis__backlog_ship',
+  'mcp__noesis__backlog_merge',
   'mcp__noesis__backlog_set_gut',
 ];
 
@@ -673,9 +674,9 @@ async function resolveTicketHookChoice(options: SetupOptions, alreadyInstalled: 
   console.log('  When this session works on a Jot ticket (TCK-<n>), the hook reminds Claude of the');
   console.log('  ticket on every prompt and moves its status at the plan steps (Ready to implement,');
   console.log('  then Implementing, and back to Planning if you reject the plan) — never any other status,');
-  console.log('  and never for a Shipped or Dropped ticket.');
+  console.log('  and never for a Shipped, Merged or Dropped ticket.');
   console.log('  It copies a small, fail-safe script to ~/.claude/hooks/, adds four hook entries');
-  console.log('  and six allowed ticket tools to ~/.claude/settings.json, and writes the switch file');
+  console.log('  and the allowed ticket tools to ~/.claude/settings.json, and writes the switch file');
   console.log('  ~/.claude/noesis-ticket.json if there is none.');
   const suffix = alreadyInstalled ? ' [Y/n] ' : ' [y/N] ';
   return promptYesNo(`Install this optional hook?${suffix}`, alreadyInstalled);
