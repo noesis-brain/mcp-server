@@ -108,9 +108,14 @@ Resolve each to an ID with `mcp__noesis__search_notes`. An edge grounded in a li
 note's own text is worth more than any similarity score; keep the line as evidence.
 
 **Accept rule.** Accept a candidate when S1 found it, or two of S2-S4 found it, or one of S2-S4
-found it together with S5, S6 or a **read closely** tier from S7 (5+ own marks, 15+ minutes of
-reading, or 3+ separate days). A source alone, S7 included, is never enough: a note the user
-read closely about another subject is not related.
+found it together with S5 or S6. A **read closely** tier from S7 can be the second signal only
+next to direct evidence: S3 (a shared identifier), S4 (the topic query), or a graph link to or
+from the note itself, never a two-hop S2 neighbour. A source alone, S7 included, is never
+enough: a note the user read closely about another subject is not related.
+
+**S7 tiers are relative to the user.** *Read closely* is the user's top 20% of read notes by
+reading score, *read* the top 50% (absolute thresholds only while the user has fewer than 10
+read notes). A heavy marker reads almost every note "closely" by any fixed threshold.
 
 **Rank** accepted candidates by the number of sources, then by the S7 reading score, then by
 similarity. So, within the cap, the notes the user has read closely come first.

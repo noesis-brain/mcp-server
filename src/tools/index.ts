@@ -2368,7 +2368,7 @@ export function registerTools(server: McpServer, services: ToolServices): void {
         message += `\n`;
       }
 
-      message += `**Candidates, ranked.** Sources \`graph\` and \`identifier\` are topical; \`similar\` and \`code\` only corroborate. A candidate meets the accept rule with two topical sources, or one plus a corroborating source or a closely read tier.\n\n`;
+      message += `**Candidates, ranked.** Sources \`graph\` and \`identifier\` are topical; \`similar\` and \`code\` only corroborate. A candidate meets the accept rule with two topical sources, or one plus a corroborating source. A closely read tier (the user's top 20% of read notes) is a second signal only next to direct evidence: a shared identifier or a one-hop graph link, never a two-hop link.\n\n`;
       if (candidates.length === 0) {
         message += `_No candidates: no graph neighbours, shared ticket IDs, embedding neighbours or shared codebases._\n\n`;
       }
@@ -2406,7 +2406,7 @@ export function registerTools(server: McpServer, services: ToolServices): void {
    */
   server.tool(
     'get_reading_signals',
-    "Get the user's reading signals for up to 50 notes: focus time, the first and last read, the number of separate days read, own marks (highlights, rectangles, ink, ...), accepted Skim-Read marks, heading markers, bookmarks, favorite, pinned, points, and the derived tier (read_closely / read / unread) and score. Use it to rank relation candidates; reading alone never makes a note related.",
+    "Get the user's reading signals for up to 50 notes: focus time, the first and last read, the number of separate days read, own marks (highlights, rectangles, ink, ...), accepted Skim-Read marks, heading markers, bookmarks, favorite, pinned, points, the score, and the tier relative to the user's own notes (read_closely = top 20% of read notes by score, read = top 50%, unread otherwise). Use it to rank relation candidates; reading alone never makes a note related.",
     {
       note_ids: z.array(z.number()).min(1).max(50).describe('Note IDs (at most 50)'),
     },
@@ -2416,7 +2416,7 @@ export function registerTools(server: McpServer, services: ToolServices): void {
         return { content: [{ type: 'text', text: 'No reading signals: none of these notes is yours, or they are trashed or in a locked space.' }] };
       }
       const lines = signals.map(formatReadingLine);
-      return { content: [{ type: 'text', text: `**Reading signals** (read closely = 5+ marks, 15+ min or 3+ days; read = any mark or 3+ min)\n\n${lines.join('\n')}` }] };
+      return { content: [{ type: 'text', text: `**Reading signals** (tiers are relative to your own notes: read closely = your top 20% by reading score, read = your top 50%)\n\n${lines.join('\n')}` }] };
     }
   );
 
