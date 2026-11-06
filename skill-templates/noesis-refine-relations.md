@@ -81,16 +81,39 @@ For each note in the confirmed set, in order:
 **2a. Read the current relations.** `mcp__noesis__get_note(id)`. This is the only reliable
 read — use it every time, even when you expect none.
 
-**2b. Gather candidates**, in one parallel batch:
-- `mcp__noesis__find_similar_notes(note_id, limit: 15)`
-- `mcp__noesis__search_semantic(query: title + description, limit: 10)`
-- **The body scan — the highest-precision source, and the reason this skill exists.**
-  Read the note content and extract every note it already cites:
-  - file paths ending in `.md` (absolute, `~/Noesis/...`, or bare filenames)
-  - `noesisbrain.com/notes/<id>` URLs — the `<id>` is the target, use it directly
-  - quoted note titles
-  Resolve each to an ID with `mcp__noesis__search_notes`. An edge grounded in a line of the
-  note's own text is worth more than any similarity score; keep the line as evidence.
+**2b. Gather candidates** from seven sources, in one parallel batch where you can. Record,
+for every candidate, which sources found it.
+
+| Source | How | Counts as |
+|---|---|---|
+| S1 body citation | The body scan below | enough alone |
+| S2 graph neighbour | `mcp__noesis__get_relation_graph(<each S1 target>, depth: 1)` | topical |
+| S3 shared identifier | Ticket IDs (`[A-Z]+-\d+`), PR numbers and distinctive names from the body and keywords; `mcp__noesis__search_notes` for each. A hit counts when the term is in its title, description or keywords | topical |
+| S4 topic query | `mcp__noesis__search_semantic` on the note's key lines plus its keywords, **with the template's genre words removed** ("Teams Chat", "meeting", "digest", people's names) | topical |
+| S5 shared code | `mcp__noesis__search_by_related_code(<path>)` for each related codebase of the note | corroboration only |
+| S6 own embedding | `mcp__noesis__find_similar_notes(note_id, limit: 20)` (captures are left out) | corroboration only |
+| S7 reading | `mcp__noesis__get_reading_signals` on every candidate, plus `mcp__noesis__list_most_read_notes(codebase_id)` for each related codebase | lowers the bar only |
+
+`mcp__noesis__update_relations(note_id)` **without** `relations` runs S2, S3, S5, S6 and S7 on
+the server and returns ranked candidates with their sources, evidence and reading tier. Use it
+as the first batch, then add S1 and S4.
+
+**The body scan — the highest-precision source, and the reason this skill exists.** Read the
+note content and extract every note it already cites:
+- file paths ending in `.md` (absolute, `~/Noesis/...`, or bare filenames)
+- `noesisbrain.com/notes/<id>` URLs — the `<id>` is the target, use it directly
+- quoted note titles
+
+Resolve each to an ID with `mcp__noesis__search_notes`. An edge grounded in a line of the
+note's own text is worth more than any similarity score; keep the line as evidence.
+
+**Accept rule.** Accept a candidate when S1 found it, or two of S2-S4 found it, or one of S2-S4
+found it together with S5, S6 or a **read closely** tier from S7 (5+ own marks, 15+ minutes of
+reading, or 3+ separate days). A source alone, S7 included, is never enough: a note the user
+read closely about another subject is not related.
+
+**Rank** accepted candidates by the number of sources, then by the S7 reading score, then by
+similarity. So, within the cap, the notes the user has read closely come first.
 
 **2c. Filter.** Drop captures, drop the note itself (the MCP write path does **not** reject
 self-links), drop anything that fails to resolve. Never invent an ID — if a cited note cannot
@@ -118,7 +141,7 @@ Note 2923  BTO 12.3 Aug Sprint 0        edges 0 -> 25
   + add   references  3611  BPLAT-14016 UltraLite Simple Serialization
           evidence: "my-git/issues/BPLAT-14016-phoenix-tsc-ultralite...md"
   + add   related     2924  Epsilon Branch Merge Convention
-          evidence: similar 0.81, both cover the Epsilon merge workflow
+          evidence: [S3+S6] shares IDEA-1579; similar 0.81 · read closely: 17 marks, 4 days
   ! unresolved: "support-https-print-portal-investigation.md" (no match)
 ```
 
@@ -155,8 +178,9 @@ confirm the shape.
 - **Read before write, every time.** The write is a replace; skipping 2a loses relations.
 - **The body scan is the differentiator.** If you skip it, this skill is just a slower
   version of the in-app suggester.
-- **Evidence or no edge.** Every proposed link needs either a quoted line from the note or a
-  similarity score. "These feel related" is not a reason.
+- **Evidence or no edge.** Every proposed link needs a quoted line from the note, or the
+  sources the accept rule asks for. "These feel related" is not a reason, and neither is
+  "the user read it a lot".
 - **Sequential per note.** Parallel `get_note` batches race the API rate limit; the
   *candidate gathering* inside one note (2b) is the part to parallelize.
 - **Report every cap.** A truncated batch, a dropped candidate, an unresolved citation — all

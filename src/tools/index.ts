@@ -8,7 +8,7 @@ import * as path from 'path';
 import * as os from 'os';
 import * as yaml from 'js-yaml';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
-import { NoesisClient, type LocalFile, type EditedOnlineNote, type Note, type OsKey, CLIENT_OS, getActivePathFromMap, expandHome } from '../api/NoesisClient.js';
+import { NoesisClient, type LocalFile, type EditedOnlineNote, type Note, type OsKey, type ReadingSignals, CLIENT_OS, getActivePathFromMap, expandHome } from '../api/NoesisClient.js';
 import { parseNoteReference, resolvePathReference, rootLocalBase } from '../resolve/noteRef.js';
 import { formatRootsList } from '../resolve/rootsFormat.js';
 import type { SyncResult, SyncStatus, BidirectionalSyncResult } from '../types/index.js';
@@ -194,6 +194,36 @@ function getUniqueFilePath(filePath: string): string {
     counter++;
   }
   return newPath;
+}
+
+const READING_TIER_LABEL: Record<ReadingSignals['tier'], string> = {
+  read_closely: 'read closely',
+  read: 'read',
+  unread: 'unread',
+};
+
+/** "read closely: 17 marks, 42 min, 4 days" — the reading tier with its strongest evidence. */
+function formatReadingShort(r: Pick<ReadingSignals, 'tier' | 'own_marks' | 'focus_seconds' | 'active_days'>): string {
+  const parts = [
+    r.own_marks > 0 ? `${r.own_marks} mark${r.own_marks === 1 ? '' : 's'}` : null,
+    r.focus_seconds >= 60 ? `${Math.round(r.focus_seconds / 60)} min` : null,
+    r.active_days > 1 ? `${r.active_days} days` : null,
+  ].filter(Boolean);
+  return parts.length > 0 ? `${READING_TIER_LABEL[r.tier]}: ${parts.join(', ')}` : READING_TIER_LABEL[r.tier];
+}
+
+/** One line per note for get_reading_signals and list_most_read_notes. */
+function formatReadingLine(s: ReadingSignals): string {
+  const extras = [
+    s.heading_markers > 0 ? `${s.heading_markers} heading markers` : null,
+    s.bookmarks > 0 ? `${s.bookmarks} bookmarks` : null,
+    s.accepted_skim_marks > 0 ? `${s.accepted_skim_marks} accepted Skim-Read marks` : null,
+    s.is_favorite ? 'favorite' : null,
+    s.is_pinned ? 'pinned' : null,
+    s.points > 0 ? `${s.points} pts` : null,
+    s.last_active_at ? `last read ${String(s.last_active_at).slice(0, 10)}` : null,
+  ].filter(Boolean);
+  return `**${s.note_id}.** ${s.title} — ${formatReadingShort(s)} · score ${s.score}${extras.length ? ` · ${extras.join(', ')}` : ''}`;
 }
 
 export interface ToolServices {
@@ -407,6 +437,20 @@ export function registerTools(server: McpServer, services: ToolServices): void {
       }
       if ((note as any).quality_score != null) {
         metadata += `\n**Quality:** ${(note as any).quality_score}/100`;
+      }
+      // Signals the owner set, and how closely the user has read the note (TCK-1884).
+      const signalFlags = [
+        (note as any).is_favorite ? 'favorite' : null,
+        (note as any).is_pinned ? 'pinned' : null,
+        Number((note as any).points) > 0 ? `${(note as any).points} pts` : null,
+      ].filter(Boolean);
+      if (signalFlags.length > 0) {
+        metadata += `\n**Signals:** ${signalFlags.join(', ')}`;
+      }
+      const reading = (note as any).reading as ReadingSignals | undefined;
+      if (reading) {
+        metadata += `\n**Reading:** ${formatReadingShort(reading)} · score ${reading.score}`
+          + (reading.last_active_at ? ` · last read ${String(reading.last_active_at).slice(0, 10)}` : '');
       }
 
       // Relations (from JSONB column)
@@ -2295,7 +2339,9 @@ export function registerTools(server: McpServer, services: ToolServices): void {
         };
       }
 
-      const otherNotes = await client.getNotesForRelationAnalysis(note_id, { limit: 30 });
+      // Ranked candidates with their evidence (TCK-1884). This used to list the 30 most
+      // recently modified notes, which said nothing about relatedness.
+      const candidates = await client.getRelationCandidates(note_id, { limit: 30 });
 
       let message = `**Find Relations for:** ${note.title} (ID: ${note.id})\n\n`;
       message += `**Description:** ${note.description || 'None'}\n`;
@@ -2322,20 +2368,28 @@ export function registerTools(server: McpServer, services: ToolServices): void {
         message += `\n`;
       }
 
-      message += `**Other Notes to Consider:**\n\n`;
-      for (const other of otherNotes) {
-        message += `**${other.id}.** ${other.title}\n`;
-        if (other.description) {
-          message += `   ${other.description.substring(0, 100)}${other.description.length > 100 ? '...' : ''}\n`;
-        }
-        if (other.keywords.length > 0) {
-          message += `   Keywords: ${other.keywords.slice(0, 5).join(', ')}\n`;
+      message += `**Candidates, ranked.** Sources \`graph\` and \`identifier\` are topical; \`similar\` and \`code\` only corroborate. A candidate meets the accept rule with two topical sources, or one plus a corroborating source or a closely read tier.\n\n`;
+      if (candidates.length === 0) {
+        message += `_No candidates: no graph neighbours, shared ticket IDs, embedding neighbours or shared codebases._\n\n`;
+      }
+      for (const c of candidates) {
+        const flags = [
+          c.meets_accept_rule ? '✅ meets the accept rule' : 'weak',
+          c.already_related ? 'already related' : null,
+          c.reading && c.reading.tier !== 'unread' ? formatReadingShort(c.reading) : null,
+        ].filter(Boolean).join(' · ');
+        message += `**${c.id}.** ${c.title}\n`;
+        message += `   [${c.sources.join('+')}] ${flags}\n`;
+        if (c.reasons.length > 0) message += `   Evidence: ${c.reasons.join('; ')}\n`;
+        if (c.description) {
+          message += `   ${c.description.substring(0, 100)}${c.description.length > 100 ? '...' : ''}\n`;
         }
         message += `\n`;
       }
 
       message += `---\n`;
       message += `**Relation Types:**\n`;
+      message += `- \`related\`: Both docs are about the same subject\n`;
       message += `- \`references\`: This doc mentions/links to another\n`;
       message += `- \`implements\`: This doc implements a plan/design from another\n`;
       message += `- \`extends\`: This doc builds on/extends another\n`;
@@ -2343,6 +2397,44 @@ export function registerTools(server: McpServer, services: ToolServices): void {
       message += `Call \`update_relations\` with detected relations.`;
 
       return { content: [{ type: 'text', text: message }] };
+    }
+  );
+
+  /**
+   * Reading signals (TCK-1884): what the user's own reading says about notes, so note-creating
+   * skills can prefer, among topically related notes, the ones the user has actually read.
+   */
+  server.tool(
+    'get_reading_signals',
+    "Get the user's reading signals for up to 50 notes: focus time, the first and last read, the number of separate days read, own marks (highlights, rectangles, ink, ...), accepted Skim-Read marks, heading markers, bookmarks, favorite, pinned, points, and the derived tier (read_closely / read / unread) and score. Use it to rank relation candidates; reading alone never makes a note related.",
+    {
+      note_ids: z.array(z.number()).min(1).max(50).describe('Note IDs (at most 50)'),
+    },
+    async (args) => {
+      const signals = await client.getReadingSignals(args.note_ids);
+      if (signals.length === 0) {
+        return { content: [{ type: 'text', text: 'No reading signals: none of these notes is yours, or they are trashed or in a locked space.' }] };
+      }
+      const lines = signals.map(formatReadingLine);
+      return { content: [{ type: 'text', text: `**Reading signals** (read closely = 5+ marks, 15+ min or 3+ days; read = any mark or 3+ min)\n\n${lines.join('\n')}` }] };
+    }
+  );
+
+  server.tool(
+    'list_most_read_notes',
+    "List the user's most-read notes, best read first, optionally narrowed to one codebase (by ID, see list_codebases), a full-text query or a root. Captures are left out. Use it as a candidate source when linking a new note: a closely read note about the same code or topic is one the user relies on.",
+    {
+      codebase_id: z.number().optional().describe('Only notes linked to this codebase'),
+      query: z.string().optional().describe('Full-text query, as in search_notes'),
+      root: z.string().optional().describe('Only notes in this root'),
+      limit: z.number().min(1).max(50).optional().describe('Maximum results (default: 20, max: 50)'),
+    },
+    async (args) => {
+      const notes = await client.listMostReadNotes({ codebaseId: args.codebase_id, query: args.query, root: args.root, limit: args.limit });
+      if (notes.length === 0) {
+        return { content: [{ type: 'text', text: 'No read notes match.' }] };
+      }
+      return { content: [{ type: 'text', text: `**Most-read notes** (${notes.length})\n\n${notes.map(formatReadingLine).join('\n')}` }] };
     }
   );
 
@@ -2877,13 +2969,14 @@ export function registerTools(server: McpServer, services: ToolServices): void {
    */
   server.tool(
     'generate_embeddings',
-    'Generate embeddings for notes that don\'t have them. Uses Gemini API to create 768-dim vectors for semantic search. Processes in batches with progress reporting.',
+    'Generate embeddings for notes that don\'t have them. Uses Gemini API to create 768-dim vectors for semantic search. Processes in batches with progress reporting. With `reembed: true`, also re-embeds notes whose vector was made from an older embedding text (the raw file, before title-first topic text).',
     {
       batch_size: z.number().min(1).max(50).optional().describe('Number of notes to process (default: 10, max: 50)'),
-      root: z.string().optional().describe('Filter to specific root folder')
+      root: z.string().optional().describe('Filter to specific root folder'),
+      reembed: z.boolean().optional().describe('Also re-embed notes embedded from an older text version (default: false)')
     },
     async (args) => {
-      const { batch_size = 10, root } = args;
+      const { batch_size = 10, root, reembed = false } = args;
 
       if (!embeddingsEnabled) {
         return {
@@ -2896,25 +2989,33 @@ export function registerTools(server: McpServer, services: ToolServices): void {
       }
 
       // Get notes without embeddings
-      const notes = await client.getNotesWithoutEmbeddings({ limit: batch_size, root });
+      const notes = await client.getNotesWithoutEmbeddings({ limit: batch_size, root, stale: reembed });
 
       if (notes.length === 0) {
         const context = root ? ` in "${root}"` : '';
         return {
           content: [{
             type: 'text',
-            text: `✅ All notes${context} already have embeddings!`
+            text: reembed
+              ? `✅ All notes${context} have embeddings made from the current text version!`
+              : `✅ All notes${context} already have embeddings!`
           }]
         };
       }
 
       let message = `**Generating embeddings for ${notes.length} notes...**\n\n`;
 
-      // Prepare texts for batch processing
+      // Embed the server-built topic text when the backend sends it (TCK-1884), so a vector
+      // made here matches one the backend makes; an older backend sends only the content.
       const texts = notes.map(note => ({
         id: note.id,
-        text: `${note.title}\n\n${note.content}`.trim()
+        text: (typeof note.embedding_text === 'string' && note.embedding_text.length > 0
+          ? note.embedding_text
+          : `${note.title}\n\n${note.content}`).trim()
       }));
+      const versionById = new Map<number, number | undefined>(
+        notes.map(note => [note.id, Number.isInteger(note.embedding_text_version) ? note.embedding_text_version : undefined])
+      );
 
       const results = await generateEmbeddingsBatch(texts);
 
@@ -2925,7 +3026,7 @@ export function registerTools(server: McpServer, services: ToolServices): void {
 
       for (const result of results) {
         try {
-          const updated = await client.updateNoteEmbedding(result.id, result.embedding);
+          const updated = await client.updateNoteEmbedding(result.id, result.embedding, versionById.get(result.id));
           if (updated) {
             success++;
             const note = notes.find(n => n.id === result.id);
@@ -2960,8 +3061,11 @@ export function registerTools(server: McpServer, services: ToolServices): void {
       message += `- Total notes: ${stats.total}\n`;
       message += `- With embeddings: ${stats.withEmbeddings}\n`;
       message += `- Without embeddings: ${stats.withoutEmbeddings}\n`;
+      if (stats.staleEmbeddings !== undefined) {
+        message += `- Made from an older text version: ${stats.staleEmbeddings}${stats.staleEmbeddings > 0 ? ' (run with `reembed: true`)' : ''}\n`;
+      }
 
-      if (stats.withoutEmbeddings > 0) {
+      if (stats.withoutEmbeddings > 0 || (reembed && (stats.staleEmbeddings ?? 0) > 0)) {
         message += `\n_Run again to process more notes._`;
       }
 
@@ -3050,10 +3154,11 @@ export function registerTools(server: McpServer, services: ToolServices): void {
     'Find notes that are semantically similar to a given note. Useful for discovering related content and potential document relationships.',
     {
       note_id: z.number().describe('The ID of the note to find similar notes for'),
-      limit: z.number().min(1).max(20).optional().describe('Maximum results (default: 5, max: 20)')
+      limit: z.number().min(1).max(20).optional().describe('Maximum results (default: 5, max: 20)'),
+      include_captures: z.boolean().optional().describe('Also return capture notes (live mirrors of coding sessions); left out by default')
     },
     async (args) => {
-      const { note_id, limit = 5 } = args;
+      const { note_id, limit = 5, include_captures = false } = args;
 
       if (!embeddingsEnabled) {
         return {
@@ -3079,7 +3184,7 @@ export function registerTools(server: McpServer, services: ToolServices): void {
         }
 
         // Find similar notes
-        const similarNotes = await client.findSimilarNotes(note_id, { limit });
+        const similarNotes = await client.findSimilarNotes(note_id, { limit, includeCaptures: include_captures });
 
         if (similarNotes.length === 0) {
           return {

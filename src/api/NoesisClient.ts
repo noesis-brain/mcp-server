@@ -73,6 +73,39 @@ export function getActivePathFromMap(localPaths: Record<string, string> | null |
   return expandHome(localPaths[CLIENT_OS] || '');
 }
 
+/** What the user's own reading says about a note (backend services/readingSignals.ts). */
+export interface ReadingSignals {
+  note_id: number;
+  title: string;
+  focus_seconds: number;
+  first_active_at: string | null;
+  last_active_at: string | null;
+  active_days: number;
+  own_marks: number;
+  accepted_skim_marks: number;
+  heading_markers: number;
+  bookmarks: number;
+  points: number;
+  is_favorite: boolean;
+  is_pinned: boolean;
+  tier: 'read_closely' | 'read' | 'unread';
+  score: number;
+}
+
+/** One ranked relation candidate (backend services/relationCandidates.ts). */
+export interface RelationCandidate {
+  id: number;
+  title: string;
+  description: string | null;
+  sources: Array<'graph' | 'identifier' | 'similar' | 'code'>;
+  reasons: string[];
+  similarity: number | null;
+  already_related: boolean;
+  reading: Pick<ReadingSignals, 'tier' | 'score' | 'own_marks' | 'focus_seconds' | 'active_days'> | null;
+  meets_accept_rule: boolean;
+  score: number;
+}
+
 // Types matching PostgresAdapter interface
 export interface Codebase {
   id: number;
@@ -1161,25 +1194,50 @@ export class NoesisClient {
     return this.getNoteForEnhancement(id);
   }
 
-  async getNotesForRelationAnalysis(
-    excludeId: number,
-    options: { limit?: number; root?: string } = {}
-  ): Promise<any[]> {
-    const params = new URLSearchParams({ limit: String(options.limit || 50) });
-    if (options.root) params.append('root', options.root);
+  // ============================================
+  // READING SIGNALS AND RELATION CANDIDATES (TCK-1884)
+  // ============================================
 
-    const result = await this.request<{ notes: any[] }>('GET', `/api/mcp/notes?${params}`);
-    return result.notes.filter(n => n.id !== excludeId);
+  /** The caller's reading signals of each note (focus time, read days, marks, tier, score). */
+  async getReadingSignals(noteIds: number[]): Promise<ReadingSignals[]> {
+    const result = await this.request<{ signals: ReadingSignals[] }>(
+      'POST', '/api/mcp/notes/reading-signals', { note_ids: noteIds }
+    );
+    return result.signals;
+  }
+
+  /** The caller's notes with reading activity, best read first. */
+  async listMostReadNotes(options: { codebaseId?: number; query?: string; root?: string; limit?: number } = {}): Promise<ReadingSignals[]> {
+    const params = new URLSearchParams();
+    if (options.codebaseId !== undefined) params.append('codebase_id', String(options.codebaseId));
+    if (options.query) params.append('q', options.query);
+    if (options.root) params.append('root', options.root);
+    if (options.limit) params.append('limit', String(options.limit));
+    const result = await this.request<{ notes: ReadingSignals[] }>('GET', `/api/mcp/notes/most-read?${params}`);
+    return result.notes;
+  }
+
+  /** Ranked relation candidates for a note, with sources, reasons and the accept rule. */
+  async getRelationCandidates(noteId: number, options: { limit?: number } = {}): Promise<RelationCandidate[]> {
+    const params = new URLSearchParams();
+    if (options.limit) params.append('limit', String(options.limit));
+    const result = await this.request<{ candidates: RelationCandidate[] }>(
+      'GET', `/api/mcp/notes/${noteId}/relation-candidates?${params}`
+    );
+    return result.candidates;
   }
 
   // ============================================
   // EMBEDDINGS
   // ============================================
 
-  async getNotesWithoutEmbeddings(options: { limit?: number; root?: string } = {}): Promise<any[]> {
+  async getNotesWithoutEmbeddings(options: { limit?: number; root?: string; stale?: boolean } = {}): Promise<any[]> {
     const params = new URLSearchParams();
     if (options.limit) params.append('limit', String(options.limit));
     if (options.root) params.append('root', options.root);
+    // stale: also notes embedded from an older text version; each note then carries the
+    // server-built embedding_text and embedding_text_version to embed and send back (TCK-1884).
+    if (options.stale) params.append('stale', 'true');
 
     const result = await this.request<{ notes: any[] }>(
       'GET',
@@ -1188,9 +1246,9 @@ export class NoesisClient {
     return result.notes;
   }
 
-  async updateNoteEmbedding(id: number, embedding: number[]): Promise<boolean> {
+  async updateNoteEmbedding(id: number, embedding: number[], textVersion?: number): Promise<boolean> {
     try {
-      await this.request('PUT', `/api/mcp/notes/${id}/embedding`, { embedding });
+      await this.request('PUT', `/api/mcp/notes/${id}/embedding`, { embedding, text_version: textVersion });
       return true;
     } catch {
       return false;
@@ -1211,10 +1269,11 @@ export class NoesisClient {
 
   async findSimilarNotes(
     noteId: number,
-    options: { limit?: number } = {}
+    options: { limit?: number; includeCaptures?: boolean } = {}
   ): Promise<any[]> {
     const params = new URLSearchParams();
     if (options.limit) params.append('limit', String(options.limit));
+    if (options.includeCaptures) params.append('include_captures', 'true');
 
     const result = await this.request<{ notes: any[] }>(
       'GET',
@@ -1235,11 +1294,13 @@ export class NoesisClient {
     total: number;
     withEmbeddings: number;
     withoutEmbeddings: number;
+    staleEmbeddings?: number;
   }> {
     const result = await this.request<{
       total: number;
       withEmbeddings: number;
       withoutEmbeddings: number;
+      staleEmbeddings?: number;
     }>('GET', '/api/mcp/stats/embeddings');
     return result;
   }
