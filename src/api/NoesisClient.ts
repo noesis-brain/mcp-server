@@ -1399,6 +1399,42 @@ export class NoesisClient {
   }
 
   // ============================================
+  // SMART LINKS (TCK-1883)
+  // ============================================
+
+  async getSmartLinkSettings(): Promise<SmartLinkSettingsInput> {
+    return (await this.request<{ settings: SmartLinkSettingsInput }>('GET', '/api/smart-links/settings')).settings;
+  }
+
+  /** Save the whole object; the answer carries the previous settings for a rollback. */
+  async saveSmartLinkSettings(settings: SmartLinkSettingsInput): Promise<{ settings: SmartLinkSettingsInput; previous: SmartLinkSettingsInput }> {
+    return this.request('PUT', '/api/smart-links/settings', { settings });
+  }
+
+  async scanSmartLinkTypes(): Promise<SmartLinkScanResult> {
+    return this.request<SmartLinkScanResult>('GET', '/api/smart-links/scan');
+  }
+
+  /** Try samples against the saved settings, or candidate ones (a dry run: nothing is saved). */
+  async testSmartLinks(samples: string[], settings?: SmartLinkSettingsInput): Promise<SmartLinkTestResult[]> {
+    const body = await this.request<{ results: SmartLinkTestResult[] }>('POST', '/api/smart-links/test', {
+      samples,
+      ...(settings ? { settings } : {}),
+    });
+    return body.results;
+  }
+
+  /** What "Make smart links in this note" would change — read-only. */
+  async previewSmartLinksInNote(noteId: number, settings?: SmartLinkSettingsInput): Promise<SmartLinkPreviewItem[]> {
+    const body = await this.request<{ items: SmartLinkPreviewItem[] }>(
+      'POST',
+      `/api/smart-links/notes/${noteId}/preview`,
+      settings ? { settings } : {},
+    );
+    return body.items;
+  }
+
+  // ============================================
   // NAVIS
   // ============================================
 
@@ -1586,4 +1622,49 @@ export class NoesisClient {
     return this.requestWithCode('PUT', `/api/mcp/backlog/issues/${encodeURIComponent(key)}/gut`, body);
   }
 
+}
+
+// ── Smart links (TCK-1883) — the server's shapes, as these tools use them ──────────────────
+
+export interface SmartLinkTypeInput {
+  id: string;
+  preset: 'jira' | 'github' | 'noesis' | 'web' | 'custom';
+  host?: string;
+  projects?: string[];
+  owner?: string;
+  repo?: string;
+  [field: string]: unknown;
+}
+
+export interface SmartLinkSettingsInput {
+  enabled: boolean;
+  types: SmartLinkTypeInput[];
+}
+
+export interface SmartLinkScanResult {
+  jira: { host: string; total: number; projects: { key: string; count: number }[] }[];
+  github: { host: string; owner: string; repo: string; count: number }[];
+  noesisLinks: number;
+  otherSites: { host: string; count: number }[];
+  proposals: { type: SmartLinkTypeInput; selected: boolean; count: number }[];
+}
+
+export interface SmartLinkTestResult {
+  input: string;
+  match: { typeId: string; preset: string; id: string | null; href: string | null; form: string } | null;
+  title: string | null;
+  titleStatus: string;
+  lineStart: { style: string; linkText: string; after: string } | null;
+  inSentence: { style: string; linkText: string; after: string } | null;
+}
+
+export interface SmartLinkPreviewItem {
+  line: number;
+  original: string;
+  replacement: string | null;
+  href: string | null;
+  title: string | null;
+  titleStatus: string;
+  typeId: string | null;
+  style: string | null;
 }

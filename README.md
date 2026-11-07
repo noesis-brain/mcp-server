@@ -289,6 +289,16 @@ The `/noesis-ticket` skill drives them: start a ticket, `link` the session you a
 - `list_navis`, `create_navi`, `get_navi`, `update_navi`, `delete_navi`, `duplicate_navi`, `search_navis` — manage custom AI personas
 - `get_chat_session` — retrieve a Navi chat conversation by ID
 
+### Smart links
+
+Readable link text for pasted URLs and typed keys (Jira issues, GitHub pull requests, Noesis notes, web pages). These tools set up a user's link types and check them, without ever changing a note:
+
+- `smart_links_get_settings` — read the switch and the link types
+- `smart_links_scan_notes` — count the links already in your notes and propose link types (read-only)
+- `smart_links_test` — try sample texts against the saved settings or a candidate (a dry run)
+- `smart_links_preview_note` — what "Make smart links in this note" would change, read-only
+- `smart_links_set_settings` — save the whole settings object; the answer holds the previous one for a rollback
+
 ### Chat + history
 
 - `analyze_knowledge_base` — generate a summary report of your note collection
