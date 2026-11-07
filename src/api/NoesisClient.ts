@@ -1586,4 +1586,19 @@ export class NoesisClient {
     return this.requestWithCode('PUT', `/api/mcp/backlog/issues/${encodeURIComponent(key)}/gut`, body);
   }
 
+  /** TCK-1866: a ticket's components, the full list (any stage; no session needed). */
+  async backlogSetComponents(key: string, components: string[]): Promise<any> {
+    return this.requestWithCode('PUT', `/api/mcp/backlog/issues/${encodeURIComponent(key)}/components`, { components });
+  }
+
+  /** TCK-1866: links two of the user's tickets, both ways. */
+  async backlogLink(key: string, other: string): Promise<any> {
+    return this.requestWithCode('POST', `/api/mcp/backlog/issues/${encodeURIComponent(key)}/links`, { key: other });
+  }
+
+  /** TCK-1866: removes the link between two tickets. */
+  async backlogUnlink(key: string, other: string): Promise<any> {
+    return this.requestWithCode('DELETE', `/api/mcp/backlog/issues/${encodeURIComponent(key)}/links/${encodeURIComponent(other)}`);
+  }
+
 }

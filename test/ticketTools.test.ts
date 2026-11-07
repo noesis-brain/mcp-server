@@ -186,6 +186,22 @@ describe('ticket tools → client', () => {
     expect(calls[1][1]).toBe('/api/note-images/tok-1');
   });
 
+  it('TCK-1866: backlog_set_components and backlog_link need no session and send the key and the values', async () => {
+    delete process.env.CLAUDE_CODE_SESSION_ID;
+    await run('backlog_set_components', { key: 'TCK-5', components: ['Live Voice', 'MCP'] });
+    await run('backlog_link', { key: 'TCK-5', other: 'TCK-9' });
+    await run('backlog_link', { key: 'TCK-5', other: 'TCK-9', unlink: true });
+    expect(calls).toEqual([
+      ['backlogSetComponents', 'TCK-5', ['Live Voice', 'MCP']],
+      ['backlogLink', 'TCK-5', 'TCK-9'],
+      ['backlogUnlink', 'TCK-5', 'TCK-9'],
+    ]);
+    const comps = z.object(schemas.get('backlog_set_components')!);
+    expect(comps.safeParse({ key: 'TCK-5', components: Array.from({ length: 9 }, (_, i) => `P${i}`) }).success).toBe(false);
+    expect(comps.safeParse({ key: 'TCK-5', components: ['x'.repeat(41)] }).success).toBe(false);
+    expect(comps.safeParse({ key: 'TCK-5', components: ['x'.repeat(40)] }).success).toBe(true);
+  });
+
   it('TCK-1845: backlog_set_gut sends the caller, the text, the kind and the difficulty', async () => {
     process.env.CLAUDE_CODE_SESSION_ID = SESSION;
     await run('backlog_set_gut', { key: 'TCK-5', text: 'Reuse the upload route', kind: 'plan', difficulty: 'XL' });
@@ -325,6 +341,24 @@ describe('a refusal keeps its error_code and details', () => {
       'PUT https://example.test/api/mcp/backlog/issues/TCK-1/refined',
       'POST https://example.test/api/mcp/backlog/issues/TCK-1/shipped',
       'GET https://example.test/api/mcp/backlog/issues?status=shipped',
+    ]);
+  });
+
+  it('TCK-1866: the components and links requests — method, path and body', async () => {
+    const seen: Array<{ req: string; body: string | undefined }> = [];
+    globalThis.fetch = vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
+      seen.push({ req: `${init?.method} ${String(url)}`, body: typeof init?.body === 'string' ? init.body : undefined });
+      return new Response('{"links":[]}', { status: 200, headers: { 'Content-Type': 'application/json' } });
+    }) as typeof fetch;
+    const { NoesisClient } = await import('../src/api/NoesisClient.js');
+    const c = new NoesisClient('https://example.test', 'noe_x');
+    await c.backlogSetComponents('TCK-1', ['Live Voice', 'MCP']);
+    await c.backlogLink('TCK-1', 'TCK-2');
+    await c.backlogUnlink('TCK-1', 'TCK-2');
+    expect(seen).toEqual([
+      { req: 'PUT https://example.test/api/mcp/backlog/issues/TCK-1/components', body: JSON.stringify({ components: ['Live Voice', 'MCP'] }) },
+      { req: 'POST https://example.test/api/mcp/backlog/issues/TCK-1/links', body: JSON.stringify({ key: 'TCK-2' }) },
+      { req: 'DELETE https://example.test/api/mcp/backlog/issues/TCK-1/links/TCK-2', body: undefined },
     ]);
   });
 });
