@@ -265,6 +265,25 @@ export interface ChatSessionResult {
   hasMore: boolean;
 }
 
+/** A skill from the user's skill library (/api/user-skills, TCK-1894). The list leaves out body_md. */
+export interface UserSkill {
+  id: number;
+  name: string;
+  description: string;
+  argument_hint: string;
+  body_md?: string;
+  output: 'note';
+  source: 'web' | 'mcp';
+  created_at: string;
+  updated_at: string;
+}
+
+export interface UpsertUserSkillInput {
+  description: string;
+  argument_hint: string;
+  body_md: string;
+}
+
 export interface CreateNaviInput {
   name: string;
   system_prompt: string;
@@ -1426,6 +1445,28 @@ export class NoesisClient {
 
   async deleteNavi(id: number): Promise<void> {
     await this.request<{ success: boolean }>('DELETE', `/api/navis/${id}`);
+  }
+
+  // ============================================
+  // USER SKILLS (TCK-1894)
+  // ============================================
+
+  async listUserSkills(): Promise<UserSkill[]> {
+    const result = await this.request<{ skills: UserSkill[] }>('GET', '/api/user-skills');
+    return result.skills;
+  }
+
+  /** Create or fully replace the caller's skill with this name (fields left empty are cleared). */
+  async upsertUserSkill(name: string, body: UpsertUserSkillInput): Promise<{ skill: UserSkill; created: boolean }> {
+    return this.request<{ skill: UserSkill; created: boolean }>(
+      'PUT',
+      `/api/user-skills/by-name/${encodeURIComponent(name)}`,
+      body
+    );
+  }
+
+  async deleteUserSkill(name: string): Promise<void> {
+    await this.request<{ success: boolean }>('DELETE', `/api/user-skills/by-name/${encodeURIComponent(name)}`);
   }
 
   async duplicateNavi(id: number, name?: string): Promise<Navi> {
