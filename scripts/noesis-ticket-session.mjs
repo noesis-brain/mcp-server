@@ -1091,7 +1091,9 @@ async function coordCheck(sessionId, cwd, entry, now = Date.now()) {
     st.pause = { message_id: pause.message_id, since: oneLine(pause.since, 40), body: oneLine(pause.body, COORD_BODY_MAX) };
   } else if (st.paused) {
     const continued = pause && pause.paused === false && pause.message_id > ((stored && stored.message_id) || 0);
-    if (allAnswered || continued) {
+    // Every read answering ends the pause only when none of them still reports one (an older pause
+    // that another id carries, after the set of ids changed, is still a pause).
+    if (continued || (allAnswered && !(pause && pause.paused === true))) {
       lines.push('[coord] The owner ended the pause: continue where you stopped.');
       st.paused = false;
       delete st.pause;

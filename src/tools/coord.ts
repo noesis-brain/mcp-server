@@ -332,6 +332,29 @@ export function registerCoordTools(server: McpServer, client: NoesisClient): voi
   );
 
   server.tool(
+    'coord_port',
+    'Get this loop\'s dev ports before starting a backend or a frontend: a backend port, a frontend port and a host name under .localhost (tck-<n>.localhost for a ticket), never ones another loop holds. ' +
+      'Start the backend with BACKEND_PORT=<backend_port>, Vite with --port <frontend_port> --strictPort, and open http://<host>:<frontend_port> (a host of its own keeps the browser cookies apart). ' +
+      'Asking again keeps the same slot. action "release" gives it back when the loop is done. Errors: NO_ROOM (all 40 slots are taken; the owner frees one), NOT_FOUND (the ticket is not the user\'s).',
+    {
+      action: z.enum(['get', 'release']).optional().describe('Defaults to get'),
+      ticket: z.string().optional().describe('The ticket the loop works on, like TCK-7: the slot is the ticket\'s'),
+      holder: z.string().regex(/^[A-Za-z0-9._:-]{1,100}$/).optional().describe('Defaults to this session\'s id'),
+    },
+    async (args) => {
+      try {
+        const holder = args.holder ?? sessionId();
+        if (!holder) return errText(new Error('No holder: pass holder, or run inside a Claude Code session (CLAUDE_CODE_SESSION_ID).'));
+        const body: Record<string, unknown> = { holder };
+        if (args.ticket !== undefined) body.ticket = args.ticket;
+        return jsonText(await client.coordPort(args.action ?? 'get', body));
+      } catch (e) {
+        return errText(e);
+      }
+    }
+  );
+
+  server.tool(
     'coord_conflicts',
     'List the open conflicts the scanner reported, the most severe first, with the pair, the kind (C1-C20), the detail, the evidence and when it was first and last seen. all=true adds those resolved in the last week.',
     { all: z.boolean().optional() },

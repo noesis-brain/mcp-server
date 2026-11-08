@@ -3,16 +3,19 @@
 // The conditions and their rules are in references/chief-conflict-catalogue.md.
 //
 //   node coord-scan.mjs --board <tickets.json> [--repo <main checkout>] [--agents <agents.json>]
-//                       [--npm-latest <version>] [--json]
+//                       [--npm-latest <version>] [--plans <plans.json>] [--json]
 //   node coord-scan.mjs --selftest
 //
 // --board is the Jot board as `backlog_get` returns it ({"issues": [...]} or a plain array). The
 // Chief writes it with its MCP tools, so this script holds no API token. --repo defaults to the
 // main checkout of the git repository the current folder is in. --agents replaces
-// `claude agents --json`, and --npm-latest replaces `npm view`, for tests.
+// `claude agents --json`, and --npm-latest replaces `npm view`, for tests. --plans maps ticket keys
+// to plan files ({"TCK-7": "/path/plan.md"}); without it, a planning ticket's plan is the newest
+// ~/.claude/plans/*.md its bound session's transcript names (C15).
 //
 // It only reads: git status, diff, rev-list and worktree list, the files of each worktree, the
-// loop registry (~/.claude/loop-supervisor/<session>.json), `claude agents --json`, `lsof` and
+// loop registry (~/.claude/loop-supervisor/<session>.json), the tail of a planning ticket's session
+// transcript and its plan file, `claude agents --json`, `lsof` and
 // `npm view`. `git merge-tree --write-tree` must write tree objects to compute a merge, so it runs
 // with GIT_OBJECT_DIRECTORY set to a temporary folder (the repository's own objects are only read,
 // as alternates). Every git call runs with GIT_OPTIONAL_LOCKS=0: a plain `git status` refreshes
@@ -43,6 +46,9 @@ const LOW_RISK = [
 const IGNORED = [/(^|\/)[^/]*LOOP-STATE[^/]*\.md$/, /^loop-stack\//, /^\.loop\//, /^\.claude\/worktrees\//, /^\.claude-notes\//];
 const PHASE_RE = /^scripts\/phase(\d+(?:\.\d+)?)-[^/]*\.sql$/;
 const SEVERITY = { high: 0, medium: 1, low: 2 };
+/** Tickets whose plan, not their diff, says what they will touch: C15 reads their plan file. */
+const PLANNING = ['planning', 'ready_to_implement'];
+const TRANSCRIPT_TAIL_BYTES = 4 * 1024 * 1024;
 
 /** A pair of two tickets is always named in ticket-number order (as numbers: TCK-9 before TCK-10), so a change
  *  in the board order never turns one pair into "another" (the server keys a conflict by kind, a and b). Pairs
@@ -194,7 +200,65 @@ function listeners() {
   return out.filter((l) => /node|tsx|vite/i.test(l.command));
 }
 
-export function scan({ repo, board, agents, npm, withProcesses = true }) {
+/** The newest plan file a session's transcript names (Claude Code writes plans to ~/.claude/plans/<name>.md), or null. */
+function planFromTranscript(sid) {
+  if (!sid || !/^[A-Za-z0-9-]{8,64}$/.test(sid)) return null;
+  const cfg = process.env.CLAUDE_CONFIG_DIR || path.join(os.homedir(), '.claude');
+  const root = path.join(cfg, 'projects');
+  // A plan path as Claude Code writes it: under the config folder, absolute, or as ~/.claude/plans/.
+  const esc = (t) => t.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const homeForm = path.resolve(cfg) === path.join(os.homedir(), '.claude') ? '|~\\/\\.claude' : '';
+  const planRe = new RegExp(`(?:${esc(path.resolve(cfg))}${homeForm})\\/plans\\/[A-Za-z0-9._-]+\\.md`, 'g');
+  let file = null;
+  try {
+    for (const d of fs.readdirSync(root)) {
+      const f = path.join(root, d, `${sid}.jsonl`);
+      if (fs.existsSync(f)) { file = f; break; }
+    }
+  } catch { return null; }
+  if (!file) return null;
+  try {
+    const size = fs.statSync(file).size;
+    const fd = fs.openSync(file, 'r');
+    const len = Math.min(size, TRANSCRIPT_TAIL_BYTES);
+    const buf = Buffer.alloc(len);
+    fs.readSync(fd, buf, 0, len, size - len);
+    fs.closeSync(fd);
+    const hits = buf.toString('utf8').match(planRe);
+    if (!hits) return null;
+    const last = hits[hits.length - 1].replace(/^~/, os.homedir());
+    return fs.existsSync(last) ? last : null;
+  } catch { return null; }
+}
+
+/**
+ * The repository files a plan names: the backticked paths under its "Critical files" heading, or,
+ * when it has no such heading, every backticked path in it. A path here has a folder and a file
+ * name (`src/x.ts`, `scripts/phase77.sql`); a trailing slash names a folder.
+ */
+export function planFiles(markdown) {
+  const text = String(markdown || '');
+  const lines = text.split('\n');
+  const start = lines.findIndex((l) => /^#{1,6}\s.*critical files/i.test(l));
+  let section = text;
+  if (start >= 0) {
+    const level = lines[start].match(/^#+/)[0].length;
+    const end = lines.findIndex((l, i) => i > start && /^#{1,6}\s/.test(l) && l.match(/^#+/)[0].length <= level);
+    section = lines.slice(start + 1, end < 0 ? undefined : end).join('\n');
+  }
+  const out = new Set();
+  for (const m of section.matchAll(/`([^`\s]+)`/g)) {
+    const t = m[1].replace(/^\.\//, '').replace(/[:#].*$/, '');
+    // A relative path with a folder: the first segment cannot be empty (an absolute path) or start with ~.
+    if (/^[A-Za-z0-9._@-]+(\/[A-Za-z0-9._@-]+)*\/?$/.test(t) && t.includes('/')) out.add(t);
+  }
+  return [...out];
+}
+
+/** Whether a changed file is one a plan names: the same path, or inside a folder the plan names. */
+const namedBy = (planned, file) => planned.some((p) => (p.endsWith('/') ? file.startsWith(p) : file === p));
+
+export function scan({ repo, board, agents, npm, plans = {}, withProcesses = true }) {
   const main = mainCheckout(repo);
   if (!main) throw new Error(`not a git repository: ${repo}`);
   const mainRef = git(main, ['rev-parse', '--abbrev-ref', 'HEAD']).out || 'main';
@@ -322,6 +386,21 @@ export function scan({ repo, board, agents, npm, withProcesses = true }) {
     const hard = t.mainConflicts.filter((x) => !lowRisk(x));
     const sev = hard.length ? 'high' : t.mainMovedOn.length ? 'medium' : 'low';
     add('C16', sev, t.key, 'main', `${t.behind} commit(s) behind ${mainRef}${t.mainMovedOn.length ? `; main changed ${t.mainMovedOn.length} file(s) this ticket also changes` : ''}${t.mainConflicts.length ? `; merging it into main now conflicts in ${t.mainConflicts.length} file(s)` : ''}`, { behind: t.behind, files: t.mainMovedOn.slice(0, 20), mainConflicts: t.mainConflicts });
+  }
+  // C15: a ticket still being planned, whose plan names a file main changed after the plan was written
+  // (the incident: "pull first, TCK-1881 is shipping and may affect you"). Its diff says nothing yet.
+  for (const t of tickets) {
+    if (!PLANNING.includes(t.status)) continue;
+    const plan = plans[t.key] || planFromTranscript(t.sessionId);
+    if (!plan || !fs.existsSync(plan)) continue;
+    const planned = planFiles(fs.readFileSync(plan, 'utf8'));
+    if (!planned.length) continue;
+    const since = new Date(fs.statSync(plan).mtimeMs).toISOString();
+    // Ships arrive as merges: walk main's first-parent line and diff each merge against main as it
+    // was, so a merged branch counts by the date it reached main, not by its own commit dates.
+    const shipped = [...new Set(lines(git(main, ['log', '--first-parent', '--diff-merges=first-parent', `--since=${since}`, '--name-only', '--format=', mainRef]).out))];
+    const hit = shipped.filter((f) => namedBy(planned, f));
+    if (hit.length) add('C15', 'medium', t.key, 'main', `main changed ${hit.length} file(s) its plan names since the plan was written; re-read them before building`, { plan: path.basename(plan), since, files: hit.slice(0, 20) });
   }
   // C12: a lockfile change.
   for (const t of lead) if (t.lockfile) add('C12', 'low', t.key, 'all', 'it changes package-lock.json; after it ships, every other worktree needs npm install', {});
@@ -468,6 +547,82 @@ function selftest() {
     eq('read-only: no ref changed', refsOf(), refsBefore);
     // The state of every worktree, index, object and ref, for the read-only checks of the later scans.
     const snapAll = () => JSON.stringify([[w1, w2, w3, w7, repo].map((d) => [git(d, ['status', '--porcelain=v1', '-uall']).out, hashOf(indexFile(d))]), git(repo, ['count-objects', '-v']).out, refsOf()]);
+    // C15: a ticket still being planned, whose plan names a file main changed after the plan was written.
+    const snapC15 = snapAll();
+    const planOld = path.join(root, 'plan-old.md');
+    fs.writeFileSync(planOld, '# Plan\n\n## Critical files\n- `src/x.ts`\n- `scripts/nothing.sql`\n\n## Other\n- `src/elsewhere.ts`\n');
+    const past = new Date(Date.now() - 3600_000);
+    fs.utimesSync(planOld, past, past);
+    const planNew = path.join(root, 'plan-new.md');
+    fs.writeFileSync(planNew, '## Critical files\n- `src/x.ts`\n');
+    const future = new Date(Date.now() + 3600_000);
+    fs.utimesSync(planNew, future, future);
+    const planPrefix = path.join(root, 'plan-prefix.md');
+    fs.writeFileSync(planPrefix, '## Critical files\n- `src/x.t`\n- `script/`\n');
+    fs.utimesSync(planPrefix, past, past);
+    const planBoard = { issues: [{ key: 'TCK-11', work_status: 'planning' }, { key: 'TCK-12', work_status: 'ready_to_implement' }, { key: 'TCK-13', work_status: 'implementing' }, { key: 'TCK-14', work_status: 'planning' }, { key: 'TCK-17', work_status: 'ready_to_implement' }, { key: 'TCK-18', work_status: 'planning' }] };
+    const rp = scan({ repo: w2, board: planBoard, agents: [], npm: '2.12.0', plans: { 'TCK-11': planOld, 'TCK-12': planNew, 'TCK-13': planOld, 'TCK-14': path.join(root, 'missing.md'), 'TCK-17': planOld, 'TCK-18': planPrefix }, withProcesses: false });
+    const planFolder = path.join(root, 'plan-folder.md');
+    fs.writeFileSync(planFolder, '## Critical files\n- `scripts/`\n- `scripts-other/x.sql`\n');
+    fs.utimesSync(planFolder, past, past);
+    const rf = scan({ repo: w2, board: { issues: [{ key: 'TCK-16', work_status: 'planning' }] }, agents: [], npm: '2.12.0', plans: { 'TCK-16': planFolder }, withProcesses: false });
+    eq('C15: a folder the plan names covers the files main changed inside it', rf.conflicts.filter((c) => c.kind === 'C15').map((c) => c.evidence.files), [['scripts/phase75-main.sql']]);
+    eq('C15: planning and ready tickets whose plan names a file main changed since get it; a newer plan, a building ticket, a missing plan or a mere name prefix does not', rp.conflicts.filter((c) => c.kind === 'C15').map((c) => [c.a, c.b, c.severity, c.evidence.files, c.evidence.plan]), [['TCK-11', 'main', 'medium', ['src/x.ts'], 'plan-old.md'], ['TCK-17', 'main', 'medium', ['src/x.ts'], 'plan-old.md']]);
+    // Without --plans: the plan is the newest ~/.claude/plans/*.md the bound session's transcript names.
+    const cfg = path.join(root, 'claude-config');
+    const plansDir = path.join(cfg, 'plans');
+    fs.mkdirSync(plansDir, { recursive: true });
+    fs.mkdirSync(path.join(cfg, 'projects', '-work-x'), { recursive: true });
+    const viaTranscript = path.join(plansDir, 'tck-15-plan.md');
+    fs.copyFileSync(planOld, viaTranscript);
+    fs.utimesSync(viaTranscript, past, past);
+    const older = path.join(plansDir, 'older.md');
+    fs.writeFileSync(older, '## Critical files\n- `src/never.ts`\n');
+    const sid15 = 'aaaabbbb-1111-2222-3333-444455556666';
+    fs.writeFileSync(path.join(cfg, 'projects', '-work-x', `${sid15}.jsonl`), [
+      JSON.stringify({ type: 'user', message: `see ${older}` }),
+      JSON.stringify({ type: 'assistant', message: `plan written to ${viaTranscript}` }),
+    ].join('\n') + '\n');
+    const savedCfg = process.env.CLAUDE_CONFIG_DIR;
+    process.env.CLAUDE_CONFIG_DIR = cfg;
+    let r15;
+    try {
+      r15 = scan({ repo: w2, board: { issues: [{ key: 'TCK-15', work_status: 'planning', bound_session_id: sid15 }] }, agents: [], npm: '2.12.0', withProcesses: false });
+    } finally {
+      if (savedCfg === undefined) delete process.env.CLAUDE_CONFIG_DIR;
+      else process.env.CLAUDE_CONFIG_DIR = savedCfg;
+    }
+    eq('C15: the plan comes from the session transcript (the newest one it names)', r15.conflicts.filter((c) => c.kind === 'C15').map((c) => [c.a, c.evidence.plan]), [['TCK-15', 'tck-15-plan.md']]);
+    // A long transcript: only its last 4 MB is read, where the newest plan is; the default config folder's ~/.claude form.
+    const home = path.join(root, 'home');
+    const homePlans = path.join(home, '.claude', 'plans');
+    fs.mkdirSync(homePlans, { recursive: true });
+    fs.mkdirSync(path.join(home, '.claude', 'projects', '-w'), { recursive: true });
+    fs.copyFileSync(planOld, path.join(homePlans, 'newest.md'));
+    fs.utimesSync(path.join(homePlans, 'newest.md'), past, past);
+    fs.writeFileSync(path.join(homePlans, 'first.md'), '## Critical files\n- `src/never.ts`\n');
+    const sid19 = 'ccccdddd-1111-2222-3333-444455556666';
+    fs.writeFileSync(path.join(home, '.claude', 'projects', '-w', `${sid19}.jsonl`), [
+      JSON.stringify({ type: 'user', message: 'the plan is ~/.claude/plans/first.md' }),
+      JSON.stringify({ type: 'assistant', message: 'x'.repeat(4.5 * 1024 * 1024) }),
+      JSON.stringify({ type: 'assistant', message: 'now ~/.claude/plans/newest.md' }),
+    ].join('\n') + '\n');
+    const savedHome = process.env.HOME;
+    const savedCfg2 = process.env.CLAUDE_CONFIG_DIR;
+    process.env.HOME = home;
+    delete process.env.CLAUDE_CONFIG_DIR;
+    let r19;
+    try {
+      r19 = scan({ repo: w2, board: { issues: [{ key: 'TCK-19', work_status: 'planning', bound_session_id: sid19 }] }, agents: [], npm: '2.12.0', withProcesses: false });
+    } finally {
+      process.env.HOME = savedHome;
+      if (savedCfg2 === undefined) delete process.env.CLAUDE_CONFIG_DIR;
+      else process.env.CLAUDE_CONFIG_DIR = savedCfg2;
+    }
+    eq('C15: a long transcript is read from its end; the ~/.claude/plans form resolves', r19.conflicts.filter((c) => c.kind === 'C15').map((c) => [c.a, c.evidence.plan]), [['TCK-19', 'newest.md']]);
+    eq('planFiles: only the Critical files section; folders kept; bare words, absolute and home paths skipped', planFiles('## Critical files\n- `src/a.ts` and `src/b/`\n- `npm test` `/abs/x.ts` `~/x/y.ts` `noslash.ts`\n### A sub-heading inside\n- `src/sub.ts`\n## Next\n- `src/c.ts`'), ['src/a.ts', 'src/b/', 'src/sub.ts']);
+    eq('planFiles: without the heading, every backticked path, without a line number or anchor', planFiles('Touch `src/a.ts` then `scripts/x.sql:12` and `docs/a.md#top`.'), ['src/a.ts', 'scripts/x.sql', 'docs/a.md']);
+    eq('read-only: the C15 scans write nothing', snapAll(), snapC15);
     const pairs = (res) => res.conflicts.map((c) => `${c.kind} ${c.a} ${c.b}`).sort();
     const reversed = scan({ repo: w2, board: { issues: [...board.issues].reverse() }, agents, npm: '2.12.0', withProcesses: false });
     eq('pair order: the same pairs, named the same way, whatever the board order', pairs(reversed), pairs(r));
@@ -526,6 +681,33 @@ function selftest() {
     eq('C17: idle while iterating and gone while implementing are stopped loops; idle while planning is low', [c17('TCK-8'), c17('TCK-10'), c17('TCK-9')], [['medium', true], ['medium', true], ['low', false]]);
     eq('read-only: the later scans write nothing', snapAll(), snap);
     eq('versions compare numerically', [verCmp('2.13.0', '2.12.0') > 0, verCmp('2.11.1', '2.12.0') < 0, verCmp('2.10.0', '2.9.0') > 0], [true, true, true]);
+    // C15 through a merge, the way this repository ships: the branch's commit is older than the plan,
+    // the merge into main is newer. Main also changed a file before the plan, and the branch synced
+    // that in after the plan: main's first-parent line must not count it again. (Last: it moves main.)
+    const old3h = new Date(Date.now() - 3 * 3600_000).toISOString();
+    const old1h = new Date(Date.now() - 1 * 3600_000).toISOString();
+    const dated = (args, when) => {
+      const r = git(repo, args, { GIT_AUTHOR_DATE: when, GIT_COMMITTER_DATE: when });
+      if (!r.ok) throw new Error(`git ${args[0]}: ${r.err}`);
+    };
+    sh(repo, 'checkout', '-q', '-b', 'ship-x', 'main');
+    write(repo, 'src/merged.ts', 'export const m = 1;\n');
+    sh(repo, 'add', 'src/merged.ts');
+    dated(['commit', '-q', '-m', 'old work'], old3h);
+    sh(repo, 'checkout', '-q', 'main');
+    write(repo, 'src/early.ts', 'export const e = 1;\n');
+    sh(repo, 'add', 'src/early.ts');
+    dated(['commit', '-q', '-m', 'main work before the plan'], old3h);
+    sh(repo, 'checkout', '-q', 'ship-x');
+    dated(['merge', '-q', '--no-ff', '-m', 'sync main in', 'main'], old1h);
+    sh(repo, 'checkout', '-q', 'main');
+    sh(repo, 'merge', '-q', '--no-ff', '-m', 'ship x', 'ship-x');
+    const planMerge = path.join(root, 'plan-merge.md');
+    fs.writeFileSync(planMerge, '## Critical files\n- `src/merged.ts`\n- `src/early.ts`\n');
+    const old2h = new Date(Date.now() - 2 * 3600_000);
+    fs.utimesSync(planMerge, old2h, old2h);
+    const rm = scan({ repo, board: { issues: [{ key: 'TCK-20', work_status: 'planning' }] }, agents: [], npm: '2.12.0', plans: { 'TCK-20': planMerge }, withProcesses: false });
+    eq('C15: a ship by merge counts, by the date it reached main; a sync merge on the branch does not', rm.conflicts.filter((c) => c.kind === 'C15').map((c) => c.evidence.files), [['src/merged.ts']]);
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }
@@ -541,7 +723,7 @@ function parseArgs(argv) {
     const a = argv[i];
     if (!a.startsWith('--')) continue;
     const next = argv[i + 1];
-    if (next !== undefined && !next.startsWith('--') && ['repo', 'board', 'agents', 'npm-latest'].includes(a.slice(2))) { out[a.slice(2)] = next; i++; } else out[a.slice(2)] = true;
+    if (next !== undefined && !next.startsWith('--') && ['repo', 'board', 'agents', 'npm-latest', 'plans'].includes(a.slice(2))) { out[a.slice(2)] = next; i++; } else out[a.slice(2)] = true;
   }
   return out;
 }
@@ -550,9 +732,10 @@ if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.me
   const args = parseArgs(process.argv.slice(2));
   if (args.selftest) process.exit(selftest());
   if (!args.board || !fs.existsSync(args.board)) {
-    console.error('usage: coord-scan.mjs --board <tickets.json> [--repo <main checkout>] [--agents <agents.json>] [--npm-latest <version>] [--json] | --selftest');
+    console.error('usage: coord-scan.mjs --board <tickets.json> [--repo <main checkout>] [--agents <agents.json>] [--npm-latest <version>] [--plans <{"TCK-n": "plan.md"}>] [--json] | --selftest');
     process.exit(2);
   }
-  const result = scan({ repo: path.resolve(args.repo || process.cwd()), board: JSON.parse(fs.readFileSync(args.board, 'utf8')), agents: loadAgents(args.agents), npm: npmLatest(args['npm-latest']) });
+  const plans = args.plans ? JSON.parse(fs.readFileSync(args.plans, 'utf8')) : {};
+  const result = scan({ repo: path.resolve(args.repo || process.cwd()), board: JSON.parse(fs.readFileSync(args.board, 'utf8')), agents: loadAgents(args.agents), npm: npmLatest(args['npm-latest']), plans });
   console.log(args.json ? JSON.stringify(result, null, 2) : report(result));
 }

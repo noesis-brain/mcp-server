@@ -1703,6 +1703,11 @@ export class NoesisClient {
     return this.requestWithCode('GET', `/api/mcp/coordination/conflicts${all ? '?all=true' : ''}`);
   }
 
+  /** This loop's dev-port slot (a backend port, a frontend port and a .localhost host), or give it back. */
+  async coordPort(action: 'get' | 'release', body: Record<string, unknown>): Promise<any> {
+    return this.requestWithCode('POST', `/api/mcp/coordination/allocations/port${action === 'release' ? '/release' : ''}`, body);
+  }
+
 }
 
 // ── Smart links (TCK-1883) — the server's shapes, as these tools use them ──────────────────

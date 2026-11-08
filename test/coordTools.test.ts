@@ -47,6 +47,8 @@ describe('coordination client methods: method, path and body', () => {
     await c.coordReport([{ kind: 'C2' }]);
     await c.coordConflicts();
     await c.coordConflicts(true);
+    await c.coordPort('get', { holder: 'h', ticket: 'TCK-1' });
+    await c.coordPort('release', { holder: 'h' });
     expect(seen).toEqual([
       { req: 'POST https://example.test/api/mcp/coordination/decisions', body: JSON.stringify({ category: 'rebase', choice: 'x' }) },
       { req: 'GET https://example.test/api/mcp/coordination/decisions/42', body: undefined },
@@ -66,6 +68,8 @@ describe('coordination client methods: method, path and body', () => {
       { req: 'POST https://example.test/api/mcp/coordination/report', body: JSON.stringify({ conflicts: [{ kind: 'C2' }] }) },
       { req: 'GET https://example.test/api/mcp/coordination/conflicts', body: undefined },
       { req: 'GET https://example.test/api/mcp/coordination/conflicts?all=true', body: undefined },
+      { req: 'POST https://example.test/api/mcp/coordination/allocations/port', body: JSON.stringify({ holder: 'h', ticket: 'TCK-1' }) },
+      { req: 'POST https://example.test/api/mcp/coordination/allocations/port/release', body: JSON.stringify({ holder: 'h' }) },
     ]);
   });
 
@@ -89,6 +93,7 @@ describe('coordination client methods: method, path and body', () => {
       ['coordInbox', () => c.coordInbox('s')],
       ['coordReport', () => c.coordReport([])],
       ['coordConflicts', () => c.coordConflicts(true)],
+      ['coordPort', () => c.coordPort('get', { holder: 'h' })],
     ];
     for (const [name, call] of calls) await expect(call(), name).rejects.toThrow(/\[LEASE_LOST\].*"why":"ttl"/);
   });
@@ -152,7 +157,7 @@ describe('coordination tools → client', () => {
   it('registers exactly these tools, and none that answers, reviews, changes the policy, pauses or continues', () => {
     expect([...handlers.keys()].sort()).toEqual([
       'coord_allocate_mcp_version', 'coord_conflicts', 'coord_decide', 'coord_decision_get', 'coord_decisions', 'coord_heartbeat', 'coord_inbox',
-      'coord_lease', 'coord_leases', 'coord_message', 'coord_policy', 'coord_report', 'coord_sessions',
+      'coord_lease', 'coord_leases', 'coord_message', 'coord_policy', 'coord_port', 'coord_report', 'coord_sessions',
     ]);
     for (const name of handlers.keys()) expect(name).not.toMatch(/answer|review|approve|set_policy|force|pause|continue/);
     // coord_message has no kind: it cannot send a pause or a continue.
@@ -371,6 +376,25 @@ describe('coordination tools → client', () => {
     }
   });
 
+  it('coord_port: this session holds it by default, a ticket keys it, release gives it back; without a session it refuses', async () => {
+    process.env.CLAUDE_CODE_SESSION_ID = SESSION;
+    await run('coord_port', {});
+    await run('coord_port', { ticket: 'TCK-7' });
+    await run('coord_port', { action: 'release', ticket: 'TCK-7' });
+    await run('coord_port', { holder: 'chief' });
+    expect(calls).toEqual([
+      ['coordPort', 'get', { holder: SESSION }],
+      ['coordPort', 'get', { holder: SESSION, ticket: 'TCK-7' }],
+      ['coordPort', 'release', { holder: SESSION, ticket: 'TCK-7' }],
+      ['coordPort', 'get', { holder: 'chief' }],
+    ]);
+    calls.length = 0;
+    delete process.env.CLAUDE_CODE_SESSION_ID;
+    const res = await run('coord_port', {});
+    expect(res.isError).toBe(true);
+    expect(calls).toEqual([]);
+  });
+
   it('coord_report names the scanner that ships in this package', async () => {
     const { COORD_SCANNER } = await import('../src/tools/coord.js');
     expect(fs.existsSync(COORD_SCANNER)).toBe(true);
@@ -406,6 +430,14 @@ describe('coordination tools → client', () => {
     expect(opts('coord_decisions', 'category')).toEqual(opts('coord_decide', 'category'));
     expect(opts('coord_decisions', 'status')).toEqual(['answered', 'auto', 'pending', 'reverted', 'review']);
     expect(opts('coord_lease', 'resource')).toEqual(['mcp-publish', 'prod-schema', 'ship', 'test-db']);
+  });
+});
+
+describe('the Chief\'s rules ship in this package', () => {
+  it('scripts/coord-rules.mjs passes its own selftest from here', () => {
+    const r = spawnSync(process.execPath, [path.join(__dirname, '..', 'scripts', 'coord-rules.mjs'), '--selftest'], { encoding: 'utf8', timeout: 60_000 });
+    expect(r.status, `${r.stdout}\n${r.stderr}`.slice(-2000)).toBe(0);
+    expect(r.stdout).toMatch(/all passed/);
   });
 });
 
@@ -447,6 +479,7 @@ describe('a client refusal reaches the session through every tool', () => {
       coord_inbox: {},
       coord_report: { conflicts: [] },
       coord_conflicts: {},
+      coord_port: {},
     };
     expect([...handlers.keys()].sort()).toEqual(Object.keys(args).sort());
     for (const [name, a] of Object.entries(args)) {
@@ -469,7 +502,7 @@ describe('the package registers the coordination tools', () => {
     const coord = names.filter((n) => n.startsWith('coord_')).sort();
     expect(coord).toEqual([
       'coord_allocate_mcp_version', 'coord_conflicts', 'coord_decide', 'coord_decision_get', 'coord_decisions', 'coord_heartbeat', 'coord_inbox',
-      'coord_lease', 'coord_leases', 'coord_message', 'coord_policy', 'coord_report', 'coord_sessions',
+      'coord_lease', 'coord_leases', 'coord_message', 'coord_policy', 'coord_port', 'coord_report', 'coord_sessions',
     ]);
   });
 });

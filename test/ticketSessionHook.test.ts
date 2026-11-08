@@ -1716,7 +1716,15 @@ describe('TCK-1890: the Chief of Staff — inbox, pause flag, heartbeat, warn-on
     // An older continue on the other id does not end it either.
     again();
     respond = answer({ [HOOK_SID]: { status: 500, body: {} }, [BOUND_SID]: ok({ paused: false, since: 't5', message_id: 5, body: 'Continue.' }) });
-    expect((await run(home, read, ON)).ctx).not.toMatch(/ended the pause/);
+    const older = await run(home, read, ON);
+    expect(older.ctx).not.toMatch(/ended the pause/);
+    expect(older.ctx).toMatch(/PAUSED by the owner since t9: Wait for TCK-7\./);
+    // Every read answers, but the newest flag is an OLDER pause than the stored one: still paused.
+    again();
+    respond = answer({ [HOOK_SID]: ok({ paused: true, since: 't3', message_id: 3, body: 'Old pause.' }), [BOUND_SID]: ok(null) });
+    const olderPause = await run(home, read, ON);
+    expect(olderPause.ctx).not.toMatch(/ended the pause/);
+    expect(olderPause.ctx).toMatch(/PAUSED by the owner since t9: Wait for TCK-7\./);
     // A newer continue on either id ends it, even while the other read fails.
     again();
     respond = answer({ [HOOK_SID]: { status: 500, body: {} }, [BOUND_SID]: ok({ paused: false, since: 't10', message_id: 10, body: 'Continue.' }) });
