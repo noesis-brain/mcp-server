@@ -81,11 +81,20 @@ export const BIND_NEXT_LINK =
 export const BIND_NEXT_LATER =
   'Bound. Keep the status current with backlog_set_status as you work; refine the ticket again only if the plan changes or the user asks.';
 
+/** For a ticket whose draft the owner kept as the ticket text ("Mark refined", TCK-1890):
+ *  refined_at is set and refined_text is not. It is not refined; the gut is still wanted. */
+export const BIND_NEXT_KEPT =
+  'Bound. The owner kept their draft as the ticket text ("Mark refined"), so do not refine it with backlog_refine. ' +
+  'Write the team lead gut with backlog_set_gut if the ticket has none (kind plan: how it can be built, at most 40 words, plus a difficulty). ' +
+  'Keep the status current with backlog_set_status as you work.';
+
 /** Pick the hint for a bind response: refine before ExitPlanMode on an unrefined planning
- *  bind, refine now on an unrefined later bind, no refine step once the ticket is refined. */
+ *  bind, refine now on an unrefined later bind, no refine step once the ticket is refined,
+ *  and none on a ticket whose draft the owner kept. */
 export function bindNextHint(data: unknown): string {
-  const issue = (data as { issue?: { work_status?: string; refined_text?: string | null } } | null)?.issue;
+  const issue = (data as { issue?: { work_status?: string; refined_text?: string | null; refined_at?: string | null } } | null)?.issue;
   if (!issue || (issue.refined_text && issue.refined_text.trim())) return BIND_NEXT_LATER;
+  if (issue.refined_at) return BIND_NEXT_KEPT;
   return issue.work_status === 'planning' ? BIND_NEXT : BIND_NEXT_LINK;
 }
 

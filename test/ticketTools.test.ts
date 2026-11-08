@@ -144,17 +144,58 @@ describe('ticket tools → client', () => {
     for (const hint of [BIND_NEXT_LINK, BIND_NEXT_LATER]) expect(hint).not.toMatch(/ExitPlanMode/);
   });
 
+  it('a ticket whose draft the owner kept ("Mark refined") is not refined again, and its gut is still asked for (TCK-1890)', async () => {
+    const { bindNextHint, BIND_NEXT, BIND_NEXT_LINK, BIND_NEXT_KEPT, BIND_NEXT_LATER } = await import('../src/tools/backlog.js');
+    const at = '2026-11-09T04:00:00Z';
+    expect(bindNextHint({ issue: { work_status: 'planning', refined_text: null, refined_at: at } })).toBe(BIND_NEXT_KEPT);
+    expect(bindNextHint({ issue: { work_status: 'implementing', refined_text: '  ', refined_at: at } })).toBe(BIND_NEXT_KEPT);
+    // A Claude Code refinement (text and time) stays the "already refined" case.
+    expect(bindNextHint({ issue: { work_status: 'planning', refined_text: 'already refined', refined_at: at } })).toBe(BIND_NEXT_LATER);
+    expect(BIND_NEXT_KEPT).toMatch(/kept their draft as the ticket text/);
+    expect(BIND_NEXT_KEPT).toMatch(/do not refine it with backlog_refine/);
+    // backlog_refine is named once, only to say "do not"; nothing about refining later.
+    expect(BIND_NEXT_KEPT.match(/backlog_refine/g)).toHaveLength(1);
+    expect(BIND_NEXT_KEPT).not.toMatch(/ExitPlanMode/);
+    expect(BIND_NEXT_KEPT).not.toMatch(/refine (it|this ticket) once/);
+    expect(BIND_NEXT_KEPT).toMatch(/Write the team lead gut with backlog_set_gut if the ticket has none/);
+    expect(BIND_NEXT_KEPT).not.toMatch(/70%–120%/);
+    // The server always sends refined_at; null means no keep, so the older hints still apply.
+    expect(bindNextHint({ issue: { work_status: 'planning', refined_text: null, refined_at: null } })).toBe(BIND_NEXT);
+    expect(bindNextHint({ issue: { work_status: 'implementing', refined_text: null, refined_at: null } })).toBe(BIND_NEXT_LINK);
+    // Every hint keeps its exact text: a refine request in other words must not slip into the kept hint.
+    expect(BIND_NEXT_KEPT).toBe(
+      'Bound. The owner kept their draft as the ticket text ("Mark refined"), so do not refine it with backlog_refine. ' +
+      'Write the team lead gut with backlog_set_gut if the ticket has none (kind plan: how it can be built, at most 40 words, plus a difficulty). ' +
+      'Keep the status current with backlog_set_status as you work.',
+    );
+    expect(BIND_NEXT).toBe(
+      'Bound. When your plan is ready — before ExitPlanMode — refine this ticket once with backlog_refine ' +
+      "(70%–120% of the draft's words, in the draft's language, plain sentences, no sections or increments), " +
+      'and write the team lead gut with backlog_set_gut (kind plan: how it can be built, at most 40 words, plus a difficulty). ' +
+      'Then keep the status current with backlog_set_status as you work.',
+    );
+    expect(BIND_NEXT_LINK).toBe(
+      'Bound. If this session already has a plan, refine this ticket once now with backlog_refine ' +
+      "(70%–120% of the draft's words, in the draft's language, plain sentences, no sections or increments), " +
+      'and write the team lead gut with backlog_set_gut if the ticket has none. ' +
+      'Keep the status current with backlog_set_status as you work.',
+    );
+    expect(BIND_NEXT_LATER).toBe('Bound. Keep the status current with backlog_set_status as you work; refine the ticket again only if the plan changes or the user asks.');
+  });
+
   it('the bind tool reads the hint from the ticket the server returns', async () => {
-    const { BIND_NEXT, BIND_NEXT_LINK, BIND_NEXT_LATER } = await import('../src/tools/backlog.js');
+    const { BIND_NEXT, BIND_NEXT_LINK, BIND_NEXT_LATER, BIND_NEXT_KEPT } = await import('../src/tools/backlog.js');
     process.env.CLAUDE_CODE_SESSION_ID = SESSION;
     const bind = async (issue: Record<string, unknown> | undefined) => {
       reply = issue ? { issue, released: null } : { ok: true };
       return JSON.parse((await run('backlog_bind', { key: 'TCK-7' })).content[0].text);
     };
-    const fresh = await bind({ key: 'TCK-7', work_status: 'planning', refined_text: null });
+    const fresh = await bind({ key: 'TCK-7', work_status: 'planning', refined_text: null, refined_at: null });
     expect(fresh.issue.key).toBe('TCK-7'); // the server response passes through
     expect(fresh.next).toBe(BIND_NEXT);
-    expect((await bind({ key: 'TCK-7', work_status: 'implementing', refined_text: null })).next).toBe(BIND_NEXT_LINK);
+    expect((await bind({ key: 'TCK-7', work_status: 'implementing', refined_text: null, refined_at: null })).next).toBe(BIND_NEXT_LINK);
+    // The owner kept the draft ("Mark refined", TCK-1890): no refine step.
+    expect((await bind({ key: 'TCK-7', work_status: 'planning', refined_text: null, refined_at: '2026-11-09T04:00:00Z' })).next).toBe(BIND_NEXT_KEPT);
     expect((await bind({ key: 'TCK-7', work_status: 'planning', refined_text: 'Tidy jot.' })).next).toBe(BIND_NEXT_LATER);
     expect((await bind(undefined)).next).toBe(BIND_NEXT_LATER);
   });
