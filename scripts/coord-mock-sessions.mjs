@@ -13,7 +13,10 @@
 //      (answers, a policy switch, pause and continue) through the real routes;
 //   6. checks each AC9 bullet and each of the 25 incident rows, and exits 0 only if all pass.
 //
-//   node coord-mock-sessions.mjs --api http://127.0.0.1:5790 [--json <file>] [--keep]
+//   node coord-mock-sessions.mjs --api http://127.0.0.1:5790 [--json <file>] [--keep] [--account-file <file>]
+//
+// --account-file saves the test user's email and password (mode 600), so a browser can sign in and
+// look at the replayed state.
 //
 // It refuses an API that is not on this machine (localhost, 127.0.0.1, ::1, *.localhost). It writes
 // only the new user's rows and its own scratch folder (removed at the end unless --keep).
@@ -141,7 +144,7 @@ function buildRepo(root, t) {
   return w;
 }
 
-export async function run({ api, keep = false, log = console.log }) {
+export async function run({ api, keep = false, accountFile, log = console.log }) {
   if (!isLocalApi(api)) throw new Error(`refused: ${api} is not a local API (localhost, 127.0.0.1, ::1 or *.localhost only)`);
   const { call } = client(api.replace(/\/+$/, ''));
   const runId = `${Date.now().toString(36)}${randomBytes(3).toString('hex')}`;
@@ -153,6 +156,12 @@ export async function run({ api, keep = false, log = console.log }) {
   const email = `chief-mock-${runId}@example.test`;
   const password = randomBytes(18).toString('base64url');
   const jwt = need(await call('POST', '/api/auth/signup', null, { email, password, displayName: 'Chief mock' }), 'signup').accessToken;
+  if (accountFile) {
+    // `mode` applies only to a new file, so an old file is removed first: the password is never
+    // written into a file that others can read.
+    fs.rmSync(accountFile, { force: true });
+    fs.writeFileSync(accountFile, JSON.stringify({ api, email, password }, null, 2), { mode: 0o600, flag: 'wx' });
+  }
   const token = need(await call('POST', '/api/auth/tokens', jwt, { name: `coord-mock-${runId}` }), 'API token').token;
   const mcp = (method, route, body) => call(method, `/api/mcp/coordination${route}`, token, body);
   const owner = (method, route, body) => call(method, `/api/coordination${route}`, jwt, body);
@@ -354,7 +363,13 @@ export async function run({ api, keep = false, log = console.log }) {
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   const argv = process.argv.slice(2);
-  const arg = (name) => { const i = argv.indexOf(`--${name}`); return i >= 0 ? argv[i + 1] : undefined; };
+  // A flag with no value (the end, or another flag next) is null, never the next flag's name.
+  const arg = (name) => {
+    const i = argv.indexOf(`--${name}`);
+    if (i < 0) return undefined;
+    const v = argv[i + 1];
+    return v === undefined || v.startsWith('--') ? null : v;
+  };
   const api = arg('api');
   if (argv.includes('--selftest')) {
     const cases = [['http://127.0.0.1:5790', true], ['http://localhost:5790/', true], ['http://chief.localhost:3700', true], ['http://[::1]:5790', true],
@@ -365,11 +380,11 @@ if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.me
     console.log(INCIDENTS.length === 25 && kinds.size === 15 ? 'ok    the 25 incident rows need 15 conditions' : `FAIL incidents: ${INCIDENTS.length} rows, ${kinds.size} conditions`);
     process.exit(bad.length || INCIDENTS.length !== 25 || kinds.size !== 15 ? 1 : 0);
   }
-  if (!api) {
-    console.error('usage: coord-mock-sessions.mjs --api http://127.0.0.1:<port> [--json <file>] [--keep] | --selftest');
+  if (!api || arg('json') === null || arg('account-file') === null) {
+    console.error('usage: coord-mock-sessions.mjs --api http://127.0.0.1:<port> [--json <file>] [--keep] [--account-file <file>] | --selftest');
     process.exit(2);
   }
-  run({ api, keep: argv.includes('--keep') }).then((r) => {
+  run({ api, keep: argv.includes('--keep'), accountFile: arg('account-file') ?? undefined }).then((r) => {
     if (arg('json')) fs.writeFileSync(arg('json'), JSON.stringify(r, null, 2));
     console.log(r.ok ? `\nALL PASSED (${r.results.length} checks; user ${r.user})` : `\n${r.results.filter((x) => !x.ok).length} FAILED of ${r.results.length}`);
     process.exit(r.ok ? 0 : 1);

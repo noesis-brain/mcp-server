@@ -455,6 +455,61 @@ describe('the incident replay ships in this package', () => {
     expect(remote.status).toBe(3);
     expect(remote.stderr).toMatch(/refused: https:\/\/chief-refusal\.invalid is not a local API/);
   });
+
+  // A fake fetch: signup answers, the next request fails, so run() stops right after the account file.
+  const fakeFetch = () => {
+    const calls: string[] = [];
+    const f = async (url: string) => {
+      calls.push(url);
+      if (url.endsWith('/api/auth/signup')) return new Response(JSON.stringify({ accessToken: 'jwt' }), { status: 200 });
+      return new Response('nope', { status: 500 });
+    };
+    return { calls, f };
+  };
+  const tmp = () => fs.mkdtempSync(path.join(os.tmpdir(), 'acct-'));
+
+  it('--account-file writes the API, email and password with mode 600, also over an old readable file', async () => {
+    const { run } = await import(harness);
+    for (const old of [false, true]) {
+      const dir = tmp(); const file = path.join(dir, 'account.json');
+      if (old) fs.writeFileSync(file, 'old secret', { mode: 0o644 });
+      const { calls, f } = fakeFetch();
+      vi.stubGlobal('fetch', f);
+      try {
+        await expect(run({ api: 'http://127.0.0.1:1', accountFile: file, log: () => {} })).rejects.toThrow(/API token: HTTP 500/);
+      } finally { vi.unstubAllGlobals(); }
+      expect(fs.statSync(file).mode & 0o777).toBe(0o600);
+      const saved = JSON.parse(fs.readFileSync(file, 'utf8'));
+      expect(Object.keys(saved).sort()).toEqual(['api', 'email', 'password']);
+      expect(saved.api).toBe('http://127.0.0.1:1');
+      expect(saved.email).toMatch(/^chief-mock-.+@example\.test$/);
+      expect(saved.password.length).toBeGreaterThanOrEqual(20);
+      expect(calls[0]).toBe('http://127.0.0.1:1/api/auth/signup');
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('a refused API writes no account file and sends nothing; without the flag no file is written', async () => {
+    const { run } = await import(harness);
+    const dir = tmp(); const file = path.join(dir, 'account.json');
+    const { calls, f } = fakeFetch();
+    vi.stubGlobal('fetch', f);
+    try {
+      await expect(run({ api: 'https://chief-refusal.invalid', accountFile: file, log: () => {} })).rejects.toThrow(/refused/);
+      expect(calls).toEqual([]);
+      expect(fs.existsSync(file)).toBe(false);
+      await expect(run({ api: 'http://127.0.0.1:1', log: () => {} })).rejects.toThrow(/API token: HTTP 500/);
+      expect(fs.readdirSync(dir)).toEqual([]);
+    } finally { vi.unstubAllGlobals(); fs.rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it('a flag with no value is a usage error, never the next flag taken as a file name', () => {
+    for (const args of [['--account-file', '--keep'], ['--json'], ['--account-file']]) {
+      const r = spawnSync(process.execPath, [harness, '--api', 'http://127.0.0.1:1', ...args], { encoding: 'utf8', timeout: 30_000 });
+      expect(r.status, args.join(' ')).toBe(2);
+      expect(r.stderr).toMatch(/usage:/);
+    }
+  });
 });
 
 describe('the scanner moved into this package', () => {
