@@ -443,6 +443,20 @@ describe('the Chief\'s rules ship in this package', () => {
   });
 });
 
+describe('the incident replay ships in this package', () => {
+  const harness = path.join(__dirname, '..', 'scripts', 'coord-mock-sessions.mjs');
+  it('scripts/coord-mock-sessions.mjs passes its selftest and refuses an API that is not on this machine', () => {
+    const r = spawnSync(process.execPath, [harness, '--selftest'], { encoding: 'utf8', timeout: 60_000 });
+    expect(r.status, `${r.stdout}\n${r.stderr}`.slice(-2000)).toBe(0);
+    expect(r.stdout).toMatch(/isLocalApi: only this machine/);
+    expect(r.stdout).toMatch(/the 25 incident rows need 15 conditions/);
+    // The refusal comes before any request. The host cannot exist, so even a broken guard signs up nowhere.
+    const remote = spawnSync(process.execPath, [harness, '--api', 'https://chief-refusal.invalid'], { encoding: 'utf8', timeout: 60_000 });
+    expect(remote.status).toBe(3);
+    expect(remote.stderr).toMatch(/refused: https:\/\/chief-refusal\.invalid is not a local API/);
+  });
+});
+
 describe('the scanner moved into this package', () => {
   // The selftest builds throwaway git repos: about 4 s alone, more next to the other test files.
   it('scripts/coord-scan.mjs passes its own selftest from here', { timeout: 150_000 }, () => {
