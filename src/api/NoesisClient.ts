@@ -1672,6 +1672,37 @@ export class NoesisClient {
     return this.requestWithCode('POST', '/api/mcp/coordination/allocations/mcp-version', body);
   }
 
+  /** This session reports in: its state, ticket, folder and machine. Never a token. */
+  async coordSessionHeartbeat(body: Record<string, unknown>): Promise<any> {
+    return this.requestWithCode('POST', '/api/mcp/coordination/sessions/heartbeat', body);
+  }
+
+  async coordSessions(): Promise<any> {
+    return this.requestWithCode('GET', '/api/mcp/coordination/sessions');
+  }
+
+  /** A plain message to one session, or to every session. Pause and continue are the owner's (409 OWNER_GATE). */
+  async coordMessage(body: Record<string, unknown>): Promise<any> {
+    return this.requestWithCode('POST', '/api/mcp/coordination/messages', body);
+  }
+
+  /** One session's messages after the cursor, the next cursor, and the pause flag. */
+  async coordInbox(session: string, opts: { since?: number; limit?: number } = {}): Promise<any> {
+    const q = new URLSearchParams({ session });
+    if (opts.since !== undefined) q.set('since', String(opts.since));
+    if (opts.limit !== undefined) q.set('limit', String(opts.limit));
+    return this.requestWithCode('GET', `/api/mcp/coordination/inbox?${q.toString()}`);
+  }
+
+  /** One scanner report: the whole picture of the conflicts now. */
+  async coordReport(conflicts: unknown[]): Promise<any> {
+    return this.requestWithCode('POST', '/api/mcp/coordination/report', { conflicts });
+  }
+
+  async coordConflicts(all = false): Promise<any> {
+    return this.requestWithCode('GET', `/api/mcp/coordination/conflicts${all ? '?all=true' : ''}`);
+  }
+
 }
 
 // ── Smart links (TCK-1883) — the server's shapes, as these tools use them ──────────────────

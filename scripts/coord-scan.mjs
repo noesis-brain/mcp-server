@@ -44,6 +44,15 @@ const IGNORED = [/(^|\/)[^/]*LOOP-STATE[^/]*\.md$/, /^loop-stack\//, /^\.loop\//
 const PHASE_RE = /^scripts\/phase(\d+(?:\.\d+)?)-[^/]*\.sql$/;
 const SEVERITY = { high: 0, medium: 1, low: 2 };
 
+/** A pair of two tickets is always named in ticket-number order (as numbers: TCK-9 before TCK-10), so a change
+ *  in the board order never turns one pair into "another" (the server keys a conflict by kind, a and b). Pairs
+ *  with main, npm, all or a session keep their order: those sides never swap. */
+export function orderPair(a, b) {
+  const na = /^TCK-(\d+)$/.exec(a);
+  const nb = /^TCK-(\d+)$/.exec(b);
+  return na && nb && Number(nb[1]) < Number(na[1]) ? [b, a] : [a, b];
+}
+
 function git(cwd, args, env) {
   const r = spawnSync('git', ['-C', cwd, ...args], { encoding: 'utf8', env: { ...process.env, GIT_OPTIONAL_LOCKS: '0', ...(env || {}) }, maxBuffer: 64 * 1024 * 1024 });
   return { ok: r.status === 0, code: r.status, out: (r.stdout || '').trim(), raw: r.stdout || '', err: (r.stderr || '').trim() };
@@ -219,7 +228,10 @@ export function scan({ repo, board, agents, npm, withProcesses = true }) {
   });
 
   const conflicts = [];
-  const add = (kind, severity, a, b, detail, evidence) => conflicts.push({ kind, severity, a, b, detail, evidence });
+  const add = (kind, severity, a, b, detail, evidence) => {
+    [a, b] = orderPair(a, b);
+    conflicts.push({ kind, severity, a, b, detail, evidence });
+  };
   const same = (x, y) => x.worktree && y.worktree && path.resolve(x.worktree) === path.resolve(y.worktree);
   // When tickets share a worktree, one ticket stands for it in the pairwise checks: the one whose
   // live session works there, else the first on the board. C13 reports the sharing itself.
@@ -456,6 +468,12 @@ function selftest() {
     eq('read-only: no ref changed', refsOf(), refsBefore);
     // The state of every worktree, index, object and ref, for the read-only checks of the later scans.
     const snapAll = () => JSON.stringify([[w1, w2, w3, w7, repo].map((d) => [git(d, ['status', '--porcelain=v1', '-uall']).out, hashOf(indexFile(d))]), git(repo, ['count-objects', '-v']).out, refsOf()]);
+    const pairs = (res) => res.conflicts.map((c) => `${c.kind} ${c.a} ${c.b}`).sort();
+    const reversed = scan({ repo: w2, board: { issues: [...board.issues].reverse() }, agents, npm: '2.12.0', withProcesses: false });
+    eq('pair order: the same pairs, named the same way, whatever the board order', pairs(reversed), pairs(r));
+    eq('pair order: ticket numbers compare as numbers, not as text', [orderPair('TCK-10', 'TCK-9'), orderPair('TCK-9', 'TCK-10'), orderPair('TCK-1890', 'TCK-26'), orderPair('TCK-26', 'TCK-1890')], [['TCK-9', 'TCK-10'], ['TCK-9', 'TCK-10'], ['TCK-26', 'TCK-1890'], ['TCK-26', 'TCK-1890']]);
+    eq('pair order: main, npm, all and a session keep their side', [orderPair('main', 'TCK-1'), orderPair('TCK-9', 'npm'), orderPair('TCK-9', 'all'), orderPair('TCK-9', 'b2070484'), orderPair('TCK-9', 'TCK-9')], [['main', 'TCK-1'], ['TCK-9', 'npm'], ['TCK-9', 'all'], ['TCK-9', 'b2070484'], ['TCK-9', 'TCK-9']]);
+    eq('pair order: two tickets are named in ticket-number order', r.conflicts.filter((c) => /^TCK-\d+$/.test(c.a) && /^TCK-\d+$/.test(c.b)).every((c) => Number(c.a.slice(4)) < Number(c.b.slice(4))), true);
     eq('severity order: high first', r.conflicts.map((c) => SEVERITY[c.severity]).every((v, i, a) => i === 0 || a[i - 1] <= v), true);
     eq('the report names every conflict kind', ['C2', 'C3', 'C4', 'C5', 'C7', 'C13', 'C16', 'C17'].every((k) => report(r).includes(` ${k} `)), true);
     eq('tables: CREATE and ALTER are read', tablesIn(path.join(w3, 'scripts/phase76-three.sql')), ['foo']);
