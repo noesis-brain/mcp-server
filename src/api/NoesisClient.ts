@@ -1637,6 +1637,41 @@ export class NoesisClient {
     return this.requestWithCode('DELETE', `/api/mcp/backlog/issues/${encodeURIComponent(key)}/links/${encodeURIComponent(other)}`);
   }
 
+  // ── Chief of Staff (TCK-1890): /api/mcp/coordination. Owner gates have no method here. ──
+
+  /** Record a judgment call or an owner-gate decision; the server computes the level and the outcome. */
+  async coordDecide(body: Record<string, unknown>): Promise<any> {
+    return this.requestWithCode('POST', '/api/mcp/coordination/decisions', body);
+  }
+
+  async coordDecisionGet(id: number): Promise<any> {
+    return this.requestWithCode('GET', `/api/mcp/coordination/decisions/${encodeURIComponent(String(id))}`);
+  }
+
+  async coordDecisions(filter: { status?: string; category?: string; ticket?: string; limit?: number } = {}): Promise<any> {
+    const q = new URLSearchParams();
+    for (const [k, v] of Object.entries(filter)) if (v !== undefined && v !== null) q.set(k, String(v));
+    const qs = q.toString();
+    return this.requestWithCode('GET', `/api/mcp/coordination/decisions${qs ? `?${qs}` : ''}`);
+  }
+
+  async coordPolicy(): Promise<any> {
+    return this.requestWithCode('GET', '/api/mcp/coordination/policy');
+  }
+
+  /** acquire, heartbeat or release one lease. */
+  async coordLease(resource: string, action: 'acquire' | 'heartbeat' | 'release', body: Record<string, unknown>): Promise<any> {
+    return this.requestWithCode('POST', `/api/mcp/coordination/leases/${encodeURIComponent(resource)}/${action}`, body);
+  }
+
+  async coordLeases(): Promise<any> {
+    return this.requestWithCode('GET', '/api/mcp/coordination/leases');
+  }
+
+  async coordAllocateMcpVersion(body: Record<string, unknown>): Promise<any> {
+    return this.requestWithCode('POST', '/api/mcp/coordination/allocations/mcp-version', body);
+  }
+
 }
 
 // ── Smart links (TCK-1883) — the server's shapes, as these tools use them ──────────────────
