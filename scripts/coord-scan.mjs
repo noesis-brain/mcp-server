@@ -258,7 +258,7 @@ export function planFiles(markdown) {
 /** Whether a changed file is one a plan names: the same path, or inside a folder the plan names. */
 const namedBy = (planned, file) => planned.some((p) => (p.endsWith('/') ? file.startsWith(p) : file === p));
 
-export function scan({ repo, board, agents, npm, plans = {}, withProcesses = true }) {
+export function scan({ repo, board, agents, npm, plans = {}, withProcesses = true, listen = listeners }) {
   const main = mainCheckout(repo);
   if (!main) throw new Error(`not a git repository: ${repo}`);
   const mainRef = git(main, ['rev-parse', '--abbrev-ref', 'HEAD']).out || 'main';
@@ -417,14 +417,42 @@ export function scan({ repo, board, agents, npm, plans = {}, withProcesses = tru
     add('C17', stopped || t.sessionState === 'not running' ? 'medium' : 'low', t.key, t.sessionId.slice(0, 8), detail, { state: t.sessionState, stopped });
   }
 
+  // C1: one ship at a time. Every two tickets that wait to ship (one may already be deploying) share
+  // the ship lane, and their order is the owner's. So is a ticket that two live sessions work on: both
+  // could merge and push it (TCK-1886, 2026-11-06).
+  const SHIPPING = ['ready_to_merge', 'deploying'];
+  const ships = tickets.filter((t) => SHIPPING.includes(t.status));
+  for (let i = 0; i < ships.length; i++) for (let j = i + 1; j < ships.length; j++) {
+    const [x, y] = [ships[i], ships[j]];
+    add('C1', 'high', x.key, y.key, `both wait to ship (${x.key} ${x.status}, ${y.key} ${y.status}); one ship at a time, each verified on production before the next`, { status: { [x.key]: x.status, [y.key]: y.status } });
+  }
+  const live = (Array.isArray(agents) ? agents : []).filter((a) => a.sessionId && a.cwd);
+  for (const t of ships) {
+    if (!t.worktree) continue;
+    const here = [...new Set(live.filter((a) => { const w = worktreeOf(a.cwd, wts); return w && path.resolve(w.path) === path.resolve(t.worktree); }).map((a) => a.sessionId))].sort();
+    if (here.length > 1) add('C1', 'high', t.key, 'sessions', `${here.length} live sessions work in its worktree, and only one may ship it`, { sessions: here, bound: t.sessionId });
+  }
+  // C6 and C7: what a ship carries that only the owner can do: a production schema apply (its new
+  // migration files) and an npm publish (its MCP change).
+  for (const t of tickets) {
+    if (t.status !== 'ready_to_merge') continue;
+    if (t.phases.length) add('C6', 'high', t.key, 'prod-schema', `it ships ${t.phases.map((p) => path.basename(p)).join(', ')}; production needs that schema first, and the apply is the owner's`, { phases: t.phases, tables: t.tables });
+    if (t.mcp) add('C7', 'medium', t.key, 'npm-publish', `it changes the MCP package${t.mcp.version ? ` at version ${t.mcp.version}` : ''}; the npm publish is the owner's (npm login and 2FA)`, { publish: true, version: t.mcp.version || null, npmLatest: npm || null });
+  }
+
   // C10: local servers by worktree (observe only: a cleanup is never decided here).
   let processes = [];
   if (withProcesses) {
-    processes = listeners().map((l) => {
+    processes = listen().map((l) => {
       const wt = worktreeOf(l.cwd, wts);
       const owner = wt ? lead.find((t) => path.resolve(t.worktree) === path.resolve(wt.path)) : null;
       return { pid: l.pid, command: l.command, ports: l.ports, cwd: l.cwd, worktree: wt ? wt.path : null, ticket: owner ? owner.key : null, orphan: Boolean(wt) && !owner && path.resolve(wt.path) !== path.resolve(main) };
     });
+  }
+  // C10: a server in a worktree no active ticket works in (a shipped or dead loop's backend). Listed for
+  // the owner's cleanup review; a process of a live loop is never in this list.
+  for (const p of processes) {
+    if (p.orphan) add('C10', 'low', `pid-${p.pid}`, '', `${p.command} (pid ${p.pid}) listens on ${p.ports.join(', ')} in ${path.basename(p.worktree)}, where no active ticket works`, { pid: p.pid, ports: p.ports, worktree: p.worktree });
   }
   conflicts.sort((x, y) => SEVERITY[x.severity] - SEVERITY[y.severity] || x.kind.localeCompare(y.kind));
   return { generatedAt: new Date().toISOString(), main: { path: main, ref: mainRef, phases: mainPhases.length, nextPhase: mainMax + 1, mcpVersion: mainVersion, npmLatest: npm, distStale: Boolean(dist && dist.newestSource > dist.builtAt) }, tickets, conflicts, processes };
@@ -547,6 +575,59 @@ function selftest() {
     eq('read-only: no ref changed', refsOf(), refsBefore);
     // The state of every worktree, index, object and ref, for the read-only checks of the later scans.
     const snapAll = () => JSON.stringify([[w1, w2, w3, w7, repo].map((d) => [git(d, ['status', '--porcelain=v1', '-uall']).out, hashOf(indexFile(d))]), git(repo, ['count-objects', '-v']).out, refsOf()]);
+    // C1, C6, C7: the ship lane and what a ship carries. TCK-1 (a new phase75, an MCP change) and
+    // TCK-7 (neither) wait to merge, TCK-2 (a staged phase76, an MCP change) is already deploying,
+    // TCK-3 is still being built. Two live sessions work in TCK-7's worktree, and two in TCK-3's.
+    // TCK-48: ready to merge, with an MCP change whose package.json has no version.
+    const w48 = wt(48); write(w48, `${MCP_DIR}/package.json`, '{ "name": "mcp" }\n'); write(w48, `${MCP_DIR}/src/a.ts`, 'export const a = 48;\n');
+    sh(w48, 'add', '-A'); sh(w48, 'commit', '-q', '-m', 'forty-eight');
+    const snapShip = snapAll();
+    const shipBoard = { issues: [
+      { key: 'TCK-1', work_status: 'ready_to_merge' }, { key: 'TCK-2', work_status: 'deploying' },
+      { key: 'TCK-3', work_status: 'iterating' }, { key: 'TCK-7', work_status: 'ready_to_merge', bound_session_id: 'sid-7a' },
+    ] };
+    const shipAgents = [
+      { sessionId: 'sid-7a', cwd: w7, status: 'busy' }, { sessionId: 'sid-7b', cwd: path.join(w7, 'src'), status: 'idle' },
+      { sessionId: 'sid-3a', cwd: w3, status: 'busy' }, { sessionId: 'sid-3b', cwd: w3, status: 'busy' }, { sessionId: 'sid-m', cwd: repo, status: 'busy' },
+    ];
+    const rs = scan({ repo: w2, board: shipBoard, agents: shipAgents, npm: '2.12.0', withProcesses: false });
+    const shipKinds = (k) => rs.conflicts.filter((c) => c.kind === k).map((c) => [c.a, c.b]);
+    eq('C1: every two tickets waiting to ship or deploying share the lane; a ticket still being built does not', shipKinds('C1').filter(([, b]) => b !== 'sessions'), [['TCK-1', 'TCK-2'], ['TCK-1', 'TCK-7'], ['TCK-2', 'TCK-7']]);
+    eq('C1: the pair says each status', rs.conflicts.find((c) => c.kind === 'C1' && c.a === 'TCK-1' && c.b === 'TCK-2').evidence.status, { 'TCK-1': 'ready_to_merge', 'TCK-2': 'deploying' });
+    eq('C1: two live sessions in a shipping ticket\'s worktree (a folder inside it counts); not in a ticket still being built', rs.conflicts.filter((c) => c.kind === 'C1' && c.b === 'sessions').map((c) => [c.a, c.evidence.sessions, c.evidence.bound]), [['TCK-7', ['sid-7a', 'sid-7b'], 'sid-7a']]);
+    eq('C6: a ticket ready to merge with a new migration file; not one already deploying, nor one still being built', rs.conflicts.filter((c) => c.kind === 'C6').map((c) => [c.a, c.b, c.evidence.phases]), [['TCK-1', 'prod-schema', ['scripts/phase75-one.sql']]]);
+    eq('C7: a ticket ready to merge with an MCP change gets a publish gate; not one already deploying', rs.conflicts.filter((c) => c.kind === 'C7' && c.b === 'npm-publish').map((c) => [c.a, c.evidence.publish, c.evidence.version]), [['TCK-1', true, '2.11.1']]);
+    // The edges: a shipping ticket with ONE session (listed twice), a deploying ticket with two, a
+    // shipping ticket with no worktree, one whose sessions are both in the main checkout, one that
+    // shares TCK-1's worktree, and an MCP change with no version.
+    const edgeBoard = { issues: [
+      { key: 'TCK-1', work_status: 'ready_to_merge', bound_session_id: 'sid-1' }, { key: 'TCK-2', work_status: 'deploying' },
+      { key: 'TCK-40', work_status: 'ready_to_merge' }, { key: 'TCK-41', work_status: 'ready_to_merge', bound_session_id: 'sid-m' },
+      { key: 'TCK-42', work_status: 'ready_to_merge', worktree: w1 }, { key: 'TCK-48', work_status: 'ready_to_merge' },
+    ] };
+    const edgeAgents = [
+      { sessionId: 'sid-1', cwd: w1, status: 'busy' }, { sessionId: 'sid-1', cwd: path.join(w1, 'src'), status: 'busy' },
+      { sessionId: 'sid-2a', cwd: w2, status: 'busy' }, { sessionId: 'sid-2b', cwd: path.join(w2, 'src'), status: 'busy' },
+      { sessionId: 'sid-m', cwd: repo, status: 'busy' }, { sessionId: 'sid-m2', cwd: repo, status: 'busy' },
+    ];
+    const re = scan({ repo: w2, board: edgeBoard, agents: edgeAgents, npm: '2.12.0', withProcesses: false });
+    const edgePairs = re.conflicts.filter((c) => c.kind === 'C1' && c.b !== 'sessions').map((c) => `${c.a} ${c.b}`);
+    eq('C1 edges: every two shipping tickets pair, with or without a worktree of their own (6 tickets, 15 pairs)', [edgePairs.length, ['TCK-2 TCK-40', 'TCK-40 TCK-41', 'TCK-41 TCK-48', 'TCK-1 TCK-42'].every((p) => edgePairs.includes(p))], [15, true]);
+    eq('C1 edges: two sessions only for the deploying TCK-2; one session listed twice, a ticket with no worktree, or sessions in the main checkout are not two', re.conflicts.filter((c) => c.kind === 'C1' && c.b === 'sessions').map((c) => [c.a, c.evidence.sessions]), [['TCK-2', ['sid-2a', 'sid-2b']]]);
+    eq('C6 edges: both tickets in TCK-1\'s worktree ship its migration', re.conflicts.filter((c) => c.kind === 'C6').map((c) => c.a), ['TCK-1', 'TCK-42']);
+    eq('C7 edges: an MCP change with no version still gets a publish gate', re.conflicts.filter((c) => c.kind === 'C7' && c.b === 'npm-publish').map((c) => [c.a, c.evidence.version]), [['TCK-1', '2.11.1'], ['TCK-42', '2.11.1'], ['TCK-48', null]]);
+    eq('C1, C6, C7: none while nothing waits to ship', [scan({ repo: w2, board, agents, npm: '2.12.0', withProcesses: false }).conflicts.filter((c) => c.kind === 'C1' || c.kind === 'C6' || (c.kind === 'C7' && c.b === 'npm-publish')).length], [0]);
+    // C10: TCK-3 is not on this board, so a server in its worktree is an orphan; one in TCK-1's worktree
+    // (active) or in the main checkout is not.
+    const fakeListeners = () => [
+      { pid: 4242, command: 'node', ports: [5701, 5702], cwd: path.join(w3, 'src') },
+      { pid: 4343, command: 'node', ports: [5703], cwd: w1 },
+      { pid: 4444, command: 'vite', ports: [3500], cwd: repo },
+    ];
+    const rc = scan({ repo: w2, board: { issues: [{ key: 'TCK-1', work_status: 'implementing' }] }, agents: [], npm: '2.12.0', listen: fakeListeners });
+    eq('C10: a server in a worktree with no active ticket; not one in an active ticket\'s worktree or in the main checkout', rc.conflicts.filter((c) => c.kind === 'C10').map((c) => [c.a, c.b, c.evidence.ports, path.basename(c.evidence.worktree)]), [['pid-4242', '', [5701, 5702], path.basename(w3)]]);
+    eq('C10: no process list, no C10', scan({ repo: w2, board: { issues: [] }, agents: [], npm: '2.12.0', withProcesses: false, listen: fakeListeners }).conflicts.filter((c) => c.kind === 'C10').length, 0);
+    eq('read-only: the ship scans write nothing', snapAll(), snapShip);
     // C15: a ticket still being planned, whose plan names a file main changed after the plan was written.
     const snapC15 = snapAll();
     const planOld = path.join(root, 'plan-old.md');
