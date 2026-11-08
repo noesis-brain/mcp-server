@@ -1627,9 +1627,13 @@ export class NoesisClient {
     return this.requestWithCode('PUT', `/api/mcp/backlog/issues/${encodeURIComponent(key)}/components`, { components });
   }
 
-  /** TCK-1866: links two of the user's tickets, both ways. */
-  async backlogLink(key: string, other: string): Promise<any> {
-    return this.requestWithCode('POST', `/api/mcp/backlog/issues/${encodeURIComponent(key)}/links`, { key: other });
+  /** TCK-1866: links two of the user's tickets, both ways. TCK-1890: `first` names the ticket of the two that
+   *  goes first; null removes the order; leaving it out keeps the order as it is. */
+  async backlogLink(key: string, other: string, first?: string | null): Promise<any> {
+    return this.requestWithCode('POST', `/api/mcp/backlog/issues/${encodeURIComponent(key)}/links`, {
+      key: other,
+      ...(first !== undefined ? { first } : {}),
+    });
   }
 
   /** TCK-1866: removes the link between two tickets. */

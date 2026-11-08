@@ -232,11 +232,19 @@ describe('ticket tools → client', () => {
     await run('backlog_set_components', { key: 'TCK-5', components: ['Live Voice', 'MCP'] });
     await run('backlog_link', { key: 'TCK-5', other: 'TCK-9' });
     await run('backlog_link', { key: 'TCK-5', other: 'TCK-9', unlink: true });
+    // TCK-1890: which of the two goes first, or null to remove the order.
+    await run('backlog_link', { key: 'TCK-5', other: 'TCK-9', first: 'TCK-9' });
+    await run('backlog_link', { key: 'TCK-5', other: 'TCK-9', first: null });
     expect(calls).toEqual([
       ['backlogSetComponents', 'TCK-5', ['Live Voice', 'MCP']],
-      ['backlogLink', 'TCK-5', 'TCK-9'],
+      ['backlogLink', 'TCK-5', 'TCK-9', undefined],
       ['backlogUnlink', 'TCK-5', 'TCK-9'],
+      ['backlogLink', 'TCK-5', 'TCK-9', 'TCK-9'],
+      ['backlogLink', 'TCK-5', 'TCK-9', null],
     ]);
+    const linkSchema = z.object(schemas.get('backlog_link')!);
+    for (const first of ['TCK-9', null, undefined]) expect(linkSchema.safeParse({ key: 'TCK-5', other: 'TCK-9', first }).success).toBe(true);
+    expect(linkSchema.safeParse({ key: 'TCK-5', other: 'TCK-9', first: 9 }).success).toBe(false);
     const comps = z.object(schemas.get('backlog_set_components')!);
     expect(comps.safeParse({ key: 'TCK-5', components: Array.from({ length: 9 }, (_, i) => `P${i}`) }).success).toBe(false);
     expect(comps.safeParse({ key: 'TCK-5', components: ['x'.repeat(41)] }).success).toBe(false);
@@ -396,10 +404,14 @@ describe('a refusal keeps its error_code and details', () => {
     await c.backlogSetComponents('TCK-1', ['Live Voice', 'MCP']);
     await c.backlogLink('TCK-1', 'TCK-2');
     await c.backlogUnlink('TCK-1', 'TCK-2');
+    await c.backlogLink('TCK-1', 'TCK-2', 'TCK-2');
+    await c.backlogLink('TCK-1', 'TCK-2', null);
     expect(seen).toEqual([
       { req: 'PUT https://example.test/api/mcp/backlog/issues/TCK-1/components', body: JSON.stringify({ components: ['Live Voice', 'MCP'] }) },
       { req: 'POST https://example.test/api/mcp/backlog/issues/TCK-1/links', body: JSON.stringify({ key: 'TCK-2' }) },
       { req: 'DELETE https://example.test/api/mcp/backlog/issues/TCK-1/links/TCK-2', body: undefined },
+      { req: 'POST https://example.test/api/mcp/backlog/issues/TCK-1/links', body: JSON.stringify({ key: 'TCK-2', first: 'TCK-2' }) },
+      { req: 'POST https://example.test/api/mcp/backlog/issues/TCK-1/links', body: JSON.stringify({ key: 'TCK-2', first: null }) },
     ]);
   });
 });

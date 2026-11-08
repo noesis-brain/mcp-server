@@ -459,15 +459,16 @@ export function registerBacklogTools(server: McpServer, client: NoesisClient): v
 
   server.tool(
     'backlog_link',
-    "Link two of the user's Jot tickets so they can be referenced or built together (a link reads the same from both tickets), or remove the link with unlink: true. Works in every stage, a shipped ticket too, and needs no binding. Linking twice changes nothing. Answers the ticket's links. Errors: SELF_LINK (a ticket linked to itself), NOT_FOUND (either ticket is not the user's).",
+    "Link two of the user's Jot tickets so they can be referenced or built together (a link reads the same from both tickets), or remove the link with unlink: true. Works in every stage, a shipped ticket too, and needs no binding. Linking twice changes nothing. With first, the link also says which of the two tickets goes first (build or ship it before the other); null removes that order. Answers the ticket's links, each with first (the key that goes first, or null). Errors: SELF_LINK (a ticket linked to itself), FIRST_NOT_LINKED (first is not one of the two), NOT_FOUND (a ticket is not the user's).",
     {
       key: z.string().describe('Ticket key like TCK-7'),
       other: z.string().describe('The other ticket, like TCK-12'),
       unlink: z.boolean().optional().describe('true removes the link instead'),
+      first: z.string().nullable().optional().describe('With a link: the ticket of the two that goes first, like TCK-7; null removes the order'),
     },
     async (args) => {
       try {
-        return jsonText(args.unlink ? await client.backlogUnlink(args.key, args.other) : await client.backlogLink(args.key, args.other));
+        return jsonText(args.unlink ? await client.backlogUnlink(args.key, args.other) : await client.backlogLink(args.key, args.other, args.first));
       } catch (e) {
         return errText(e);
       }
