@@ -211,15 +211,17 @@ export function registerCoordTools(server: McpServer, client: NoesisClient): voi
   server.tool(
     'coord_allocate_mcp_version',
     'Get the MCP package version for a ticket that changes md-manager-mcp-server: the next minor above npm\'s latest and above every version already handed out, so two tickets never publish the same version. ' +
-      'Pass npm_latest from `npm view <package> version`. A ticket asking again keeps its version while it is above npm. Errors: NPM_UNKNOWN (npm_latest unreadable), NOT_FOUND (the ticket is not the user\'s).',
+      'Pass npm_latest from `npm view <package> version`, and in_branches: the versions the branches and the main checkout already hold (the scanner sees them; the server cannot). A ticket asking again keeps its version while it is above npm. Errors: NPM_UNKNOWN (npm_latest unreadable), VALIDATION (an in_branches entry is not a version), NOT_FOUND (the ticket is not the user\'s).',
     {
       npm_latest: z.string().describe('The version npm reports now, like 2.12.0'),
       ticket: z.string().optional().describe('The ticket that changes the package, like TCK-7'),
+      in_branches: z.array(z.string()).max(50).optional().describe('Versions the branches and the main checkout already hold, like ["2.14.0"]: the next version skips them'),
     },
     async (args) => {
       try {
         const body: Record<string, unknown> = { npm_latest: args.npm_latest };
         if (args.ticket !== undefined) body.ticket = args.ticket;
+        if (args.in_branches !== undefined) body.in_branches = args.in_branches;
         const sid = sessionId();
         if (sid) body.holder = sid;
         return jsonText(await client.coordAllocateMcpVersion(body));

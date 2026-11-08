@@ -213,12 +213,14 @@ describe('coordination tools → client', () => {
   it('coord_allocate_mcp_version, coord_decisions, coord_decision_get, coord_policy, coord_leases', async () => {
     process.env.CLAUDE_CODE_SESSION_ID = SESSION;
     await run('coord_allocate_mcp_version', { npm_latest: '2.12.0', ticket: 'TCK-9' });
+    await run('coord_allocate_mcp_version', { npm_latest: '2.12.0', ticket: 'TCK-9', in_branches: ['2.13.0', '2.15.0'] });
     await run('coord_decisions', { status: 'pending' });
     await run('coord_decision_get', { id: 7 });
     await run('coord_policy', {});
     await run('coord_leases', {});
     expect(calls).toEqual([
       ['coordAllocateMcpVersion', { npm_latest: '2.12.0', ticket: 'TCK-9', holder: SESSION }],
+      ['coordAllocateMcpVersion', { npm_latest: '2.12.0', ticket: 'TCK-9', in_branches: ['2.13.0', '2.15.0'], holder: SESSION }],
       ['coordDecisions', { status: 'pending' }],
       ['coordDecisionGet', 7],
       ['coordPolicy'],

@@ -53,13 +53,19 @@ function sessionOf(scan, key) {
  * The actions for one scan. Each is { key, type, ... } where type is:
  *   message    {to_session | null (everyone), ticket, body}; a message for one ticket whose
  *              ticket has no session becomes a note, so it never goes to everyone
- *   allocate   {what: 'mcp-version', ticket}
+ *   allocate   {what: 'mcp-version', ticket, inBranches}   (inBranches: every version a ticket's branch
+ *              or the main checkout holds, sorted; the server cannot see them, so the next version skips them)
  *   decide     {category, rubric, choice, reason, ticket, evidence, card?}   (a judgment or an owner gate)
  *   note       {text}   (a rule that needs no step: logged once in the report)
  * Conflicts whose key is in `done` give no action.
  */
 export function rulesFor(scan, done = []) {
   const skip = new Set(done);
+  // The MCP versions the branches and the main checkout hold (as the scanner counts them): the server
+  // knows only the versions it handed out, so a version set by hand and never published stays taken.
+  const held = [scan.main && scan.main.mcpVersion, ...(scan.tickets || []).map((t) => t && t.mcp && t.mcp.version)];
+  const inBranches = [...new Set(held.filter((v) => typeof v === 'string' && v))]
+    .sort((x, y) => x.localeCompare(y, undefined, { numeric: true }));
   // How many conflicts in this scan name a ticket: the one with fewer ships first (fewer rebases after it).
   const load = (k) => (scan.conflicts || []).filter((x) => x.a === k || x.b === k).length;
   // C1: every ticket in a waiting-to-ship pair is in one ship lane, in the recommended order: fewer
@@ -164,7 +170,7 @@ export function rulesFor(scan, done = []) {
             },
           });
         } else if (c.severity === 'high' && c.evidence && isTicket(c.evidence.later)) {
-          push(c, 'allocate', { type: 'allocate', what: 'mcp-version', ticket: c.evidence.later });
+          push(c, 'allocate', { type: 'allocate', what: 'mcp-version', ticket: c.evidence.later, inBranches });
           toTicket(c, c.evidence.later, `MCP version clash: ${c.detail}. Take the version coord_allocate_mcp_version hands you; an npm publish is the owner's.`);
         } else if (ticketSide) {
           push(c, 'note', { type: 'note', text: `${ticketSide}: ${c.detail}` });
@@ -289,7 +295,14 @@ function selftest() {
     ['C15', 's1', 'TCK-1'], ['C16', 's2', 'TCK-2'], ['C4', 's2', 'TCK-2'], ['C7', 's2', 'TCK-2'], ['C8', null, null], ['C12', null, 'TCK-1'], ['C18', null, null],
   ]);
   eq('rules: the C15 message names the files', by('message')[0].body.includes('src/a.ts, src/b.ts'), true);
-  eq('rules: an MCP version clash allocates for the later ticket', by('allocate'), [{ key: 'C7|TCK-1|TCK-2|allocate', type: 'allocate', what: 'mcp-version', ticket: 'TCK-2' }]);
+  eq('rules: an MCP version clash allocates for the later ticket, naming the versions the branches hold', by('allocate'), [{ key: 'C7|TCK-1|TCK-2|allocate', type: 'allocate', what: 'mcp-version', ticket: 'TCK-2', inBranches: [] }]);
+  const versioned = rulesFor({ tickets: [{ key: 'TCK-1', mcp: { version: '2.9.0' } }, { key: 'TCK-2', mcp: { version: '2.14.0' } }, { key: 'TCK-3', mcp: { version: '2.14.0' } }, { key: 'TCK-4', mcp: null }, { key: 'TCK-5', mcp: { version: null } }],
+    conflicts: [{ kind: 'C7', severity: 'high', a: 'TCK-2', b: 'TCK-3', detail: 'same 2.14.0', evidence: { later: 'TCK-3', next: '2.15.0' } }] });
+  eq('rules: inBranches lists each branch version once, in version order (2.9.0 before 2.14.0)', versioned.find((a) => a.type === 'allocate').inBranches, ['2.9.0', '2.14.0']);
+  // The main checkout's version counts too: set by hand and never published, it is still taken.
+  const withMain = rulesFor({ main: { mcpVersion: '2.15.0' }, tickets: [{ key: 'TCK-2', mcp: { version: '2.14.0' } }, { key: 'TCK-3', mcp: { version: '2.14.0' } }],
+    conflicts: [{ kind: 'C7', severity: 'high', a: 'TCK-2', b: 'TCK-3', detail: 'same 2.14.0', evidence: { later: 'TCK-3', next: '2.16.0' } }] });
+  eq('rules: the main checkout\'s version is in inBranches', withMain.find((a) => a.type === 'allocate').inBranches, ['2.14.0', '2.15.0']);
   eq('rules: judgments for C2, C5, C14 and C10, an owner gate with a card for C13', by('decide').map((d) => [d.category, d.ticket, Boolean(d.card)]), [
     ['rebase', 'TCK-2', false], ['ship-order', 'TCK-2', false], ['ship-order', 'TCK-2', false], ['merge-tickets', 'TCK-1', true], ['cleanup', 'TCK-9', false],
   ]);
