@@ -577,3 +577,107 @@ describe('the package registers the coordination tools', () => {
     ]);
   });
 });
+
+describe('the /noesis-chief skill ships in this package (TCK-1890)', () => {
+  const template = fs.readFileSync(path.join(__dirname, '..', 'skill-templates', 'noesis-chief.md'), 'utf8');
+
+  it('names only the coord tools this package registers, and only scripts that exist here', async () => {
+    const names = new Set<string>();
+    const { registerCoordTools } = await import('../src/tools/coord.js');
+    registerCoordTools({ tool: (name: string) => names.add(name) } as never, {} as never);
+    const used = [...new Set(template.match(/\bcoord_[a-z_]+\b/g) ?? [])];
+    expect(used.length).toBeGreaterThan(6);
+    for (const n of used) expect([...names], n).toContain(n);
+    const scripts = [...template.matchAll(/\$S\/([\w-]+\.mjs)/g)].map((m) => m[1]);
+    expect(scripts).toEqual(expect.arrayContaining(['coord-scan.mjs', 'coord-rules.mjs']));
+    for (const s of scripts) expect(fs.existsSync(path.join(__dirname, '..', 'scripts', s)), s).toBe(true);
+  });
+
+  it('keeps the owner gates with the owner, records picks as parallel or after a ship, and has a report-only mode', () => {
+    expect(template).toContain('# /noesis-chief — the Chief of Staff, version 1');
+    expect(template).toContain('Answer an owner gate (the server refuses it with `OWNER_GATE`)');
+    expect(template).toContain('In server mode, do not ask the owner the cards in the terminal.');
+    expect(template).toContain('"Start TCK-<n> next, in parallel" or "Start TCK-<n> after TCK-x ships"');
+    expect(template).toContain('**report-only mode**');
+    expect(template).toContain('`as_chief: true`');
+  });
+
+  it('states each contract as the code defines it: tool parameters, server outcomes, the pick evidence and the default order', async () => {
+    const schemas = new Map<string, Record<string, unknown>>();
+    const { registerCoordTools } = await import('../src/tools/coord.js');
+    registerCoordTools({ tool: (name: string, _d: string, schema: Record<string, unknown>) => schemas.set(name, schema) } as never, {} as never);
+    const params: Array<[string, string]> = [
+      ['coord_report', 'scan_file'], ['coord_allocate_mcp_version', 'npm_latest'], ['coord_allocate_mcp_version', 'in_branches'],
+      ['coord_message', 'to_session'], ['coord_message', 'ticket'], ['coord_message', 'as_chief'],
+      ['coord_decide', 'evidence'], ['coord_decide', 'as_chief'], ['coord_decide', 'card'], ['coord_decide', 'ticket'],
+    ];
+    for (const [tool, p] of params) {
+      expect(Object.keys(schemas.get(tool) ?? {}), `${tool} has ${p}`).toContain(p);
+      expect(template, `the text names ${p}`).toContain('`' + p);
+    }
+    expect(fs.readFileSync(path.join(__dirname, '..', 'scripts', 'coord-scan.mjs'), 'utf8')).toContain('npmLatest: npm');
+    expect(fs.readFileSync(path.join(__dirname, '..', 'src', 'tools', 'coord.ts'), 'utf8')).toContain('CARD_REQUIRED');
+    for (const phrase of [
+      'with `scan_file` set to the absolute path of `scan.json`',
+      "`npm_latest` = `main.npmLatest` from `scan.json`, and `in_branches` = the action's `inBranches`",
+      'Leave out `to_session` when it is null (the message then goes to every session), and leave out `ticket` when it is null',
+      "The server answers `proceed` (auto mode, within the owner's highest level) or `review` (observe mode",
+      'The error `CARD_REQUIRED` means the server decided that the call waits for the owner',
+      "the category's mode is off, or the call's level is above the highest level the owner lets you decide alone",
+      'ticket keys only, best first (at most 9)',
+      'not a Draft first, then marked up next (pinned), then priority, then the oldest',
+    ]) expect(template).toContain(phrase);
+  });
+
+  it('keeps every limit of the role and of the report-only mode word for word', () => {
+    for (const row of [
+      "| Edit product code, or any file in a ticket's worktree |",
+      '| Merge, push, publish to npm, or apply SQL to production |',
+      '| Stop a process or a session (`stop-session` is an owner gate) |',
+      '| Carry out an answered card: the session that owns the ticket does it |',
+    ]) expect(template).toContain(row);
+    for (const phrase of [
+      'Do steps 1, 2 and 3, but skip `coord_report` and carry out no action.',
+      'run `~/.claude/tools/coord-scan.mjs` with the same arguments',
+      'Do step 5 without `coord_decide`',
+      'This is the only mode that asks in the terminal.',
+      'followed by "I will send your answer to <session>."',
+      '- Send only the approved messages',
+      'Never carry it out yourself.',
+      'In server mode, do not ask the owner the cards in the terminal.',
+      "Never send a message other than the actions' messages and the C9 message.",
+      'only inside `node\n~/.claude/tools/coord-lease.mjs run test-db -- <command>`',
+    ]) expect(template).toContain(phrase);
+  });
+
+  it('pins each instruction whole, not only its opening words', () => {
+    for (const sentence of [
+      "Call `coord_decide` with `category`, `rubric`, `choice`, `reason`, `evidence` and `as_chief: true`, and `ticket` when it is not null.",
+      "When `main.npmLatest` is null (`npm view` failed), skip it this pass and leave its key out of `done.json`.",
+      "or `review` (observe mode: it goes to the owner's review list and does not wait).",
+      "Write a card (step 4) and call again with it. Nothing is stored before that.",
+      "   - `ticket` = the first ticket, and `evidence` = the next tickets in order, ticket keys only, best first (at most 9).",
+      "Check the card first (step 4), then call `coord_decide` with the card. It waits on the Chief view until the owner answers.",
+      "When `$S/coord-rules.mjs` does not exist, sort the findings yourself by the catalogue's columns: rules become proposed messages, judgment calls go to the report's review list, owner gates become cards.",
+      "Then one batched question for the proposed messages, the C9 message of step 3 included (\"Send all of them\", \"Send none\", \"Let me pick\").",
+      "Then call `coord_report` with `scan_file` set to the absolute path of `scan.json` (expand `~`: the tool does not).",
+    ]) expect(template).toContain(sentence);
+  });
+
+  it('noesis-mcp setup installs it into ~/.claude/commands unchanged', async () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'noesis-chief-setup-'));
+    const savedHome = process.env.HOME;
+    process.env.HOME = home;
+    vi.resetModules();
+    const log = vi.spyOn(console, 'log').mockImplementation(() => {});
+    try {
+      const { runSetup } = await import('../src/cli/setup.js');
+      await runSetup([]);
+      expect(fs.readFileSync(path.join(home, '.claude', 'commands', 'noesis-chief.md'), 'utf8')).toBe(template);
+    } finally {
+      log.mockRestore();
+      process.env.HOME = savedHome;
+      fs.rmSync(home, { recursive: true, force: true });
+    }
+  });
+});
