@@ -625,7 +625,7 @@ describe('the /noesis-chief skill ships in this package (TCK-1890)', () => {
       'The error `CARD_REQUIRED` means the server decided that the call waits for the owner',
       "the category's mode is off, or the call's level is above the highest level the owner lets you decide alone",
       'ticket keys only, best first (at most 9)',
-      'not a Draft first, then marked up next (pinned), then priority, then the oldest',
+      'not a Draft first, then marked up next (pinned), then priority, then the newest.',
     ]) expect(template).toContain(phrase);
   });
 
@@ -719,6 +719,67 @@ describe('the scan watcher ships in this package (TCK-1890)', () => {
       const r = spawnSync(process.execPath, [watcher, ...argv], { encoding: 'utf8', timeout: 30_000, env });
       expect(r.status, argv.join(' ')).toBe(2);
       expect(r.stderr).toContain('--chief-pid <the Chief session pid> is required');
+    }
+  });
+});
+
+describe('the pick replay ships in this package (TCK-1890, AC10)', () => {
+  const replay = path.join(__dirname, '..', 'scripts', 'coord-pick-replay.mjs');
+
+  it('scripts/coord-pick-replay.mjs passes its own selftest from here', () => {
+    const r = spawnSync(process.execPath, [replay, '--selftest'], { encoding: 'utf8', timeout: 60_000 });
+    expect(r.status, r.stdout + r.stderr).toBe(0);
+    expect(r.stdout).toMatch(/(\d+)\/\1 passed/);
+  });
+
+  it('ranks by the order the template states, and reports the AC10 verdict on an export', () => {
+    const template = fs.readFileSync(path.join(__dirname, '..', 'skill-templates', 'noesis-chief.md'), 'utf8');
+    expect(template).toContain('not a Draft first, then marked up next (pinned), then priority, then the newest.');
+    expect(fs.readFileSync(replay, 'utf8')).toContain('not a Draft first, then marked up next, then priority, then the newest');
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pick-replay-'));
+    const at = (d: number) => new Date(Date.UTC(2026, 10, d)).toISOString();
+    const file = path.join(dir, 'export.json');
+    fs.writeFileSync(file, JSON.stringify({
+      exported_at: at(10),
+      issues: [1, 2, 3].map((id) => ({ id, created_at: at(id), work_status: 'created', priority: null, pinned_at: null })),
+      events: [{ id: 1, issue_id: 3, type: 'binding.set', created_at: at(5), payload: {} }],
+    }));
+    try {
+      const r = spawnSync(process.execPath, [replay, '--export', file, '--json'], { encoding: 'utf8', timeout: 30_000 });
+      expect(r.status, r.stderr).toBe(0);
+      const out = JSON.parse(r.stdout);
+      expect([out.picks, out.top1, out.top3, out.cases[0].key, out.cases[0].rank]).toEqual([1, 1, 1, 'TCK-3', 1]);
+      // The oldest of five waiting tickets is picked: rank 5, so the top-3 rate is 0 and the exit is 1.
+      fs.writeFileSync(file, JSON.stringify({
+        exported_at: at(10),
+        issues: [1, 2, 3, 4, 5].map((id) => ({ id, created_at: at(id), work_status: 'created', priority: null, pinned_at: null })),
+        events: [{ id: 1, issue_id: 1, type: 'binding.set', created_at: at(6), payload: {} }],
+      }));
+      const unmet = spawnSync(process.execPath, [replay, '--export', file], { encoding: 'utf8', timeout: 30_000 });
+      expect(unmet.status).toBe(1);
+      expect(unmet.stdout).toContain('AC10 needs the top-3 rate at 50% or more: NOT met.');
+      expect(unmet.stdout).toContain('TCK-1  rank 5 of 5');
+      // Exactly half in the top 3 meets AC10 ("at least half"): exit 0.
+      fs.writeFileSync(file, JSON.stringify({
+        exported_at: at(10),
+        issues: [1, 2, 3, 4, 5, 6].map((id) => ({ id, created_at: at(id), work_status: 'created', priority: null, pinned_at: null })),
+        events: [{ id: 1, issue_id: 6, type: 'binding.set', created_at: at(7), payload: {} }, { id: 2, issue_id: 1, type: 'binding.set', created_at: at(8), payload: {} }],
+      }));
+      const half = spawnSync(process.execPath, [replay, '--export', file], { encoding: 'utf8', timeout: 30_000 });
+      expect(half.stdout).toContain('top-3 1/2 (50%)');
+      expect(half.status).toBe(0);
+      // Each flag reaches the replay: the two binds of this export (days 7 and 8) change with each one.
+      const picks = (...flags: string[]) => JSON.parse(spawnSync(process.execPath, [replay, '--export', file, '--json', ...flags], { encoding: 'utf8', timeout: 30_000 }).stdout).picks;
+      expect(picks()).toBe(2);
+      expect(picks('--days', '2')).toBe(1); // only day 8 is within 2 days of day 10
+      expect(picks('--now', at(7) + '')).toBe(1); // day 8 is after now
+      expect(picks('--burst-seconds', '100000')).toBe(0); // the two binds, 1 day apart, are a batch
+      expect(picks('--min-wait-minutes', String(2 * 24 * 60))).toBe(1); // TCK-6 (created day 6, bound day 7) waited 1 day
+      const missing = spawnSync(process.execPath, [replay], { encoding: 'utf8', timeout: 30_000 });
+      expect(missing.status).toBe(2);
+      expect(missing.stderr).toContain('--export <export.json> is required');
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
     }
   });
 });

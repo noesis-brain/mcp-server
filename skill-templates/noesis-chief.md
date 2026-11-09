@@ -134,7 +134,7 @@ When a ticket waits to start (Created or Planning, with no session bound) and th
 pick, or the current pick's ticket has started, record a pick:
 
 1. Read `coord_policy` and take the `pick` category's written rules. The owner adds a rule each time they disagree with a pick.
-2. Rank the waiting tickets. Apply the written rules first. Then use the default order: not a Draft first, then marked up next (pinned), then priority, then the oldest.
+2. Rank the waiting tickets. Apply the written rules first. Then use the default order: not a Draft first, then marked up next (pinned), then priority, then the newest. On the owner's 14 real picks in the 14 days before 2026-11-09 (tickets that waited, among 85 to 103 waiting ones), this order had the pick in its top 3 for 5, and the old order (then the oldest) for 3 (`$S/coord-pick-replay.mjs`). The facts alone predict a pick poorly: the `pick` rules the owner writes when they disagree with a pick are what can make it better.
 3. A Draft (Created, no refined text, not kept by the owner) is never the first pick.
 4. Decide how the first ticket can start:
    - **In parallel**, now, when it shares no file and no feature area with an active ticket.
