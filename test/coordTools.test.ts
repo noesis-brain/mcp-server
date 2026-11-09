@@ -681,3 +681,44 @@ describe('the /noesis-chief skill ships in this package (TCK-1890)', () => {
     }
   });
 });
+
+describe('the scan watcher ships in this package (TCK-1890)', () => {
+  const watcher = path.join(__dirname, '..', 'scripts', 'coord-watch.mjs');
+  const template = fs.readFileSync(path.join(__dirname, '..', 'skill-templates', 'noesis-chief.md'), 'utf8');
+
+  it('scripts/coord-watch.mjs passes its own selftest from here', () => {
+    const r = spawnSync(process.execPath, [watcher, '--selftest'], { encoding: 'utf8', timeout: 60_000 });
+    expect(r.status, r.stdout + r.stderr).toBe(0);
+    expect(r.stdout).toMatch(/(\d+)\/\1 passed/);
+  });
+
+  it('wakes the Chief with the line /noesis-chief watch mode answers, and the template starts it the way it parses', async () => {
+    const mod = await import('../scripts/coord-watch.mjs');
+    expect(mod.WAKE_LINE).toBe('/noesis-chief watch');
+    expect(template).toContain('`ScheduleWakeup` with 1800 seconds and the prompt `/noesis-chief watch`');
+    expect(template).toContain('S=<repo>/md-manager-mcp-server/scripts\nnode $S/coord-watch.mjs --start --chief-pid $PPID --repo <repo>');
+    expect(template).toContain('There is no scan watcher in this mode: use only the `ScheduleWakeup` wake of Watch mode.');
+    expect(mod.ACTIVE_STATUSES).toEqual(['planning', 'ready_to_implement', 'implementing', 'iterating', 'ready_to_merge', 'deploying']);
+  });
+
+  it('pins each new sentence of the text whole', () => {
+    for (const sentence of [
+      "- Add the `C9|lease|<date>` key to `done.json` whether the owner approved the C9 message or not, so a later pass that day does not ask again.",
+      "- Then one multiSelect question for the review list, with the header `Review`: \"Which of my choices do you agree with?\". Each choice that is not ticked counts as a disagree; write the owner's reason into `~/.claude/coord/<date>-review.md`.",
+      "- The report's Ship order part comes from the scan's C1 lines, because `coord_leases` needs the server.",
+      "`components`. A Planning ticket with no session bound also waits to start, so step 5 ranks it\nwith these fields.",
+      "(the list gives only `link_count`: read the ticket's `links[].first` with `mcp__noesis__backlog_get` and its key).",
+      "`/noesis-chief watch` into this session, but only when this session is idle: never at a question\nor a permission prompt. It stops when this session ends, and it starts nothing while another\nwatcher serves a live Chief.",
+      "`priority`, `size`, `created_at`, `refined_text`, `refined_at`, `open_question_count`,",
+    ]) expect(template).toContain(sentence);
+  });
+
+  it('refuses to run without the Chief pid, before it reads any API setting', () => {
+    const env = { ...process.env, NOESIS_API_URL: 'http://127.0.0.1:9', NOESIS_API_TOKEN: 'dead' };
+    for (const argv of [['--once'], ['--once', '--chief-pid', '1'], ['--start']]) {
+      const r = spawnSync(process.execPath, [watcher, ...argv], { encoding: 'utf8', timeout: 30_000, env });
+      expect(r.status, argv.join(' ')).toBe(2);
+      expect(r.stderr).toContain('--chief-pid <the Chief session pid> is required');
+    }
+  });
+});

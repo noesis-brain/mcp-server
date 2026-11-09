@@ -52,6 +52,10 @@ the Noesis server does not have the coordination routes yet (TCK-1890 is not shi
 - Ask the owner with AskUserQuestion. This is the only mode that asks in the terminal. First the first owner-gate card: its question is the card's `Decide:` line followed by "I will send your answer to <session>.", so the owner's answer is the yes for that one message. Then one batched question for the proposed messages, the C9 message of step 3 included ("Send all of them", "Send none", "Let me pick").
 - Send only the approved messages, with `SendMessage` to the session's name from `ListAgents`. A session that is not reachable gets the message on its ticket (`mcp__noesis__backlog_post_message`, `kind: comment`).
 - Tell the owning session each answered card with `SendMessage`, as the question said. Never carry it out yourself.
+- Add the `C9|lease|<date>` key to `done.json` whether the owner approved the C9 message or not, so a later pass that day does not ask again.
+- Then one multiSelect question for the review list, with the header `Review`: "Which of my choices do you agree with?". Each choice that is not ticked counts as a disagree; write the owner's reason into `~/.claude/coord/<date>-review.md`.
+- The report's Ship order part comes from the scan's C1 lines, because `coord_leases` needs the server.
+- There is no scan watcher in this mode: use only the `ScheduleWakeup` wake of Watch mode.
 
 ## One pass
 
@@ -61,9 +65,11 @@ Work files for one pass go in `~/.claude/coord/`. They are scratch: the record i
 
 Call `mcp__noesis__backlog_get` with `images: false` once for each active status: `planning`,
 `ready_to_implement`, `implementing`, `iterating`, `ready_to_merge`, `deploying`. Write only these
-fields of each issue to `~/.claude/coord/board.json`, as `{"issues": [...]}`: `key`,
+fields of each issue to `~/.claude/coord/board.json`, as `{"issues": [...]}`: `key`, `title`,
 `work_status`, `work_status_at`, `bound_session_id`, `branch`, `worktree`, `pinned_at`,
-`priority`, `open_question_count`, `components`.
+`priority`, `size`, `created_at`, `refined_text`, `refined_at`, `open_question_count`,
+`components`. A Planning ticket with no session bound also waits to start, so step 5 ranks it
+with these fields.
 
 Also call it once with `status: "created"`. Keep those tickets for step 5 only, with `key`,
 `title`, `refined_text`, `refined_at`, `pinned_at`, `priority`, `size`, `created_at`,
@@ -132,7 +138,7 @@ pick, or the current pick's ticket has started, record a pick:
 3. A Draft (Created, no refined text, not kept by the owner) is never the first pick.
 4. Decide how the first ticket can start:
    - **In parallel**, now, when it shares no file and no feature area with an active ticket.
-   - **After TCK-x ships**, when it changes the same files or the same feature area as the active ticket TCK-x: an open C14 conflict, an entry in `components` that both tickets have, or a `first` link that puts TCK-x first. The scanner reads only active tickets, so for a Created ticket use its `components` and links. Starting it now would mean a rebase or a merge conflict later.
+   - **After TCK-x ships**, when it changes the same files or the same feature area as the active ticket TCK-x: an open C14 conflict, an entry in `components` that both tickets have, or a `first` link that puts TCK-x first (the list gives only `link_count`: read the ticket's `links[].first` with `mcp__noesis__backlog_get` and its key). The scanner reads only active tickets, so for a Created ticket use its `components` and links. Starting it now would mean a rebase or a merge conflict later.
 5. Call `coord_decide` with:
    - `category: "pick"`;
    - `ticket` = the first ticket, and `evidence` = the next tickets in order, ticket keys only, best first (at most 9). The Chief view ranks Up next from this list, so any other ticket key in it would get a rank;
@@ -163,9 +169,21 @@ Chief view, and the server sends each answer to the inbox of every session the c
 
 ## Watch mode
 
-After the pass, if any ticket is active, wait for the next wake. The scan watcher types
-`/noesis-chief watch` into this session when the scan changes. Without the watcher, call
-`ScheduleWakeup` with 1800 seconds and the prompt `/noesis-chief watch`. On a wake:
+After the pass, if any ticket is active, start the scan watcher once:
+
+```bash
+S=<repo>/md-manager-mcp-server/scripts
+node $S/coord-watch.mjs --start --chief-pid $PPID --repo <repo>
+```
+
+`$PPID` in the Bash tool is this session's Claude Code process. The watcher opens its own iTerm2
+tab, because macOS lets only a process with a terminal drive iTerm2, and goes back to this tab.
+Every 5 minutes it scans. When the result changes, it posts the scan and types
+`/noesis-chief watch` into this session, but only when this session is idle: never at a question
+or a permission prompt. It stops when this session ends, and it starts nothing while another
+watcher serves a live Chief. It has no model, so it costs no tokens. Also call
+`ScheduleWakeup` with 1800 seconds and the prompt `/noesis-chief watch`: that wake comes when
+nothing changes, or when the watcher is not running. On a wake:
 1. Run steps 1–3 again (`done.json` keeps the rules from repeating).
 2. Compare the result with the last `scan.json`, by conflict kind and ticket pair.
 3. Report only the new and the resolved findings, and any new card.
