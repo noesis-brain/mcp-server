@@ -18,6 +18,7 @@ import { currentSessionRef, upsertSessionFrontmatter, type ClaudeSessionRef } fr
 import { buildIndex, matchSessions } from './sessionIndex.js';
 import { registerNaviTools } from './navis.js';
 import { registerSkillTools } from './skills.js';
+import { registerSmartLinkTools } from './smartLinks.js';
 import { registerBacklogTools } from './backlog.js';
 import { registerExamTools } from './exam.js';
 import { suggestOtherOsPath } from '../utils/suggestPath.js';
@@ -253,6 +254,7 @@ export function registerTools(server: McpServer, services: ToolServices): void {
   registerNaviTools(server, client);
   registerSkillTools(server, client);
   registerBacklogTools(server, client);
+  registerSmartLinkTools(server, client);
   registerExamTools(server, client);
 
   // Register search_notes tool

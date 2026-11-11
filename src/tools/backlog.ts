@@ -104,7 +104,7 @@ function errText(e: unknown): { content: Array<{ type: 'text'; text: string }>; 
 export function registerBacklogTools(server: McpServer, client: NoesisClient): void {
   server.tool(
     'backlog_get',
-    'Read the Backlog: without a key, list issues (+ per-stage counts and open_question_count, optionally filtered by stage or a text query); with a key (TCK-<n>), the full issue including increments, open owner questions, and the bounded message thread (questions + answers linked via answered_by_message_id — what RESOLVE reads). A ticket\'s pictures (screenshots the owner pasted or attached) follow the JSON as images, each after a line saying where it appears; look at them, they are part of the request.',
+    'Read the Backlog: without a key, list issues (+ per-stage counts and open_question_count, optionally filtered by stage or a text query); with a key (TCK-<n>), the full issue including its components, the tickets linked to it (links: key, title, headline, work_status), increments, open owner questions, and the bounded message thread (questions + answers linked via answered_by_message_id — what RESOLVE reads). A ticket\'s pictures (screenshots the owner pasted or attached) follow the JSON as images, each after a line saying where it appears; look at them, they are part of the request.',
     {
       key: z.string().optional().describe('Issue key like TCK-7 (omit to list)'),
       stage: STAGE_ENUM.optional().describe('List filter: only this stage'),
@@ -424,6 +424,41 @@ export function registerBacklogTools(server: McpServer, client: NoesisClient): v
         const body: Record<string, unknown> = { ...who, text: args.text, kind: args.kind };
         if (args.difficulty !== undefined) body.difficulty = args.difficulty;
         return jsonText(await client.backlogSetGut(args.key, body));
+      } catch (e) {
+        return errText(e);
+      }
+    }
+  );
+
+  // TCK-1866: a ticket's components and its links to other tickets. Bookkeeping: any stage, a shipped ticket
+  // too, and no session needed — so a loop's close-out can record them after the ticket is shipped.
+  server.tool(
+    'backlog_set_components',
+    "Set the major components a Jot ticket's work touched (the full list: at most 8 names of at most 40 characters; names are trimmed and kept once, ignoring case). Works in every stage, a shipped ticket too, and needs no binding. Reuse names the user's tickets already use (backlog_get shows each ticket's components). Errors: VALIDATION (too many or too long), NOT_FOUND.",
+    {
+      key: z.string().describe('Ticket key like TCK-7'),
+      components: z.array(z.string().min(1).max(40)).max(8).describe('The full list of component names, e.g. ["Live Voice", "MCP"]'),
+    },
+    async (args) => {
+      try {
+        return jsonText(await client.backlogSetComponents(args.key, args.components));
+      } catch (e) {
+        return errText(e);
+      }
+    }
+  );
+
+  server.tool(
+    'backlog_link',
+    "Link two of the user's Jot tickets so they can be referenced or built together (a link reads the same from both tickets), or remove the link with unlink: true. Works in every stage, a shipped ticket too, and needs no binding. Linking twice changes nothing. Answers the ticket's links. Errors: SELF_LINK (a ticket linked to itself), NOT_FOUND (either ticket is not the user's).",
+    {
+      key: z.string().describe('Ticket key like TCK-7'),
+      other: z.string().describe('The other ticket, like TCK-12'),
+      unlink: z.boolean().optional().describe('true removes the link instead'),
+    },
+    async (args) => {
+      try {
+        return jsonText(args.unlink ? await client.backlogUnlink(args.key, args.other) : await client.backlogLink(args.key, args.other));
       } catch (e) {
         return errText(e);
       }
