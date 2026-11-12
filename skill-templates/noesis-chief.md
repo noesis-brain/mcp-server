@@ -40,6 +40,16 @@ $ARGUMENTS
 - `watch`: a pass now, then wait for the next wake. The scan watcher (`coord-watch.mjs`) wakes you when the scan changes. Without it, `ScheduleWakeup` every 30 minutes while any ticket is active. Stop when no ticket is active.
 - `--repo <path>`: the main checkout. The default is `~/temp_cGit/md-manager` on this Mac. The scripts below are in its `md-manager-mcp-server/scripts/` folder, the same package the `noesis` MCP runs from.
 
+## First, while the owner is here: what only the owner can unblock
+
+Some steps wait for the owner and nobody else: an npm login with its one-time password, a key or a
+login the owner must set, and a yes for SQL on production. Find them on the first pass, while the
+owner is present, never at ship time when the owner may be asleep.
+- Run `npm whoami`. When it fails and a ticket changes the MCP package (a C7 line, or `MCP changed` in the scan), put "npm login needed before <ticket> can publish" first under Needs you, and ask the owner to run `npm login` now.
+- List every other owner-only step a ticket at Ready to merge or Implementing will need (a migration for production, a key), and ask for all of them in one batch.
+
+On 2026-11-13 the TCK-1890 ship found npm signed out only at the publish step, and the work waited all night for the owner.
+
 ## Before the first pass: does the server have the routes?
 
 Call `coord_policy` once. When the tool is missing, or the call fails with `Not found` (HTTP 404),
@@ -154,7 +164,7 @@ The Chief view's Up next shows this order. A pick is a suggestion: you never sta
 Write the report in plain sentences (`~/.claude/references/note-style-guide.md` § Write Plain
 Sentences). Put what needs the owner first. A section with nothing in it is left out.
 
-1. **Needs you.** How many cards wait, the `Decide:` line of each, and the link to the Chief view.
+1. **Needs you.** The owner-only steps found first (an npm login, a key, a production SQL yes), how many cards wait, the `Decide:` line of each, and the link to the Chief view.
 2. **Waiting for you now.** The C17 sessions that are at a question or a permission prompt, with the ticket and how long they have waited.
 3. **What I did.** One line per message sent and per version handed out, with the rule.
 4. **For your review.** How many judgment calls wait in the review list.

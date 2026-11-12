@@ -593,6 +593,14 @@ describe('the /noesis-chief skill ships in this package (TCK-1890)', () => {
     for (const s of scripts) expect(fs.existsSync(path.join(__dirname, '..', 'scripts', s)), s).toBe(true);
   });
 
+  it('finds the owner-only steps first, before the server check, with the npm login named (2026-11-13)', () => {
+    const first = template.indexOf('## First, while the owner is here: what only the owner can unblock');
+    expect(first).toBeGreaterThan(0);
+    expect(first).toBeLessThan(template.indexOf('## Before the first pass: does the server have the routes?'));
+    expect(template).toContain('- Run `npm whoami`. When it fails and a ticket changes the MCP package (a C7 line, or `MCP changed` in the scan), put "npm login needed before <ticket> can publish" first under Needs you, and ask the owner to run `npm login` now.');
+    expect(template).toContain('1. **Needs you.** The owner-only steps found first (an npm login, a key, a production SQL yes), how many cards wait');
+  });
+
   it('keeps the owner gates with the owner, records picks as parallel or after a ship, and has a report-only mode', () => {
     expect(template).toContain('# /noesis-chief — the Chief of Staff, version 1');
     expect(template).toContain('Answer an owner gate (the server refuses it with `OWNER_GATE`)');
