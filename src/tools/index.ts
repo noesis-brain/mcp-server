@@ -17,6 +17,7 @@ import { SyncStateManager, determineSyncDirection } from './SyncStateManager.js'
 import { currentSessionRef, upsertSessionFrontmatter, type ClaudeSessionRef } from './claudeSessions.js';
 import { buildIndex, matchSessions } from './sessionIndex.js';
 import { registerNaviTools } from './navis.js';
+import { registerSkillTools } from './skills.js';
 import { registerSmartLinkTools } from './smartLinks.js';
 import { registerBacklogTools } from './backlog.js';
 import { registerCoordTools } from './coord.js';
@@ -252,6 +253,7 @@ export function registerTools(server: McpServer, services: ToolServices): void {
 
   // Register Navi management tools
   registerNaviTools(server, client);
+  registerSkillTools(server, client);
   registerBacklogTools(server, client);
   registerCoordTools(server, client);
   registerSmartLinkTools(server, client);
