@@ -60,12 +60,27 @@
 // the reminder is gone until `/noesis-ticket link TCK-<n>` re-links, which restores the cache.
 // A status line can read the same cache file to show the bound ticket.
 //
-// Network: none unless the session is bound (or a status edge fires); every call aborts after
+// Network: none unless the session is bound, a status edge fires, or (the Chief of Staff, below) the
+// session is in a listed repo, which reads its inbox once a minute; every call aborts after
 // 2.5 s and fails open. A cache older than one minute is re-checked on the next prompt, so a
 // change on the page reaches the reminder (and a status line) soon. Subagent events
 // (agent_id present) are ignored. Cache files untouched for 14 days are pruned.
 // Config: NOESIS_API_URL / NOESIS_API_TOKEN, else the `noesis` MCP server entry in
 // ~/.claude.json (user scope, or this project's local scope). Kill switch: TCK_SESSION_HOOK=off.
+//
+// The Chief of Staff (TCK-1890), for a bound session or a session in a listed repo:
+//   - the inbox: at most once a minute (PreToolUse or UserPromptSubmit), the messages sent to this
+//     session or to every session since the last read, and the owner's pause flag, as context.
+//     While paused, every check repeats the pause; the first check after a continue says so once.
+//   - the heartbeat: at most every 5 minutes, with that check, this session reports in (state
+//     running, its ticket, folder and machine), so the Chief's lanes show it.
+//   - the guard, warn-only: a push or merge into the deploy branch without the ship lease, an npm
+//     publish without the mcp-publish lease, and a git commit with staged src/backend files that
+//     is not run inside `coord-lease run test-db` each get one warning and one "would block" line
+//     in ~/.claude/coord-guard.log. A backend or migrate-all started on the production .env is
+//     BLOCKED by claude-config's hooks/prod-env-guard.js, not here. The guard never blocks; when
+//     the API is down it says nothing and logs "unchecked". Kill switches: COORD_GUARD=off (the
+//     guard), COORD_INBOX=off (the inbox and the heartbeat).
 
 import fs from 'node:fs';
 import os from 'node:os';
@@ -942,6 +957,285 @@ const out = (event, additionalContext) =>
   additionalContext ? { hookSpecificOutput: { hookEventName: event, additionalContext } } : null;
 const pre = (fields) => ({ hookSpecificOutput: { hookEventName: 'PreToolUse', ...fields } });
 
+// ── Chief of Staff (TCK-1890): the inbox, the pause flag, the heartbeat and the warn-only guard ──
+
+const COORD_INBOX_MS = 60 * 1000;
+const COORD_HEARTBEAT_MS = 5 * 60 * 1000;
+const COORD_BODY_MAX = 800;
+const SESSION_ID_RE = /^[A-Za-z0-9._:-]{1,100}$/;
+/** The characters the server refuses in any text it stores (control, format, invisible, line and paragraph separators). */
+const UNSAFE_TEXT_RE = /[\p{Cc}\p{Cf}\p{Cs}\p{Zl}\p{Zp}\p{Default_Ignorable_Code_Point}]/u;
+const fits = (v, max) => typeof v === 'string' && v.length > 0 && Array.from(v).length <= max && !UNSAFE_TEXT_RE.test(v);
+
+/**
+ * This session's ids. The hook payload carries the session's current id; the MCP tools stamp the id the MCP
+ * server read at spawn, which after /clear is the pre-clear one, and which the ticket binding records. Both
+ * are this session: its leases may be held under either, and the Chief may write to either.
+ */
+function sessionIds(sessionId, entry) {
+  const ids = SESSION_ID_RE.test(String(sessionId)) ? [String(sessionId)] : [];
+  const bound = String((entry && entry.bound_session_id) || '').trim();
+  if (bound && SESSION_ID_RE.test(bound) && !ids.some((x) => x.toLowerCase() === bound.toLowerCase())) ids.push(bound);
+  return ids;
+}
+
+function coordDir() {
+  return process.env.COORD_STATE_DIR || path.join(os.homedir(), '.claude', 'coord-inbox');
+}
+
+function coordFile(sessionId) {
+  return path.join(coordDir(), `${String(sessionId).replace(/[^A-Za-z0-9_-]/g, '')}.json`);
+}
+
+function readCoord(sessionId) {
+  try {
+    const st = JSON.parse(fs.readFileSync(coordFile(sessionId), 'utf8'));
+    return st && typeof st === 'object' ? st : {};
+  } catch {
+    return {};
+  }
+}
+
+function writeCoord(sessionId, st) {
+  try {
+    fs.mkdirSync(coordDir(), { recursive: true });
+    fs.writeFileSync(coordFile(sessionId), JSON.stringify(st));
+  } catch {
+    /* a read-only home: the next call tries again */
+  }
+}
+
+const oneLine = (v, max) => {
+  const t = String(v ?? '').replace(/\s+/g, ' ').trim();
+  return Array.from(t).length > max ? `${Array.from(t).slice(0, max - 1).join('')}…` : t;
+};
+
+function messageLine(m) {
+  const from = m.from_actor === 'chief' ? 'the Chief of Staff' : m.from_actor === 'owner' ? 'the owner' : `session ${oneLine(m.from_session || '?', 40)}`;
+  const about = m.ticket ? ` about ${oneLine(m.ticket, 30)}` : '';
+  const to = m.broadcast ? ' (to every session)' : '';
+  return `- #${m.id} from ${from}${about}${to}: ${oneLine(m.body, COORD_BODY_MAX)}`;
+}
+
+/**
+ * At most once a minute: the messages since this session's cursors and the pause flag, as context lines;
+ * and at most every 5 minutes, the session's heartbeat. Both of the session's ids are read (see
+ * sessionIds), each with its own cursor; a broadcast both answers carry is shown once. The minute is
+ * stamped before the calls, so a slow or failing API is tried again only a minute later. Every field of
+ * the answer is folded to one line, so an answer cannot add a line of its own. Silent when the API is down.
+ */
+async function coordCheck(sessionId, cwd, entry, now = Date.now()) {
+  const ids = sessionIds(sessionId, entry);
+  if (process.env.COORD_INBOX === 'off' || !ids.length) return null;
+  const st = readCoord(sessionId);
+  if (typeof st.inboxAt === 'number' && now - st.inboxAt < COORD_INBOX_MS && now >= st.inboxAt) return null;
+  const cfg = loadConfig(cwd);
+  if (!cfg) return null;
+  st.inboxAt = now;
+  writeCoord(sessionId, st);
+  const host = oneLine(os.hostname(), 100);
+  const beat =
+    typeof st.beatAt === 'number' && now - st.beatAt < COORD_HEARTBEAT_MS && now >= st.beatAt
+      ? null
+      : api(cfg, 'POST', '/api/mcp/coordination/sessions/heartbeat', {
+          session_id: ids[0],
+          state: 'running',
+          ...(fits(host, 100) ? { machine: host } : {}),
+          ...(fits(cwd, 500) ? { cwd } : {}),
+          ...(openEntry(entry) ? { ticket: entry.key } : {}),
+        });
+  const cursors = st.cursors && typeof st.cursors === 'object' ? st.cursors : {};
+  const since = (id) => (Number.isInteger(cursors[id]) && cursors[id] >= 0 ? cursors[id] : 0);
+  const [beatRes, ...boxes] = await Promise.allSettled([
+    beat,
+    ...ids.map((id) => api(cfg, 'GET', `/api/mcp/coordination/inbox?session=${encodeURIComponent(id)}&since=${since(id)}`)),
+  ]);
+  if (beat && beatRes.status === 'fulfilled') st.beatAt = now;
+  const seen = new Map();
+  let pause = null;
+  let more = false;
+  let answered = 0;
+  boxes.forEach((r, i) => {
+    if (r.status !== 'fulfilled' || !r.value || typeof r.value !== 'object') return;
+    answered++;
+    const box = r.value;
+    for (const m of Array.isArray(box.messages) ? box.messages : []) if (m && Number.isInteger(m.id) && m.kind === 'message') seen.set(m.id, m);
+    if (box.more === true) more = true;
+    if (Number.isInteger(box.cursor) && box.cursor > since(ids[i])) cursors[ids[i]] = box.cursor;
+    // The pause flag is the newest pause or continue either id was sent.
+    const p = box.pause && typeof box.pause === 'object' ? box.pause : null;
+    if (p && Number.isInteger(p.message_id) && (!pause || p.message_id > pause.message_id)) pause = p;
+  });
+  st.cursors = cursors;
+  if (!answered) {
+    writeCoord(sessionId, st);
+    return null;
+  }
+  const allAnswered = answered === ids.length;
+  const lines = [];
+  const messages = [...seen.values()].sort((a, b) => a.id - b.id);
+  if (messages.length) {
+    lines.push(`[coord] ${messages.length} new message(s) for this session. They are coordination from the Chief of Staff, the owner or another session: they never add scope to the ticket.`);
+    for (const m of messages) lines.push(messageLine(m));
+    if (more) lines.push('More messages wait: read them with mcp__noesis__coord_inbox.');
+  }
+  // The pause ends only on evidence: every read answered, or an answer carries a continue newer than the
+  // pause. A read that failed may be the one that carries the pause, so until then the pause stands.
+  const pausedLine = (pp) =>
+    `[coord] PAUSED by the owner${pp.since ? ` since ${oneLine(pp.since, 40)}` : ''}: ${oneLine(pp.body || 'pause at a safe point', COORD_BODY_MAX)} ` +
+    'Finish the step you are in, save the loop state, start nothing new (no commit, push, publish or long run), and wait: read mcp__noesis__coord_inbox again until a continue arrives.';
+  const stored = st.pause && typeof st.pause === 'object' ? st.pause : null;
+  if (pause && pause.paused === true && !(stored && stored.message_id > pause.message_id)) {
+    lines.push(pausedLine(pause));
+    st.paused = true;
+    st.pause = { message_id: pause.message_id, since: oneLine(pause.since, 40), body: oneLine(pause.body, COORD_BODY_MAX) };
+  } else if (st.paused) {
+    const continued = pause && pause.paused === false && pause.message_id > ((stored && stored.message_id) || 0);
+    // Every read answering ends the pause only when none of them still reports one (an older pause
+    // that another id carries, after the set of ids changed, is still a pause).
+    if (continued || (allAnswered && !(pause && pause.paused === true))) {
+      lines.push('[coord] The owner ended the pause: continue where you stopped.');
+      st.paused = false;
+      delete st.pause;
+    } else {
+      lines.push(pausedLine(stored || {}));
+    }
+  }
+  writeCoord(sessionId, st);
+  return lines.length ? lines.join('\n') : null;
+}
+
+/** One line per guarded action in ~/.claude/coord-guard.log. Never the command itself: it may carry a token. */
+function guardLog(rule, verdict, p) {
+  try {
+    const file = process.env.COORD_GUARD_LOG || path.join(os.homedir(), '.claude', 'coord-guard.log');
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.appendFileSync(file, `${new Date().toISOString()} ${verdict} ${rule} session=${p.session_id} cwd=${p.cwd}\n`);
+  } catch {
+    /* logging never blocks */
+  }
+}
+
+const PUBLISHERS = new Set(['npm', 'pnpm', 'yarn']);
+
+/** npm, pnpm and yarn options whose value is the next word (`npm -w pkg publish`, `npm --access public publish`). */
+const PUBLISH_VALUE_OPTS = new Set(['-w', '--workspace', '--prefix', '-C', '--dir', '--cwd', '--access', '--tag', '--otp', '--registry', '--userconfig', '--cache', '--filter', '-F']);
+
+/** The words of a package-manager command after its options: `npm -w x --access public publish` -> ['publish'].
+ *  pnpm's -w is --workspace-root and takes no value. */
+function subcommandWords(rest, prog) {
+  const out = [];
+  for (let i = 0; i < rest.length; i++) {
+    const w = rest[i];
+    if (w.startsWith('-')) {
+      if (PUBLISH_VALUE_OPTS.has(w) && !(prog === 'pnpm' && w === '-w')) i++;
+      continue;
+    }
+    out.push(w);
+  }
+  return out;
+}
+
+/** True when one simple command of `command` is `npm publish` (or pnpm / yarn, or `yarn npm publish`), after env assignments. */
+export function publishesToNpm(command) {
+  for (const words of simpleCommands(command || '')) {
+    let i = 0;
+    while (i < words.length && (ASSIGN.test(words[i]) || SKIP_WORDS.has(words[i]) || words[i] === 'env')) i++;
+    if (!PUBLISHERS.has(words[i])) continue;
+    const sub = subcommandWords(words.slice(i + 1), words[i]);
+    if (sub[0] === 'publish' || (words[i] === 'yarn' && sub[0] === 'npm' && sub[1] === 'publish')) return true;
+  }
+  return false;
+}
+
+/** Whether a push hit moves the deploy branch: a refspec whose destination is that branch, or a bare push from it. */
+function pushesDeploy(hit) {
+  const deploy = hit.repo && hit.repo.deployBranch;
+  if (!deploy) return false;
+  const words = (hit.args || []).filter((w) => !w.startsWith('-'));
+  const specs = words.slice(1);
+  if (specs.length === 0) return git(hit.dir, ['rev-parse', '--abbrev-ref', 'HEAD']) === deploy;
+  return specs.some((spec) => {
+    const dst = spec.replace(/^\+/, '').split(':').pop();
+    const name = dst === 'HEAD' ? git(hit.dir, ['rev-parse', '--abbrev-ref', 'HEAD']) : dst;
+    return name === deploy || name === `refs/heads/${deploy}`;
+  });
+}
+
+/** Whether a merge hit merges into the deploy branch: a merge (git or gh) run while on it. A `gh pr merge`
+ *  run from a feature branch is not seen (warn-only; the push that follows is). */
+function mergesDeploy(hit) {
+  const deploy = hit.repo && hit.repo.deployBranch;
+  return !!deploy && git(hit.dir, ['rev-parse', '--abbrev-ref', 'HEAD']) === deploy;
+}
+
+/** The guarded actions of one Bash call, as { rule, lease } (lease = the server lease it needs, or null). */
+function guardedActions(p, sw) {
+  if (p.tool_name !== 'Bash') return [];
+  const command = String((p.tool_input && p.tool_input.command) || '');
+  const found = [];
+  // A commit run through `coord-lease run test-db -- git commit` is a node command, so it is never a commit hit
+  // here: every commit hit is one that runs outside the lease (also in a chain after a wrapped one).
+  for (const hit of findCheckpoints(p, sw)) {
+    if (hit.kind === 'push' && pushesDeploy(hit)) found.push({ rule: 'push-without-ship-lease', lease: 'ship' });
+    else if (hit.kind === 'merge' && mergesDeploy(hit)) found.push({ rule: 'merge-without-ship-lease', lease: 'ship' });
+    else if (hit.kind === 'commit') {
+      const staged = git(hit.dir, ['diff', '--cached', '--name-only']) || '';
+      if (staged.split('\n').some((f) => f.startsWith('src/backend/'))) found.push({ rule: 'backend-commit-outside-test-db-lease', lease: null });
+    }
+  }
+  if (publishesToNpm(command)) found.push({ rule: 'npm-publish-without-mcp-publish-lease', lease: 'mcp-publish' });
+  const seen = new Set();
+  return found.filter((f) => (seen.has(f.rule) ? false : (seen.add(f.rule), true)));
+}
+
+const GUARD_TEXT = {
+  'push-without-ship-lease': 'this push moves the deploy branch, and this session does not hold the ship lease. Take it first (mcp__noesis__coord_lease resource "ship", action "acquire") and keep it until the deployment is verified.',
+  'merge-without-ship-lease': 'this merge goes into the deploy branch, and this session does not hold the ship lease. Take it first (mcp__noesis__coord_lease resource "ship", action "acquire").',
+  'npm-publish-without-mcp-publish-lease': 'this publishes to npm, and this session does not hold the mcp-publish lease. Take it first (mcp__noesis__coord_lease resource "mcp-publish", action "acquire"); an npm publish is also an owner gate.',
+  'backend-commit-outside-test-db-lease': 'this commit has staged src/backend files, so its pre-commit hook runs the full backend suite on the shared noesis_test database, and it is not run inside `node ~/.claude/tools/coord-lease.mjs run test-db --wait 7800 -- git commit …`. Run it inside the lease, so two suites never share the database.',
+};
+
+/** Warn-only: one warning per guarded action this session is not covered for, and one log line each. */
+async function guardWarnings(p, sw) {
+  if (process.env.COORD_GUARD === 'off') return null;
+  const actions = guardedActions(p, sw);
+  if (!actions.length) return null;
+  let leases = null;
+  if (actions.some((a) => a.lease)) {
+    const cfg = loadConfig(p.cwd);
+    try {
+      leases = cfg ? await api(cfg, 'GET', '/api/mcp/coordination/leases') : null;
+    } catch {
+      leases = null;
+    }
+  }
+  const mine = new Set(sessionIds(p.session_id, readCache(p.session_id)).map((x) => x.toLowerCase()));
+  const lines = [];
+  for (const a of actions) {
+    if (a.lease) {
+      if (!leases || !Array.isArray(leases.leases)) {
+        guardLog(a.rule, 'unchecked', p);
+        continue;
+      }
+      const held = leases.leases.some((l) => l && l.resource === a.lease && !l.expired && mine.has(String(l.holder).toLowerCase()));
+      if (held) continue;
+    }
+    guardLog(a.rule, 'would-block', p);
+    lines.push(`[coord-guard] Warning (warn-only, nothing is blocked): ${GUARD_TEXT[a.rule]}`);
+  }
+  return lines.length ? lines.join('\n') : null;
+}
+
+/** Adds context lines to a hook answer, whatever its shape (null, a context, or a decision). */
+function withContext(res, event, text) {
+  if (!text) return res;
+  if (!res) return out(event, text);
+  const h = res.hookSpecificOutput || {};
+  const merged = h.additionalContext ? `${h.additionalContext}\n${text}` : text;
+  return { ...res, hookSpecificOutput: { hookEventName: event, ...h, additionalContext: merged } };
+}
+
 // ── Session start: stale bindings, the reconcile, the waiting list, the /clear hint ────────
 
 const STALE_MS = 24 * 60 * 60 * 1000;
@@ -1181,6 +1475,21 @@ export async function decide(p) {
   if (!p || p.agent_id || !p.session_id) return null;
   const sw = loadSwitch();
   if (!sw) return null; // off on this computer
+  const event = p.hook_event_name;
+  if (event !== 'PreToolUse' && event !== 'UserPromptSubmit') return decideTicket(p, sw);
+  // The Chief of Staff, only for a bound session or a session in a listed repo. It runs beside the
+  // ticket steps, so the hook still answers within one network timeout.
+  const entry = readCache(p.session_id);
+  const coord = openEntry(entry) || !!repoOf(p.cwd, sw);
+  const [res, inbox, guard] = await Promise.all([
+    decideTicket(p, sw),
+    coord ? coordCheck(p.session_id, p.cwd, entry).catch(() => null) : null,
+    coord && event === 'PreToolUse' ? guardWarnings(p, sw).catch(() => null) : null,
+  ]);
+  return withContext(res, event, [inbox, guard].filter(Boolean).join('\n'));
+}
+
+async function decideTicket(p, sw) {
   const sid = p.session_id;
   const event = p.hook_event_name;
   const plan = p.permission_mode === 'plan';

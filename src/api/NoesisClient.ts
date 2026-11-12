@@ -1668,14 +1668,89 @@ export class NoesisClient {
     return this.requestWithCode('PUT', `/api/mcp/backlog/issues/${encodeURIComponent(key)}/components`, { components });
   }
 
-  /** TCK-1866: links two of the user's tickets, both ways. */
-  async backlogLink(key: string, other: string): Promise<any> {
-    return this.requestWithCode('POST', `/api/mcp/backlog/issues/${encodeURIComponent(key)}/links`, { key: other });
+  /** TCK-1866: links two of the user's tickets, both ways. TCK-1890: `first` names the ticket of the two that
+   *  goes first; null removes the order; leaving it out keeps the order as it is. */
+  async backlogLink(key: string, other: string, first?: string | null): Promise<any> {
+    return this.requestWithCode('POST', `/api/mcp/backlog/issues/${encodeURIComponent(key)}/links`, {
+      key: other,
+      ...(first !== undefined ? { first } : {}),
+    });
   }
 
   /** TCK-1866: removes the link between two tickets. */
   async backlogUnlink(key: string, other: string): Promise<any> {
     return this.requestWithCode('DELETE', `/api/mcp/backlog/issues/${encodeURIComponent(key)}/links/${encodeURIComponent(other)}`);
+  }
+
+  // ── Chief of Staff (TCK-1890): /api/mcp/coordination. Owner gates have no method here. ──
+
+  /** Record a judgment call or an owner-gate decision; the server computes the level and the outcome. */
+  async coordDecide(body: Record<string, unknown>): Promise<any> {
+    return this.requestWithCode('POST', '/api/mcp/coordination/decisions', body);
+  }
+
+  async coordDecisionGet(id: number): Promise<any> {
+    return this.requestWithCode('GET', `/api/mcp/coordination/decisions/${encodeURIComponent(String(id))}`);
+  }
+
+  async coordDecisions(filter: { status?: string; category?: string; ticket?: string; limit?: number } = {}): Promise<any> {
+    const q = new URLSearchParams();
+    for (const [k, v] of Object.entries(filter)) if (v !== undefined && v !== null) q.set(k, String(v));
+    const qs = q.toString();
+    return this.requestWithCode('GET', `/api/mcp/coordination/decisions${qs ? `?${qs}` : ''}`);
+  }
+
+  async coordPolicy(): Promise<any> {
+    return this.requestWithCode('GET', '/api/mcp/coordination/policy');
+  }
+
+  /** acquire, heartbeat or release one lease. */
+  async coordLease(resource: string, action: 'acquire' | 'heartbeat' | 'release', body: Record<string, unknown>): Promise<any> {
+    return this.requestWithCode('POST', `/api/mcp/coordination/leases/${encodeURIComponent(resource)}/${action}`, body);
+  }
+
+  async coordLeases(): Promise<any> {
+    return this.requestWithCode('GET', '/api/mcp/coordination/leases');
+  }
+
+  async coordAllocateMcpVersion(body: Record<string, unknown>): Promise<any> {
+    return this.requestWithCode('POST', '/api/mcp/coordination/allocations/mcp-version', body);
+  }
+
+  /** This session reports in: its state, ticket, folder and machine. Never a token. */
+  async coordSessionHeartbeat(body: Record<string, unknown>): Promise<any> {
+    return this.requestWithCode('POST', '/api/mcp/coordination/sessions/heartbeat', body);
+  }
+
+  async coordSessions(): Promise<any> {
+    return this.requestWithCode('GET', '/api/mcp/coordination/sessions');
+  }
+
+  /** A plain message to one session, or to every session. Pause and continue are the owner's (409 OWNER_GATE). */
+  async coordMessage(body: Record<string, unknown>): Promise<any> {
+    return this.requestWithCode('POST', '/api/mcp/coordination/messages', body);
+  }
+
+  /** One session's messages after the cursor, the next cursor, and the pause flag. */
+  async coordInbox(session: string, opts: { since?: number; limit?: number } = {}): Promise<any> {
+    const q = new URLSearchParams({ session });
+    if (opts.since !== undefined) q.set('since', String(opts.since));
+    if (opts.limit !== undefined) q.set('limit', String(opts.limit));
+    return this.requestWithCode('GET', `/api/mcp/coordination/inbox?${q.toString()}`);
+  }
+
+  /** One scanner report: the whole picture of the conflicts now. */
+  async coordReport(conflicts: unknown[]): Promise<any> {
+    return this.requestWithCode('POST', '/api/mcp/coordination/report', { conflicts });
+  }
+
+  async coordConflicts(all = false): Promise<any> {
+    return this.requestWithCode('GET', `/api/mcp/coordination/conflicts${all ? '?all=true' : ''}`);
+  }
+
+  /** This loop's dev-port slot (a backend port, a frontend port and a .localhost host), or give it back. */
+  async coordPort(action: 'get' | 'release', body: Record<string, unknown>): Promise<any> {
+    return this.requestWithCode('POST', `/api/mcp/coordination/allocations/port${action === 'release' ? '/release' : ''}`, body);
   }
 
 }
