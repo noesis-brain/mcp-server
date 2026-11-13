@@ -429,8 +429,8 @@ async function resolveCaptureChoice(options: SetupOptions, alreadyInstalled: boo
 // ---------------------------------------------------------------------------
 // Optional Jot ticket hook (opt-in).
 //
-// Copies scripts/noesis-ticket-session.mjs to ~/.claude/hooks/ and runs it from four
-// events, so a session bound to a Jot ticket keeps its status current without relying on
+// Copies scripts/noesis-ticket-session.mjs to ~/.claude/hooks/ and runs it from seven
+// events (TCK-1926 added PermissionRequest, Stop and SessionEnd, which report the dialogs a session waits at), so a session bound to a Jot ticket keeps its status current without relying on
 // the model's memory: a reminder on every prompt, Ready to implement / Implementing at the
 // plan steps (back to Planning after a rejected plan, and no other status), and a closed ticket never moves. The copy (not the package
 // path, as the capture hook uses) gives a stable path that survives an npx cache or a
@@ -455,6 +455,11 @@ const TICKET_HOOK_EVENTS: ReadonlyArray<{ event: string; matcher: string }> = [
   { event: 'PostToolUse', matcher: 'ExitPlanMode|Bash|AskUserQuestion|mcp__noesis__backlog_(bind|set_status|unbind|refine|ship|merge)' },
   // Stale bindings, the reconcile and the /clear hint; never on compact.
   { event: 'SessionStart', matcher: 'startup|resume|clear' },
+  // TCK-1926: a dialog the session (or a subagent) waits at is reported to the Chief view, and ends with the turn or
+  // the session.
+  { event: 'PermissionRequest', matcher: '*' },
+  { event: 'Stop', matcher: '' },
+  { event: 'SessionEnd', matcher: '' },
 ];
 /** The hook's per-computer switch. Missing means the hook does nothing at all; setup writes this
  *  default so an installed hook keeps working, and the owner lists repos in it for the checkpoint. */
@@ -675,7 +680,7 @@ async function resolveTicketHookChoice(options: SetupOptions, alreadyInstalled: 
   console.log('  ticket on every prompt and moves its status at the plan steps (Ready to implement,');
   console.log('  then Implementing, and back to Planning if you reject the plan) — never any other status,');
   console.log('  and never for a Shipped, Merged or Dropped ticket.');
-  console.log('  It copies a small, fail-safe script to ~/.claude/hooks/, adds four hook entries');
+  console.log('  It copies a small, fail-safe script to ~/.claude/hooks/, adds seven hook entries');
   console.log('  and the allowed ticket tools to ~/.claude/settings.json, and writes the switch file');
   console.log('  ~/.claude/noesis-ticket.json if there is none.');
   const suffix = alreadyInstalled ? ' [Y/n] ' : ' [y/N] ';

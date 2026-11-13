@@ -1873,3 +1873,274 @@ describe('TCK-1890: the Chief of Staff — inbox, pause flag, heartbeat, warn-on
     expect(r.ctx).toContain('- #5 from the Chief of Staff: Wait for the ship lease.');
   });
 });
+
+describe('TCK-1926: the sessions that wait for the owner', () => {
+  const ON = { COORD_INBOX: 'on', COORD_GUARD: 'off', COORD_WAIT_WATCH: 'off' };
+  const SAME = { ...BOUND, bound_session_id: HOOK_SID };
+  const boundHome = () => {
+    const home = sandbox();
+    seed(home, SAME);
+    return home;
+  };
+  const waitPath = (home: string) => path.join(home, '.claude', 'coord-inbox', `${HOOK_SID}.wait.json`);
+  const coordPath = (home: string) => path.join(home, '.claude', 'coord-inbox', `${HOOK_SID}.json`);
+  const waitCalls = () => requests.filter((r) => r.url === `/api/mcp/coordination/sessions/${HOOK_SID}/wait`);
+  const clearCalls = () => requests.filter((r) => r.url === `/api/mcp/coordination/sessions/${HOOK_SID}/wait/clear`);
+  const beatCalls = () => requests.filter((r) => r.url === '/api/mcp/coordination/sessions/heartbeat');
+  let n = 0;
+  const sinceOf = (i: number) => `2026-11-13T08:00:0${i}.000Z`;
+  let waitStatus = 200;
+  beforeEach(() => {
+    n = 0;
+    waitStatus = 200;
+    respond = (_method, url) => {
+      if (url === `/api/mcp/coordination/sessions/${HOOK_SID}/wait`) {
+        if (waitStatus !== 200) return { status: waitStatus, body: { error_code: 'INTERNAL' } };
+        n++;
+        return { status: 200, body: { session: { waiting: { since: sinceOf(n) } } } };
+      }
+      if (url.endsWith('/wait/clear')) return { status: 200, body: { cleared: true } };
+      if (url.startsWith('/api/mcp/coordination/inbox')) return { status: 200, body: { messages: [], cursor: 0, pause: { paused: false, since: null, message_id: null, body: null } } };
+      if (url === '/api/mcp/coordination/sessions/heartbeat') return { status: 200, body: { session: {} } };
+      return { status: 404, body: {} };
+    };
+  });
+  const ask = (tool: string, input: Record<string, unknown>, extra: Record<string, unknown> = {}) => ({ hook_event_name: 'PermissionRequest', tool_name: tool, tool_input: input, cwd: '/tmp', ...extra });
+
+  /** A stand-in for `claude agents --json`: an executable that prints the list `set` wrote last. */
+  function fakeAgents() {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'tck-agents-'));
+    homes.push(dir);
+    const list = path.join(dir, 'agents.json');
+    const cmd = path.join(dir, 'agents.mjs');
+    fs.writeFileSync(cmd, `#!${process.execPath}\nimport fs from 'node:fs';\nprocess.stdout.write(fs.readFileSync(${JSON.stringify(list)}, 'utf8'));\n`);
+    fs.chmodSync(cmd, 0o755);
+    const set = (entries: unknown[]) => fs.writeFileSync(list, JSON.stringify(entries));
+    set([]);
+    return { cmd, set };
+  }
+  const until = async (ok: () => boolean, ms = 5000) => {
+    const end = Date.now() + ms;
+    while (!ok() && Date.now() < end) await new Promise((r) => setTimeout(r, 50));
+    return ok();
+  };
+
+  it('a permission prompt is reported with no decision: the tool and its description, never the command', async () => {
+    const home = boundHome();
+    const r = await run(home, ask('Bash', { command: 'curl -H "Authorization: Bearer SECRET-123" https://x', description: 'Fetch the  status' }), ON);
+    expect(r.code).toBe(0);
+    expect(r.json).toBeNull(); // no decision: the dialog is the owner's
+    expect(waitCalls().map((c) => c.body)).toEqual([{ kind: 'permission', detail: 'Bash: Fetch the status' }]);
+    expect(JSON.stringify(requests)).not.toContain('SECRET');
+    expect(JSON.parse(fs.readFileSync(waitPath(home), 'utf8'))).toEqual({ since: sinceOf(1), agent_id: null });
+    requests.length = 0;
+    await run(home, ask('Write', { file_path: '/w/src/a.ts', content: 'SECRET-456' }), ON);
+    await run(home, ask('Bash', { command: 'rm -rf build' }), ON);
+    await run(home, ask('mcp__noesis__backlog_get', { key: 'TCK-1' }), ON);
+    // Another tool with a command (PowerShell on Windows): only its name.
+    await run(home, ask('PowerShell', { command: 'Invoke-WebRequest -Headers @{Authorization="Bearer SECRET-789"}' }), ON);
+    expect(waitCalls().map((c) => c.body.detail)).toEqual(['Write: /w/src/a.ts', 'Bash', 'mcp__noesis__backlog_get', 'PowerShell']);
+    expect(JSON.stringify(requests)).not.toContain('SECRET');
+  });
+
+  it('characters the server refuses (emoji selectors, joiners, zero-width spaces, soft hyphens) are removed, not sent', async () => {
+    const home = boundHome();
+    await run(home, ask('AskUserQuestion', { questions: [{ header: 'Ship', question: '\u26a0\ufe0f Ship TCK-1\u200b now?' }] }), ON);
+    await run(home, ask('Bash', { command: 'ls', description: 'List files \ud83d\udc68\u200d\ud83d\udcbb' }, { agent_id: 'a1', agent_type: 'Ex\u00adplore' }), ON);
+    await run(home, ask('ExitPlanMode', { plan: '# \u2705\ufe0f Plan for TCK-9' }), ON);
+    const unsafe = /[\p{Cc}\p{Cf}\p{Cs}\p{Zl}\p{Zp}\p{Default_Ignorable_Code_Point}]/u;
+    expect(waitCalls().map((c) => c.body)).toEqual([
+      { kind: 'question', detail: 'Ship: \u26a0 Ship TCK-1 now?' },
+      { kind: 'permission', detail: 'Bash: List files \ud83d\udc68\ud83d\udcbb', agent: 'Explore' },
+      { kind: 'plan', detail: 'Plan: \u2705 Plan for TCK-9' },
+    ]);
+    for (const c of waitCalls()) for (const v of Object.values(c.body)) expect(unsafe.test(String(v))).toBe(false);
+  });
+
+  it('a long question, plan line or description is cut to the server\'s 300 characters, emoji counted as one', async () => {
+    const home = boundHome();
+    await run(home, ask('AskUserQuestion', { questions: [{ header: 'Scope', question: 'q'.repeat(400) }] }), ON);
+    await run(home, ask('ExitPlanMode', { plan: `# ${'p'.repeat(400)}` }), ON);
+    await run(home, ask('Bash', { command: 'ls', description: '\ud83d\ude80'.repeat(400) }), ON);
+    const details = waitCalls().map((c) => c.body.detail as string);
+    expect(details.map((d) => Array.from(d).length)).toEqual([300, 300, 300]);
+    expect(details[0].startsWith('Scope: qqq')).toBe(true);
+    expect(details[1].startsWith('Plan: ppp')).toBe(true);
+    expect(details[2].startsWith('Bash: \ud83d\ude80')).toBe(true);
+  });
+
+  it("a question and a plan are one line each; a subagent's prompt names the subagent", async () => {
+    const home = boundHome();
+    await run(home, ask('AskUserQuestion', { questions: [{ header: 'Ship', question: 'Ship it\nnow?', options: [{ label: 'Ship it now' }, { label: 'Not yet' }] }] }), ON);
+    await run(home, ask('ExitPlanMode', { plan: '\n# TCK-1926 — waits\n\n## Context\nlong text', planFilePath: '/p.md' }), ON);
+    await run(home, ask('Bash', { command: 'npm test', description: 'Run the tests' }, { agent_id: 'a1b2', agent_type: 'general-purpose' }), ON);
+    expect(waitCalls().map((c) => c.body)).toEqual([
+      { kind: 'question', detail: 'Ship: Ship it now?' },
+      { kind: 'plan', detail: 'Plan: TCK-1926 — waits' },
+      { kind: 'permission', detail: 'Bash: Run the tests', agent: 'general-purpose' },
+    ]);
+    expect(JSON.parse(fs.readFileSync(waitPath(home), 'utf8'))).toEqual({ since: sinceOf(3), agent_id: 'a1b2' });
+  });
+
+  it('only for a bound session or a listed repo; COORD_WAITS=off, COORD_INBOX=off and a failing server send or keep nothing', async () => {
+    await run(sandbox(), ask('Bash', { command: 'ls' }), ON);
+    expect(waitCalls()).toHaveLength(0);
+    // An unbound session in a listed repo reports its waits too.
+    const REMOTE = 'git@github.com:noesis-owner/notes-app.git';
+    const listed = sandbox({ enabled: true, repos: [{ remote: REMOTE, deployBranch: 'main' }] });
+    await run(listed, ask('Bash', { command: 'ls' }, { cwd: gitRepo(REMOTE) }), ON);
+    expect(waitCalls()).toHaveLength(1);
+    requests.length = 0;
+    const home = boundHome();
+    await run(home, ask('Bash', { command: 'ls' }), { ...ON, COORD_WAITS: 'off' });
+    await run(home, ask('Bash', { command: 'ls' }), { ...ON, COORD_INBOX: 'off' });
+    expect(waitCalls()).toHaveLength(0);
+    waitStatus = 500;
+    const r = await run(home, ask('Bash', { command: 'ls' }), ON);
+    expect(r.code).toBe(0);
+    expect(r.json).toBeNull();
+    expect(waitCalls()).toHaveLength(1);
+    expect(fs.existsSync(waitPath(home))).toBe(false);
+  });
+
+  it("the same actor's next event ends the wait with its own start; another actor's does not; Stop and SessionEnd always do", async () => {
+    const home = boundHome();
+    const read = { hook_event_name: 'PreToolUse', tool_name: 'Read', tool_input: { file_path: '/x' }, cwd: '/tmp' };
+    await run(home, ask('Bash', { command: 'ls' }), ON);
+    // A subagent's event is not the session's answer.
+    await run(home, { ...read, agent_id: 'a1b2', agent_type: 'general-purpose' }, ON);
+    expect(clearCalls()).toHaveLength(0);
+    await run(home, read, ON);
+    expect(clearCalls().map((c) => c.body)).toEqual([{ since: sinceOf(1) }]);
+    expect(fs.existsSync(waitPath(home))).toBe(false);
+    // A subagent's wait ends with that subagent's next event, or with the turn.
+    requests.length = 0;
+    await run(home, ask('Bash', { command: 'ls' }, { agent_id: 'a1b2', agent_type: 'general-purpose' }), ON);
+    await run(home, { hook_event_name: 'UserPromptSubmit', prompt: 'go on', cwd: '/tmp' }, ON);
+    expect(clearCalls()).toHaveLength(0);
+    await run(home, { hook_event_name: 'Stop', cwd: '/tmp' }, ON);
+    expect(clearCalls().map((c) => c.body)).toEqual([{ since: sinceOf(2) }]);
+    // A subagent's wait, so only the SessionEnd rule (not "the same actor") can end it.
+    requests.length = 0;
+    await run(home, ask('Bash', { command: 'ls' }, { agent_id: 'a9c8', agent_type: 'Explore' }), ON);
+    const end = await run(home, { hook_event_name: 'SessionEnd', reason: 'other', cwd: '/tmp' }, ON);
+    expect(end.json).toBeNull();
+    expect(clearCalls().map((c) => c.body)).toEqual([{ since: sinceOf(3) }]);
+    // With no wait, an event sends no clear.
+    requests.length = 0;
+    await run(home, read, ON);
+    expect(clearCalls()).toHaveLength(0);
+  });
+
+  it('the watcher ends the wait once the session stops waiting, and keeps its name for the heartbeat', async () => {
+    const home = boundHome();
+    const agents = fakeAgents();
+    agents.set([{ sessionId: HOOK_SID, status: 'waiting', name: 'ship-tck-12', waitingFor: 'input needed' }, { sessionId: 'other', status: 'idle', name: 'x' }]);
+    const env = { ...ON, COORD_WAIT_WATCH: 'on', COORD_AGENTS_CMD: agents.cmd, COORD_WAIT_POLL_MS: '100', COORD_WAIT_GRACE_MS: '300' };
+    await run(home, ask('Bash', { command: 'ls' }), env);
+    expect(await until(() => { try { return JSON.parse(fs.readFileSync(coordPath(home), 'utf8')).name === 'ship-tck-12'; } catch { return false; } })).toBe(true);
+    await new Promise((r) => setTimeout(r, 600)); // past the grace: still waiting, so still listed
+    expect(clearCalls()).toHaveLength(0);
+    agents.set([{ sessionId: HOOK_SID, status: 'busy', name: 'ship-tck-12' }]);
+    expect(await until(() => clearCalls().length === 1)).toBe(true);
+    expect(clearCalls()[0].body).toEqual({ since: sinceOf(1) });
+    expect(fs.existsSync(waitPath(home))).toBe(false);
+    // The next heartbeat carries the name.
+    await run(home, { hook_event_name: 'PreToolUse', tool_name: 'Read', tool_input: { file_path: '/x' }, cwd: '/tmp' }, ON);
+    expect(beatCalls().at(-1)!.body).toMatchObject({ session_id: HOOK_SID, name: 'ship-tck-12' });
+  }, 20_000);
+
+  it('a closed session ends its wait; a session listed but never waiting is cleared after the grace; one never listed is left', async () => {
+    const agents = fakeAgents();
+    const env = { ...ON, COORD_WAIT_WATCH: 'on', COORD_AGENTS_CMD: agents.cmd, COORD_WAIT_POLL_MS: '100', COORD_WAIT_GRACE_MS: '1500' };
+    const seen = (home: string, name: string) => until(() => { try { return JSON.parse(fs.readFileSync(coordPath(home), 'utf8')).name === name; } catch { return false; } });
+    const closed = boundHome();
+    agents.set([{ sessionId: HOOK_SID, status: 'waiting', name: 'closing' }]);
+    await run(closed, ask('Bash', { command: 'ls' }), env);
+    expect(await seen(closed, 'closing')).toBe(true); // the watcher has seen it listed
+    agents.set([]);
+    expect(await until(() => clearCalls().length === 1)).toBe(true);
+    // Esc at a dialog: the session goes idle, and the wait ends.
+    requests.length = 0;
+    const esc = boundHome();
+    agents.set([{ sessionId: HOOK_SID, status: 'waiting', name: 'esc' }]);
+    await run(esc, ask('Bash', { command: 'ls' }), env);
+    expect(await seen(esc, 'esc')).toBe(true);
+    agents.set([{ sessionId: HOOK_SID, status: 'idle', name: 'esc' }]);
+    expect(await until(() => clearCalls().length === 1)).toBe(true);
+    requests.length = 0;
+    const busy = boundHome();
+    agents.set([{ sessionId: HOOK_SID, status: 'busy' }]);
+    await run(busy, ask('Bash', { command: 'ls' }), env);
+    expect(await until(() => clearCalls().length === 1)).toBe(true);
+    requests.length = 0;
+    const unseen = boundHome();
+    agents.set([{ sessionId: 'someone-else', status: 'waiting' }]);
+    await run(unseen, ask('Bash', { command: 'ls' }), env);
+    await new Promise((r) => setTimeout(r, 2500)); // past the grace
+    expect(clearCalls()).toHaveLength(0);
+    expect(fs.existsSync(waitPath(unseen))).toBe(true);
+    // A replaced wait stops the old watcher: only the newest wait is ever cleared by it.
+    requests.length = 0;
+    agents.set([{ sessionId: HOOK_SID, status: 'waiting', name: 'twice' }]);
+    await run(unseen, ask('Bash', { command: 'ls' }), env);
+    await run(unseen, ask('Bash', { command: 'pwd' }), env);
+    expect(await seen(unseen, 'twice')).toBe(true);
+    await new Promise((r) => setTimeout(r, 300));
+    agents.set([{ sessionId: HOOK_SID, status: 'busy' }]);
+    expect(await until(() => clearCalls().length >= 1)).toBe(true);
+    await new Promise((r) => setTimeout(r, 400));
+    expect(clearCalls().map((c) => c.body)).toEqual([{ since: sinceOf(n) }]);
+  }, 20_000);
+
+  it('a wait the watcher saw ends at its next poll, not at the grace; a listed session whose `claude agents` then fails keeps it', async () => {
+    const agents = fakeAgents();
+    const env = { ...ON, COORD_WAIT_WATCH: 'on', COORD_AGENTS_CMD: agents.cmd, COORD_WAIT_POLL_MS: '100', COORD_WAIT_GRACE_MS: '10000' };
+    const seenHome = (home: string, name: string) => until(() => { try { return JSON.parse(fs.readFileSync(coordPath(home), 'utf8')).name === name; } catch { return false; } });
+    const fast = boundHome();
+    agents.set([{ sessionId: HOOK_SID, status: 'waiting', name: 'fast' }]);
+    await run(fast, ask('Bash', { command: 'ls' }), env);
+    expect(await seenHome(fast, 'fast')).toBe(true);
+    await new Promise((r) => setTimeout(r, 300)); // seen waiting on a later poll too
+    const flipped = Date.now();
+    agents.set([{ sessionId: HOOK_SID, status: 'busy', name: 'fast' }]);
+    expect(await until(() => clearCalls().length === 1, 3000)).toBe(true);
+    expect(Date.now() - flipped).toBeLessThan(2000); // far inside the 10 s grace
+    requests.length = 0;
+    const failing = path.join(path.dirname(agents.cmd), 'fails-later.mjs');
+    const flag = path.join(path.dirname(agents.cmd), 'fail.flag');
+    fs.writeFileSync(failing, `#!${process.execPath}\nimport fs from 'node:fs';\nif (fs.existsSync(${JSON.stringify(flag)})) process.exit(3);\nprocess.stdout.write(JSON.stringify([{ sessionId: ${JSON.stringify(HOOK_SID)}, status: 'waiting', name: 'flaky' }]));\n`);
+    fs.chmodSync(failing, 0o755);
+    const flaky = boundHome();
+    await run(flaky, ask('Bash', { command: 'ls' }), { ...env, COORD_AGENTS_CMD: failing });
+    expect(await seenHome(flaky, 'flaky')).toBe(true);
+    fs.writeFileSync(flag, '1');
+    await new Promise((r) => setTimeout(r, 1000));
+    expect(clearCalls()).toHaveLength(0);
+    expect(fs.existsSync(waitPath(flaky))).toBe(true);
+    fs.rmSync(waitPath(flaky)); // let its watcher stop
+  }, 20_000);
+
+  it('the clock never ends a wait: past the time limit, or with `claude agents` failing, the watcher stops and the wait stays', async () => {
+    const agents = fakeAgents();
+    const env = { ...ON, COORD_WAIT_WATCH: 'on', COORD_AGENTS_CMD: agents.cmd, COORD_WAIT_POLL_MS: '100', COORD_WAIT_GRACE_MS: '300', COORD_WAIT_MAX_MS: '800' };
+    const long = boundHome();
+    agents.set([{ sessionId: HOOK_SID, status: 'waiting', name: 'long' }]);
+    await run(long, ask('Bash', { command: 'ls' }), env);
+    await new Promise((r) => setTimeout(r, 1800)); // past the limit, still waiting
+    expect(clearCalls()).toHaveLength(0);
+    expect(fs.existsSync(waitPath(long))).toBe(true);
+    // After the limit the watcher is gone: a later change is left to the next event.
+    agents.set([{ sessionId: HOOK_SID, status: 'busy', name: 'long' }]);
+    await new Promise((r) => setTimeout(r, 600));
+    expect(clearCalls()).toHaveLength(0);
+    const broken = boundHome();
+    const failing = path.join(path.dirname(agents.cmd), 'fails.mjs');
+    fs.writeFileSync(failing, `#!${process.execPath}\nprocess.exit(3);\n`);
+    fs.chmodSync(failing, 0o755);
+    await run(broken, ask('Bash', { command: 'ls' }), { ...env, COORD_AGENTS_CMD: failing, COORD_WAIT_MAX_MS: '60000' });
+    await new Promise((r) => setTimeout(r, 1200)); // past the grace
+    expect(clearCalls()).toHaveLength(0);
+    expect(fs.existsSync(waitPath(broken))).toBe(true);
+  }, 20_000);
+});

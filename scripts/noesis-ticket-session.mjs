@@ -81,11 +81,14 @@
 //     BLOCKED by claude-config's hooks/prod-env-guard.js, not here. The guard never blocks; when
 //     the API is down it says nothing and logs "unchecked". Kill switches: COORD_GUARD=off (the
 //     guard), COORD_INBOX=off (the inbox and the heartbeat).
+//   - the waits (TCK-1926): PermissionRequest reports what the session (or a subagent) waits for, with no decision,
+//     and the next event of the same actor, Stop, SessionEnd or a detached watcher of `claude agents --json` ends
+//     it, so the Chief view's "Needs you" lists it. Kill switch: COORD_WAITS=off.
 
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
 export const HOOK_VERSION = 2;
@@ -1043,6 +1046,7 @@ async function coordCheck(sessionId, cwd, entry, now = Date.now()) {
           ...(fits(host, 100) ? { machine: host } : {}),
           ...(fits(cwd, 500) ? { cwd } : {}),
           ...(openEntry(entry) ? { ticket: entry.key } : {}),
+          ...(fits(st.name, 100) ? { name: st.name } : {}),
         });
   const cursors = st.cursors && typeof st.cursors === 'object' ? st.cursors : {};
   const since = (id) => (Number.isInteger(cursors[id]) && cursors[id] >= 0 ? cursors[id] : 0);
@@ -1470,12 +1474,196 @@ async function sessionStart(p, sw) {
   return lines.length ? out('SessionStart', lines.join('\n')) : null;
 }
 
+// ── The sessions that wait for the owner (TCK-1926) ──────────────────────────────────────────────
+// PermissionRequest fires when Claude Code is about to show a dialog: a tool permission prompt, a question
+// (AskUserQuestion) or a plan approval (ExitPlanMode), the session's own or a subagent's. The hook reports
+// what the session waits for (POST .../sessions/<id>/wait) and returns no decision: the dialog stays the
+// owner's. The wait ends on the session's next event from the same actor (the session itself, or that
+// subagent), on Stop and on SessionEnd; a detached watcher also ends it within a few seconds when
+// `claude agents --json` no longer shows the session waiting (a dialog answered, Esc, the session closed).
+// The detail never holds a command's arguments (they may hold a secret): a Bash prompt names its description.
+// Network: only for a bound session or a session in a listed repo, as the inbox. Kill switch: COORD_WAITS=off.
+
+const WAIT_POLL_MS = Number(process.env.COORD_WAIT_POLL_MS) || 2000;
+const WAIT_GRACE_MS = Number(process.env.COORD_WAIT_GRACE_MS) || 20 * 1000;
+// A dialog has no time limit: past this the watcher stops WITHOUT ending the wait (the next event or Stop does).
+const WAIT_MAX_MS = Number(process.env.COORD_WAIT_MAX_MS) || 12 * 60 * 60 * 1000;
+/** The characters the server refuses in a line (UNSAFE_TEXT_RE), removed rather than sent. */
+const UNSAFE_TEXT_ALL = new RegExp(UNSAFE_TEXT_RE.source, 'gu');
+const clean = (v, max) => oneLine(String(v ?? '').replace(/\s+/g, ' ').replace(UNSAFE_TEXT_ALL, ''), max);
+const WAIT_DETAIL_MAX = 300;
+const FILE_TOOLS = new Set(['Write', 'Edit', 'MultiEdit', 'NotebookEdit', 'Read']);
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+const waitFile = (sessionId) => path.join(coordDir(), `${String(sessionId).replace(/[^A-Za-z0-9_-]/g, '')}.wait.json`);
+
+function readWait(sessionId) {
+  try {
+    const w = JSON.parse(fs.readFileSync(waitFile(sessionId), 'utf8'));
+    return w && typeof w.since === 'string' ? w : null;
+  } catch {
+    return null;
+  }
+}
+
+function writeWait(sessionId, w) {
+  try {
+    fs.mkdirSync(coordDir(), { recursive: true });
+    fs.writeFileSync(waitFile(sessionId), JSON.stringify(w));
+  } catch {
+    /* a read-only home: the watcher and the next report try again */
+  }
+}
+
+function dropWait(sessionId) {
+  try {
+    fs.unlinkSync(waitFile(sessionId));
+  } catch {
+    /* already gone */
+  }
+}
+
+/** What the session waits for, as one line the owner reads. */
+export function waitOf(p) {
+  const ti = p.tool_input && typeof p.tool_input === 'object' ? p.tool_input : {};
+  if (p.tool_name === 'AskUserQuestion') {
+    const q = Array.isArray(ti.questions) && ti.questions[0] && typeof ti.questions[0] === 'object' ? ti.questions[0] : {};
+    const text = [q.header ? `${q.header}:` : '', q.question || ''].join(' ');
+    return { kind: 'question', detail: clean(text, WAIT_DETAIL_MAX) || 'A question' };
+  }
+  if (p.tool_name === 'ExitPlanMode') {
+    const first = String(ti.plan || '').split('\n').map((l) => clean(l.replace(/^#+\s*/, ''), WAIT_DETAIL_MAX)).find(Boolean);
+    return { kind: 'plan', detail: clean(`Plan: ${first || 'ready for approval'}`, WAIT_DETAIL_MAX) };
+  }
+  const tool = clean(p.tool_name || 'A tool', 80) || 'A tool';
+  const what = clean(p.tool_name === 'Bash' ? ti.description : FILE_TOOLS.has(p.tool_name) ? ti.file_path || ti.notebook_path : '', WAIT_DETAIL_MAX);
+  return { kind: 'permission', detail: clean(what ? `${tool}: ${what}` : tool, WAIT_DETAIL_MAX) };
+}
+
+/** The watcher: this script again, detached, so the hook answers at once. */
+function spawnWatcher(sessionId, since, cwd) {
+  try {
+    const child = spawn(process.execPath, [fileURLToPath(import.meta.url), '--watch-wait', sessionId, since, cwd || ''], {
+      detached: true,
+      stdio: 'ignore',
+      windowsHide: true,
+    });
+    child.unref();
+  } catch {
+    /* no watcher: the next event still ends the wait */
+  }
+}
+
+/** PermissionRequest: report the wait. Never a decision. */
+async function reportWait(p, sw) {
+  if (process.env.COORD_INBOX === 'off' || process.env.COORD_WAITS === 'off') return;
+  const sid = String(p.session_id || '');
+  if (!SESSION_ID_RE.test(sid)) return;
+  if (!(openEntry(readCache(sid)) || repoOf(p.cwd, sw))) return;
+  const cfg = loadConfig(p.cwd);
+  if (!cfg) return;
+  const agent = p.agent_id ? clean(p.agent_type || 'subagent', 100) || 'subagent' : null;
+  const res = await api(cfg, 'POST', `/api/mcp/coordination/sessions/${encodeURIComponent(sid)}/wait`, {
+    ...waitOf(p),
+    ...(agent ? { agent } : {}),
+  });
+  const since = res && res.session && res.session.waiting && res.session.waiting.since;
+  if (typeof since !== 'string') return;
+  writeWait(sid, { since, agent_id: p.agent_id ? String(p.agent_id) : null });
+  if (process.env.COORD_WAIT_WATCH !== 'off') spawnWatcher(sid, since, p.cwd);
+}
+
+/** The wait ended: the file goes first (the watcher stops), then the server clears that wait only. */
+async function clearWait(sessionId, since, cwd) {
+  dropWait(sessionId);
+  const cfg = loadConfig(cwd);
+  if (!cfg) return;
+  await api(cfg, 'POST', `/api/mcp/coordination/sessions/${encodeURIComponent(sessionId)}/wait/clear`, { since });
+}
+
+/** Any other event: the same actor moved on, or the turn or the session ended. */
+async function endWait(p) {
+  const w = readWait(p.session_id);
+  if (!w) return;
+  const event = p.hook_event_name;
+  const sameActor = (w.agent_id || null) === (p.agent_id ? String(p.agent_id) : null);
+  if (event === 'Stop' || event === 'SessionEnd' || sameActor) await clearWait(p.session_id, w.since, p.cwd);
+}
+
+/** This session in `claude agents --json`: { status, name }, null when it is not listed, undefined when unknown. */
+function agentOf(sessionId) {
+  try {
+    const custom = process.env.COORD_AGENTS_CMD; // tests: an executable that prints the list
+    const out = execFileSync(custom || 'claude', custom ? [] : ['agents', '--json'], {
+      encoding: 'utf8',
+      timeout: 5000,
+      stdio: ['ignore', 'pipe', 'ignore'],
+      windowsHide: true,
+    });
+    const list = JSON.parse(out);
+    if (!Array.isArray(list)) return undefined;
+    const me = list.find((a) => a && a.sessionId === sessionId);
+    if (!me) return null;
+    return { status: String(me.status || me.state || ''), name: typeof me.name === 'string' ? me.name : null };
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * `--watch-wait <session> <since> [cwd]`: ends the wait when the session stops waiting. It has to see the session
+ * listed; a session listed once and then gone has closed. It never ends a wait it cannot see (never listed, or
+ * `claude agents` failing past the grace: the next event does), and past WAIT_MAX_MS it stops without ending it. It
+ * also keeps the session's name for the heartbeat.
+ */
+async function watchWait(sessionId, since, cwd) {
+  const started = Date.now();
+  let seenWaiting = false;
+  let listed = false;
+  for (;;) {
+    await sleep(WAIT_POLL_MS);
+    const w = readWait(sessionId);
+    if (!w || w.since !== since) return; // ended or replaced by the hook
+    const elapsed = Date.now() - started;
+    if (elapsed > WAIT_MAX_MS) return; // still waiting, or unknown: never ended by the clock
+    const me = agentOf(sessionId);
+    if (me === undefined) {
+      if (!listed && elapsed > WAIT_GRACE_MS) return; // `claude agents` keeps failing: it cannot tell
+      continue;
+    }
+    if (me === null) {
+      if (listed) break; // the session closed
+      if (elapsed > WAIT_GRACE_MS) return; // never listed: it cannot tell
+      continue;
+    }
+    listed = true;
+    if (me.name && fits(me.name, 100)) {
+      const st = readCoord(sessionId);
+      if (st.name !== me.name) writeCoord(sessionId, { ...st, name: me.name });
+    }
+    if (me.status === 'waiting') {
+      seenWaiting = true;
+      continue;
+    }
+    if (seenWaiting || elapsed > WAIT_GRACE_MS) break;
+  }
+  const w = readWait(sessionId);
+  if (w && w.since === since) await clearWait(sessionId, since, cwd || undefined);
+}
+
 export async function decide(p) {
   if (process.env.TCK_SESSION_HOOK === 'off') return null;
-  if (!p || p.agent_id || !p.session_id) return null;
+  if (!p || !p.session_id) return null;
   const sw = loadSwitch();
   if (!sw) return null; // off on this computer
   const event = p.hook_event_name;
+  // The waits (TCK-1926) cover subagents too; everything below is the session's own.
+  if (event === 'PermissionRequest') {
+    await reportWait(p, sw).catch(() => null);
+    return null;
+  }
+  await endWait(p).catch(() => null);
+  if (p.agent_id || event === 'Stop' || event === 'SessionEnd') return null;
   if (event !== 'PreToolUse' && event !== 'UserPromptSubmit') return decideTicket(p, sw);
   // The Chief of Staff, only for a bound session or a session in a listed repo. It runs beside the
   // ticket steps, so the hook still answers within one network timeout.
@@ -1622,6 +1810,10 @@ if (isMain && process.argv.includes('--trailer-key')) {
     /* fail open: no trailer */
   }
   process.exit(0);
+} else if (isMain && process.argv[2] === '--watch-wait') {
+  watchWait(String(process.argv[3] || ''), String(process.argv[4] || ''), process.argv[5] || '')
+    .catch(() => null)
+    .finally(() => process.exit(0));
 } else if (isMain) {
   let raw = '';
   process.stdin.on('data', (c) => (raw += c));

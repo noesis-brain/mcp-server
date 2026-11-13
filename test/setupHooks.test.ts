@@ -74,7 +74,7 @@ afterEach(() => {
 });
 
 describe('--with-ticket-hook', () => {
-  it('installs the copied script, four events, the allowed ticket tools and the switch file; a re-run changes nothing', async () => {
+  it('installs the copied script, seven events, the allowed ticket tools and the switch file; a re-run changes nothing', async () => {
     const line = await setup('--with-ticket-hook');
     expect(line).toMatch(/Ticket hook: settings created, script created, switch file created/);
     expect(JSON.parse(fs.readFileSync(switchPath(), 'utf8'))).toEqual({ enabled: true, repos: [] });
@@ -84,6 +84,10 @@ describe('--with-ticket-hook', () => {
     expect(s.hooks.PreToolUse).toEqual([{ matcher: '*', hooks: [{ type: 'command', command: canonical() }] }]);
     expect(s.hooks.PostToolUse).toEqual([{ matcher: POST_MATCHER, hooks: [{ type: 'command', command: canonical() }] }]);
     expect(s.hooks.SessionStart).toEqual([{ matcher: START_MATCHER, hooks: [{ type: 'command', command: canonical() }] }]);
+    // TCK-1926: the dialogs a session waits at, and the end of the turn and of the session.
+    expect(s.hooks.PermissionRequest).toEqual([{ matcher: '*', hooks: [{ type: 'command', command: canonical() }] }]);
+    expect(s.hooks.Stop).toEqual([{ matcher: '', hooks: [{ type: 'command', command: canonical() }] }]);
+    expect(s.hooks.SessionEnd).toEqual([{ matcher: '', hooks: [{ type: 'command', command: canonical() }] }]);
     expect(s.permissions.allow).toEqual(ALLOW);
     expect(canonical()).toMatch(/^node "[^"\\]+noesis-ticket-session\.mjs"$/); // absolute, forward slashes
 
@@ -119,6 +123,26 @@ describe('--with-ticket-hook', () => {
     ]);
     expect(s.permissions.allow).toEqual(['Bash(ls:*)', ...ALLOW]);
     expect(await setup('--with-ticket-hook')).toMatch(/settings unchanged/);
+  });
+
+  it('TCK-1926: upgrades a four-event install — PermissionRequest, Stop and SessionEnd are added; nothing else moves', async () => {
+    await setup('--with-ticket-hook');
+    const s0 = readSettings();
+    for (const e of ['PermissionRequest', 'Stop', 'SessionEnd']) delete s0.hooks[e];
+    s0.hooks.SessionEnd = [{ matcher: '', hooks: [{ type: 'command', command: 'node /x/other-hook.mjs' }] }];
+    writeSettings(s0);
+    expect(await setup('--with-ticket-hook')).toMatch(/settings upgraded/);
+    const s = readSettings();
+    expect(s.hooks.PermissionRequest).toEqual([{ matcher: '*', hooks: [{ type: 'command', command: canonical() }] }]);
+    expect(s.hooks.Stop).toEqual([{ matcher: '', hooks: [{ type: 'command', command: canonical() }] }]);
+    // Another tool's SessionEnd hook stays, beside ours, in the same group.
+    expect(commands(s, 'SessionEnd')).toEqual(['node /x/other-hook.mjs', canonical()]);
+    expect(commands(s, 'PreToolUse')).toEqual([canonical()]);
+    // Removing the ticket hook removes all seven, and leaves the other hook.
+    await setup('--no-ticket-hook');
+    const after = readSettings();
+    for (const e of ['UserPromptSubmit', 'PreToolUse', 'PostToolUse', 'SessionStart', 'PermissionRequest', 'Stop']) expect(commands(after, e)).toEqual([]);
+    expect(commands(after, 'SessionEnd')).toEqual(['node /x/other-hook.mjs']);
   });
 
   it('TCK-1889: upgrades a 2.9.0 install — the PostToolUse matcher gains backlog_merge, which is allowed too', async () => {
@@ -174,12 +198,15 @@ describe('--with-ticket-hook', () => {
         PreToolUse: [{ matcher: '*', hooks: [{ type: 'command', command: tilde }] }],
         PostToolUse: [{ matcher: POST_MATCHER, hooks: [{ type: 'command', command: tilde }] }],
         SessionStart: [{ matcher: START_MATCHER, hooks: [{ type: 'command', command: tilde }] }],
+        PermissionRequest: [{ matcher: '*', hooks: [{ type: 'command', command: tilde }] }],
+        Stop: [{ matcher: '', hooks: [{ type: 'command', command: tilde }] }],
+        SessionEnd: [{ matcher: '', hooks: [{ type: 'command', command: tilde }] }],
       },
       permissions: { allow: ALLOW },
     });
     const line = await setup('--with-ticket-hook');
     expect(line).toMatch(/settings unchanged, script created/);
-    for (const e of ['UserPromptSubmit', 'PreToolUse', 'PostToolUse', 'SessionStart']) expect(commands(readSettings(), e)).toEqual([tilde]);
+    for (const e of ['UserPromptSubmit', 'PreToolUse', 'PostToolUse', 'SessionStart', 'PermissionRequest', 'Stop', 'SessionEnd']) expect(commands(readSettings(), e)).toEqual([tilde]);
   });
 
   it("replaces the owner's legacy tck-session.js in place, keeping the other hooks of a shared group", async () => {
@@ -289,7 +316,8 @@ describe('--all', () => {
     const md = fs.readFileSync(claude('CLAUDE.md'), 'utf8');
     expect(md).not.toMatch(/restructure-on-sync:start/);
     const s = readSettings();
-    expect(commands(s, 'SessionEnd')).toEqual([]);
+    // No capture hook; the ticket hook's own SessionEnd (TCK-1926) stays.
+    expect(commands(s, 'SessionEnd')).toEqual([canonical()]);
     expect(commands(s, 'PreToolUse')).toEqual([canonical()]);
   });
 
