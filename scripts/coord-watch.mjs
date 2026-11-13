@@ -121,13 +121,27 @@ export function wakeChief(pid, line, deps) {
   }
 }
 
-/** One 10-second tick: a scan on every `every`-th tick, then a wake when one is pending. */
+/**
+ * Whether the owner has paused the sessions ("Pause all" on the Chief view, TCK-1926). A failed read counts as not
+ * paused, so the watcher wakes the Chief as it did before the pause existed.
+ */
+export async function pausedNow(deps, pid) {
+  if (!deps.paused) return false;
+  try {
+    return (await deps.paused(pid)) === true;
+  } catch {
+    return false;
+  }
+}
+
+/** One 10-second tick: a scan on every `every`-th tick, then a wake when one is pending and the owner has not paused. */
 export async function tick(deps, state, pid, every) {
   const out = {};
   if (state.ticks % every === 0) out.scan = await step(deps, state);
   state.ticks++;
   if (state.pending) {
-    const w = wakeChief(pid, WAKE_LINE, deps);
+    // While paused, the change stays pending and the Chief is woken after "Continue all".
+    const w = deps.alive(pid) && (await pausedNow(deps, pid)) ? { woke: 0, reason: 'the owner paused the sessions' } : wakeChief(pid, WAKE_LINE, deps);
     out.wake = w;
     if (w.woke > 0) state.pending = false;
   } else if (!deps.alive(pid)) {
@@ -220,6 +234,12 @@ export function statusFromOutput(stdout, pid) {
   }
 }
 
+/** The session id `claude agents --json` reports for this pid, or null. */
+export function sessionIdIn(agents, pid) {
+  const row = (Array.isArray(agents) ? agents : []).find((a) => a && a.pid === pid);
+  return row && typeof row.sessionId === 'string' && row.sessionId ? row.sessionId : null;
+}
+
 /** The status `claude agents --json` reports for the session of this pid, or null. */
 export function statusIn(agents, pid) {
   const row = (Array.isArray(agents) ? agents : []).find((a) => a && a.pid === pid);
@@ -256,6 +276,17 @@ function agentsStatus(pid) {
   return statusFromRun(spawnSync('claude', ['agents', '--json'], { encoding: 'utf8', timeout: 20_000 }), pid);
 }
 
+/** The Chief's session id from one `claude agents --json` run, or null. */
+function agentsSessionId(pid) {
+  const run = spawnSync('claude', ['agents', '--json'], { encoding: 'utf8', timeout: 20_000 });
+  if (!run || run.status !== 0 || run.error) return null;
+  try {
+    return sessionIdIn(JSON.parse(run.stdout || ''), pid);
+  } catch {
+    return null;
+  }
+}
+
 async function apiConfig(args) {
   if (args.configFile) {
     const cfg = JSON.parse(fs.readFileSync(args.configFile, 'utf8'));
@@ -289,6 +320,12 @@ async function realDeps(args, cfg) {
       return JSON.parse(r.stdout);
     },
     postReport: async (conflicts) => (args.dryRun ? console.log(`[dry-run] would post ${conflicts.length} conflict(s)`) : call('POST', '/api/mcp/coordination/report', { conflicts })),
+    // The pause flag is the owner's newest "Pause all" or "Continue all", read from the Chief's own inbox.
+    paused: async (pid) => {
+      const session = agentsSessionId(pid) || `chief-pid-${pid}`;
+      const r = await call('GET', `/api/mcp/coordination/inbox?session=${encodeURIComponent(session)}&limit=1`);
+      return !!(r && r.pause && r.pause.paused);
+    },
     alive,
     statusOf: agentsStatus,
     ttyOf,
@@ -465,6 +502,27 @@ async function selftest() {
   eq('wake: a failed typing waits', wakeChief(42, WAKE_LINE, { ...deps, alive: () => true, type: boom }), { woke: 0, reason: 'iTerm2 did not answer the typing' });
   const keep = { last: [], pending: true, ticks: 1 };
   eq('tick: a failed typing keeps the change pending', [(await tick({ ...deps, alive: () => true, type: boom }, keep, 42, 3)).wake.woke, keep.pending], [0, true]);
+
+  // The owner's pause (TCK-1926): no wake while paused; the change waits for "Continue all".
+  calls.length = 0;
+  let paused = true;
+  const asked = [];
+  const pausing = { ...deps, alive: () => true, paused: async (p) => (asked.push(p), paused) };
+  const held = { last: [], pending: true, ticks: 1 };
+  eq('pause: a pending wake waits, nothing typed, still pending', [await tick(pausing, held, 42, 3), only('type'), held.pending, asked], [{ wake: { woke: 0, reason: 'the owner paused the sessions' } }, [], true, [42]]);
+  paused = false;
+  eq('continue: the held change wakes the Chief once', [await tick(pausing, held, 42, 3), held.pending], [{ wake: { woke: 1 } }, false]);
+  eq('pause: nothing pending, the pause is not even read', [await tick(pausing, { last: [], pending: false, ticks: 1 }, 42, 3), asked.length], [{}, 2]);
+  const unreadable = { ...pausing, paused: async () => { throw new Error('HTTP 503'); } };
+  eq('pause: a failed read wakes as before', (await tick(unreadable, { last: [], pending: true, ticks: 1 }, 42, 3)).wake, { woke: 1 });
+  eq('pause: an answer that is not true is not a pause', (await tick({ ...pausing, paused: async () => 'yes' }, { last: [], pending: true, ticks: 1 }, 42, 3)).wake, { woke: 1 });
+  paused = true;
+  eq('pause: a Chief that has ended is gone, paused or not', (await tick({ ...pausing, alive: () => false }, { last: [], pending: true, ticks: 1 }, 42, 3)).wake, { gone: true });
+  eq('pause: no reader at all wakes as before', [await pausedNow({}, 42), await pausedNow({ paused: async () => true }, 42)], [false, true]);
+  eq('session id: the row with this pid, else null',
+    [sessionIdIn([{ pid: 7, sessionId: 'a' }, { pid: 42, sessionId: 'b' }], 42), sessionIdIn([{ pid: 42 }], 42), sessionIdIn([{ pid: 42, sessionId: '' }], 42), sessionIdIn('x', 42), sessionIdIn([{ pid: 9, sessionId: 'c' }], 42)],
+    ['b', null, null, null, null]);
+  calls.length = 0;
   eq('claude agents output: fails closed on output that is not a JSON list',
     [statusFromOutput('[{"pid":42,"status":"idle"}]', 42), statusFromOutput('[{"pid":42,"status":"idle"}', 42), statusFromOutput('Error: not logged in', 42), statusFromOutput('', 42), statusFromOutput('{"pid":42,"status":"idle"}', 42)],
     ['idle', null, null, null, null]);

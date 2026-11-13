@@ -71,6 +71,12 @@ the Noesis server does not have the coordination routes yet (TCK-1890 is not shi
 
 Work files for one pass go in `~/.claude/coord/`. They are scratch: the record is the server.
 
+### 0. Paused?
+
+Read `coord_inbox` first. When `pause.paused` is true, the owner pressed "Pause all" on the Chief view, and that
+pauses you too. Report `coord_heartbeat` with `state: "paused"`, do nothing else in this pass, and in watch mode end
+the turn with `ScheduleWakeup` (1800 seconds). Go on only when a later read says the pause has ended ("Continue all").
+
 ### 1. The board
 
 Call `mcp__noesis__backlog_get` with `images: false` once for each active status: `planning`,
@@ -140,6 +146,9 @@ rewrite, change the card fields the same way. `coord_decide` refuses a card that
 
 ### 5. Up next: record a pick
 
+Read the `pick` policy first (`coord_policy`). When its mode is `off`, the owner has switched your picks off: skip
+this step and record no pick. The server refuses one then (409 `PICKS_OFF`), and Up next shows the default order.
+
 When a ticket waits to start (Created or Planning, with no session bound) and there is no current
 pick, or the current pick's ticket has started, record a pick:
 
@@ -190,11 +199,11 @@ node $S/coord-watch.mjs --start --chief-pid $PPID --repo <repo>
 tab, because macOS lets only a process with a terminal drive iTerm2, and goes back to this tab.
 Every 5 minutes it scans. When the result changes, it posts the scan and types
 `/noesis-chief watch` into this session, but only when this session is idle: never at a question
-or a permission prompt. It stops when this session ends, and it starts nothing while another
+or a permission prompt, and never while the owner has paused the sessions. It stops when this session ends, and it starts nothing while another
 watcher serves a live Chief. It has no model, so it costs no tokens. Also call
 `ScheduleWakeup` with 1800 seconds and the prompt `/noesis-chief watch`: that wake comes when
 nothing changes, or when the watcher is not running. On a wake:
-1. Run steps 1–3 again (`done.json` keeps the rules from repeating).
+1. Run steps 0–3 again (`done.json` keeps the rules from repeating). Step 0 comes first: a paused wake only reports `paused` and waits.
 2. Compare the result with the last `scan.json`, by conflict kind and ticket pair.
 3. Report only the new and the resolved findings, and any new card.
 

@@ -603,6 +603,11 @@ describe('the /noesis-chief skill ships in this package (TCK-1890)', () => {
 
   it('keeps the owner gates with the owner, records picks as parallel or after a ship, and has a report-only mode', () => {
     expect(template).toContain('# /noesis-chief — the Chief of Staff, version 1');
+    // TCK-1926: the owner's pause comes first on every pass and every wake; no pick while picks are off.
+    expect(template).toContain('### 0. Paused?\n\nRead `coord_inbox` first. When `pause.paused` is true, the owner pressed "Pause all" on the Chief view, and that\npauses you too.');
+    expect(template).toContain('1. Run steps 0–3 again (`done.json` keeps the rules from repeating). Step 0 comes first: a paused wake only reports `paused` and waits.');
+    expect(template).toContain("When its mode is `off`, the owner has switched your picks off: skip\nthis step and record no pick. The server refuses one then (409 `PICKS_OFF`)");
+    expect(template.indexOf('### 0. Paused?')).toBeLessThan(template.indexOf('### 1. The board'));
     expect(template).toContain('Answer an owner gate (the server refuses it with `OWNER_GATE`)');
     expect(template).toContain('In server mode, do not ask the owner the cards in the terminal.');
     expect(template).toContain('"Start TCK-<n> next, in parallel" or "Start TCK-<n> after TCK-x ships"');
@@ -716,7 +721,7 @@ describe('the scan watcher ships in this package (TCK-1890)', () => {
       "- The report's Ship order part comes from the scan's C1 lines, because `coord_leases` needs the server.",
       "`components`. A Planning ticket with no session bound also waits to start, so step 5 ranks it\nwith these fields.",
       "(the list gives only `link_count`: read the ticket's `links[].first` with `mcp__noesis__backlog_get` and its key).",
-      "`/noesis-chief watch` into this session, but only when this session is idle: never at a question\nor a permission prompt. It stops when this session ends, and it starts nothing while another\nwatcher serves a live Chief.",
+      "`/noesis-chief watch` into this session, but only when this session is idle: never at a question\nor a permission prompt, and never while the owner has paused the sessions. It stops when this session ends, and it starts nothing while another\nwatcher serves a live Chief.",
       "`priority`, `size`, `created_at`, `refined_text`, `refined_at`, `open_question_count`,",
     ]) expect(template).toContain(sentence);
   });
