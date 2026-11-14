@@ -543,7 +543,12 @@ function repoChecks(dir, mainRef, add) {
 }
 
 /** The verdict for one session. */
-export async function checkSession(agent, F, deps) {
+/**
+ * One session's verdict. `selfCheck`: the session checks itself (`check --pid $PPID`, run by that session to answer
+ * "Can I close the session?"). Then its own busy state (it is running this check), its own answer reasons (it is
+ * answering now) and the check's own process chain are left out; everything else counts, a running loop included.
+ */
+export async function checkSession(agent, F, deps, { selfCheck = false } = {}) {
   const sid = agent.sessionId;
   const reasons = [];
   const followUps = [];
@@ -568,8 +573,8 @@ export async function checkSession(agent, F, deps) {
   else if (status === 'not-on-board') add('ticket-unknown', `${key} is not on the Jot board`, 'owner');
   else if (key && !CLOSED_STATUSES.includes(status)) add('ticket-open', status === 'ready_to_merge' ? `${key} is Ready to merge: it waits for your "ship it"` : `${key} is at ${status}`, status === 'ready_to_merge' ? 'owner' : 'session');
 
-  // The session itself.
-  if (state === 'busy') add('busy', 'it is working', 'session');
+  // The session itself. Checking itself, it is busy by definition: that is no reason.
+  if (selfCheck) { /* its own state is this check */ } else if (state === 'busy') add('busy', 'it is working', 'session');
   else if (state === 'waiting' || state === 'blocked') add('waiting', `it waits for you${agent.waitingFor ? ` (${agent.waitingFor})` : ''}`, 'owner');
   if (transcript.wakeupAt) add('wakeup', `a wakeup is armed for ${new Date(transcript.wakeupAt).toISOString().slice(11, 16)} UTC`, 'session');
   if (ev.sidecar && ev.sidecar.stateFile) {
@@ -594,6 +599,7 @@ export async function checkSession(agent, F, deps) {
       if (!(d === root || d.startsWith(root + path.sep))) continue;
       const p = F.ps.get(pid);
       if (!p || pid === agent.pid || up.has(pid) || SHELL_RE.test(p.command)) continue;
+      if (selfCheck && (pid === process.pid || ancestors(process.pid, F.ps).has(pid) || isDescendant(pid, process.pid, F.ps))) continue; // this check itself
       if (others.has(pid) || [...others].some((o) => isDescendant(pid, o, F.ps))) continue; // another session's own work
       const mine = agent.pid && isDescendant(pid, agent.pid, F.ps);
       if (isHelper(p, agent.pid, helpers)) continue;
@@ -645,7 +651,7 @@ export async function checkSession(agent, F, deps) {
   const answer = readJson(path.join(closeDir(), `${sid}.json`));
   const hasAnswer = Boolean(answer && (answer.verdict === 'yes' || answer.verdict === 'no') && Number.isFinite(Date.parse(answer.at)));
   const stale = hasAnswer && transcript.lastOwnerPrompt > Date.parse(answer.at);
-  if (hasAnswer && answer.verdict === 'no') add('answer-no', `the session said no: ${short((answer.left || []).join('; ') || 'no reason given', 200)}`, 'session');
+  if (selfCheck) { /* it is answering now: its old answer, or none, is no reason */ } else if (hasAnswer && answer.verdict === 'no') add('answer-no', `the session said no: ${short((answer.left || []).join('; ') || 'no reason given', 200)}`, 'session');
   else if (hasAnswer && stale) add('answer-stale', 'its answer is older than your last message to it: ask it again yourself', 'owner');
   else if (!hasAnswer && key) add('answer-missing', 'it has not answered "Can I close the session?" yet', 'chief');
 
@@ -657,6 +663,7 @@ export async function checkSession(agent, F, deps) {
     ticket: key ? { key, status, by: ev.by.map(([k]) => k) } : null,
     verdict, reasons, followUps,
     answer: hasAnswer ? { verdict: answer.verdict, at: answer.at, left: answer.left || [], stale: Boolean(stale) } : null,
+    ...(selfCheck ? { selfCheck: true } : {}),
     askedAt: answer && answer.askedAt || null,
     checkedAt: new Date(F.now).toISOString(),
   };
@@ -673,8 +680,10 @@ export async function check(args, deps) {
   let rows = interactive(F.agents);
   if (args.session) rows = rows.filter((a) => a.sessionId === args.session);
   else if (args.pid) rows = rows.filter((a) => a.pid === Number(args.pid));
+  // A session that checks itself (--pid or --session names the claude process this runs under) answers for itself.
+  const caller = args.pid || args.session ? selfSessionPid(F.ps) : null;
   const sessions = [];
-  for (const a of rows) sessions.push(await checkSession(a, F, deps));
+  for (const a of rows) sessions.push(await checkSession(a, F, deps, { selfCheck: Boolean(caller) && a.pid === caller }));
   // The loop tabs (local, of a ticket); every other tab is only counted.
   const tabs = F.tabs === null ? null : {
     loop: F.tabs.map((t) => ({ id: t.id, ticket: t.ticket, status: t.status, label: t.label, sureOrphan: t.sureOrphan, active: t.active, url: t.url, title: t.title, openedBy: t.openedBy ? t.openedBy.sessionId : null })),
@@ -754,6 +763,7 @@ export function render(result) {
   const out = [`Close check at ${result.checkedAt}: ${result.sessions.length} session${result.sessions.length === 1 ? '' : 's'}`];
   for (const s of result.sessions) {
     out.push('', `${s.verdict.toUpperCase().padEnd(5)} ${s.name || s.sessionId.slice(0, 8)} (${s.sessionId.slice(0, 8)}, pid ${s.pid}, ${s.folder})${s.ticket ? ` ${s.ticket.key} ${s.ticket.status || '?'}` : ' no ticket'}`);
+    if (s.selfCheck) out.push('      (it checked itself: its own busy state, its answer and this check\'s process are left out)');
     for (const r of s.reasons) out.push(`      no: ${r.text} [fix: ${r.fixer}]`);
     for (const f of s.followUps) out.push(`      note: ${f.text}`);
   }
@@ -1500,6 +1510,35 @@ async function selftest() {
     { const seen = []; const d = actDeps({}, { ...realDeps({}), get: async (p) => { seen.push(p); return { pause: { paused: false } }; } }); eq('the real pause read asks the server for this session\'s inbox, and no session id reads as unknown', [await d.paused('abc-123'), await d.paused(null), seen], [false, null, ['/api/mcp/coordination/inbox?session=abc-123&limit=1']]); }
     eq('the iTerm scripts: by unique id, by tty, the tab count, and the shared-tab guard before close', [/if \(\(unique id of s\) as text\) is "U-1" then/.test(paneScript('U-1')), /if \(\(unique id of s\) as text\) is "U-1" then/.test(typeLineScript('U-1', 'x')), /if \(tty of s\) is "\/dev\/ttys1" then/.test(itermSessionsScript('/dev/ttys1')), /set n to count of sessions of t/.test(itermSessionsScript('/dev/ttys1')), /if \(count of sessions of t\) is not 1 then return "shared"\n\s*close s/.test(closeItermScript('U-1'))], [true, true, true, true, true]);
     { const fakePs = new Map([[process.pid, { pid: process.pid, ppid: 4242, pgid: 1, command: 'node coord-close.mjs' }], [4242, { pid: 4242, ppid: 1, pgid: 1, command: '/usr/local/bin/claude --resume x' }]]); eq("chiefPid: --self-pid first, else the claude process this script runs under, else none", [chiefPid({ selfPid: 7 }, { ps: () => fakePs }), chiefPid({}, { ps: () => fakePs }), chiefPid({}, { ps: () => null })], [7, 4242, null]); }
+    {
+      // s1 checks itself while busy, with no answer yet: the check (process.pid, under a zsh under s1's claude 101, running from s1's worktree) is not listed.
+      const busy = agents.map((a) => (a.sessionId === sid(1) ? { ...a, status: 'busy' } : a));
+      const selfPs = new Map([...ps, [7001, { pid: 7001, ppid: 101, pgid: 7001, command: 'timeout 300 node coord-close.mjs check' }], [process.pid, { pid: process.pid, ppid: 7001, pgid: 7001, command: 'node coord-close.mjs check --pid 101' }]]);
+      const selfCwds = new Map([...cwds, [process.pid, w1], [7001, w1]]);
+      const sd = deps({ agents: () => busy, ps: () => selfPs, cwds: () => selfCwds });
+      const s1File = path.join(closeDir(), `${sid(1)}.json`);
+      const s1Kept = fs.existsSync(s1File) ? fs.readFileSync(s1File, 'utf8') : null; // the close tests below rely on s1's answer
+      fs.rmSync(s1File, { force: true });
+      const me = (await check({ configRepo: null, repo, pid: 101 }, sd)).sessions[0];
+      const chief = (await check({ configRepo: null, repo, all: true }, sd)).sessions.find((x) => x.sessionId === sid(1));
+      eq('a session that checks itself: its busy state, its missing answer and this check\'s own process are left out; its other processes still count', [me.selfCheck, me.reasons.map((x) => x.code), me.reasons.some((x) => x.pid === process.pid || x.pid === 7001)], [true, ['process', 'process', 'process', 'process', 'process'], false]);
+      eq('the same session seen by --all (the Chief): busy, its missing answer and the check\'s process count', [chief.selfCheck, chief.reasons.map((x) => x.code).filter((c) => c !== 'process'), chief.reasons.some((x) => x.pid === process.pid)], [undefined, ['busy', 'answer-missing'], true]);
+      // A recorded "no" (at LOOP COMPLETE) does not make its own later check say no.
+      write(path.join(closeDir(), `${sid(1)}.json`), JSON.stringify({ verdict: 'no', at: new Date(NOW - 60_000).toISOString(), left: ['waits for ship it'] }));
+      const again = (await check({ configRepo: null, repo, pid: 101 }, sd)).sessions[0];
+      eq('its own earlier "no" is no reason when it checks itself again', again.reasons.some((x) => x.code.startsWith('answer-')), false);
+      fs.rmSync(path.join(closeDir(), `${sid(1)}.json`), { force: true });
+      const other = (await check({ configRepo: null, repo, pid: 102 }, sd)).sessions[0];
+      eq('checking ANOTHER session by pid is no self-check', [other.selfCheck, other.reasons.some((x) => x.code === 'answer-missing')], [undefined, true]);
+      // A loop that still runs counts even when the session checks itself.
+      const loop1 = path.join(root, 'LOOP-STATE-s1.md');
+      write(loop1, '# x\n**Loop-state: RUNNING**\nTicket: TCK-1 bound at kickoff\n');
+      write(path.join(cfg, 'loop-supervisor', `${sid(1)}.json`), JSON.stringify({ sessionId: sid(1), cwd: w1, stateFile: loop1 }));
+      const looping = (await check({ configRepo: null, repo, pid: 101 }, sd)).sessions[0];
+      eq('a running loop still counts when the session checks itself', looping.reasons.some((x) => x.code === 'loop-running'), true);
+      fs.rmSync(path.join(cfg, 'loop-supervisor', `${sid(1)}.json`));
+      if (s1Kept !== null) write(s1File, s1Kept);
+    }
     eq('the ask line names the main checkout for the session\'s own check', askLine('/main/repo').includes('check --pid $PPID --repo /main/repo'), true);
     eq("the ask line quotes a path with a space or a quote as one shell word", [askLine('/a b/c').includes("--repo '/a b/c'"), shq("/it's"), shq('/plain/path-1.x')], [true, "'/it'\\''s'", '/plain/path-1.x']);
     eq('close itself fixes exactly these three reasons; every other reason blocks', FIXED_BY_CLOSE, ['process', 'port', 'tabs']);

@@ -401,7 +401,7 @@ function parseArgs(argv) {
   return args;
 }
 
-const USAGE = 'usage: coord-tabs.mjs list [--json] [--closed <file>] [--repo <main checkout>] | close (--ids <id,...> | --orphans) [--json] | --selftest';
+const USAGE = 'usage: coord-tabs.mjs list [--json] [--closed <file>] [--repo <main checkout>] | close (--ids <id,...> | --orphans) [--repo <main checkout>] [--json] | --selftest';
 
 // No top-level await: coord-close.mjs imports this file while its own main runs, and a module that
 // is still evaluating would make that import wait forever.
