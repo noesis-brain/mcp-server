@@ -131,10 +131,10 @@ export const COPIED_FROM_SCAN = ['IGNORED', 'git', 'lines', 'keep', 'mainCheckou
 const configDir = () => process.env.CLAUDE_CONFIG_DIR || path.join(os.homedir(), '.claude');
 export const closeDir = () => path.join(configDir(), 'coord', 'close');
 const sidOk = (s) => typeof s === 'string' && /^[A-Za-z0-9-]{8,64}$/.test(s);
-const short = (s, n) => { const t = String(s ?? ''); return t.length > n ? `${t.slice(0, n - 1)}…` : t; };
+export const short = (s, n) => { const t = String(s ?? ''); return t.length > n ? `${t.slice(0, n - 1)}…` : t; };
 const folderOf = (p) => (p ? path.basename(p) : null);
 
-function readJson(file) {
+export function readJson(file) {
   try { return JSON.parse(fs.readFileSync(file, 'utf8')); } catch { return null; }
 }
 
@@ -250,6 +250,13 @@ export function realDeps(args = {}) {
     get: apiGet,
     now: () => Date.now(),
     configDir,
+    tabs: async (F, run) => {
+      const m = await import('./coord-tabs.mjs');
+      const tabs = run ? m.listChromeTabs(run) : m.listChromeTabs();
+      if (tabs === null) return null;
+      const facts = await m.tabFacts(F);
+      return m.classify(tabs, { ...facts, status: m.statusMapFor(tabs, facts, F) });
+    },
   };
 }
 
@@ -281,6 +288,8 @@ const isToolResult = (content) => Array.isArray(content) && content.some((c) => 
  */
 export function readTranscript(text, now = Date.now()) {
   const keys = [];
+  const tabTools = new Set(); // tool_use ids of the session's own Chrome tab tools
+  const tabIds = new Set();
   let lastOwnerPrompt = 0;
   let wakeupAt = 0;
   let fired = false;
@@ -299,6 +308,7 @@ export function readTranscript(text, now = Date.now()) {
         if (!c || c.type !== 'tool_use') continue;
         const name = String(c.name || '');
         if (/^mcp__noesis__backlog_(bind|set_status|refine|set_gut|ship)$/.test(name) && TICKET_RE.test(String(c.input?.key || ''))) keys.push(c.input.key);
+        if (/^mcp__claude-in-chrome__tabs_(create|context)_mcp$/.test(name) && c.id) tabTools.add(c.id);
         if (name === 'ScheduleWakeup') {
           const d = Math.min(WAKEUP_MAX_S, Math.max(WAKEUP_MIN_S, Number(c.input?.delaySeconds) || 0));
           wakeupAt = c.input?.stop ? 0 : at + d * 1000;
@@ -312,6 +322,13 @@ export function readTranscript(text, now = Date.now()) {
       if (a.type === 'queued_command' && a.origin?.kind === 'human') lastOwnerPrompt = Math.max(lastOwnerPrompt, at);
       continue;
     }
+    if (r.type === 'user' && isToolResult(r.message?.content)) {
+      for (const c of r.message.content) {
+        if (!c || c.type !== 'tool_result' || !tabTools.has(c.tool_use_id)) continue;
+        for (const m of JSON.stringify(c.content ?? '').matchAll(/tabId\\?"?\s*[:=]?\s*(\d{3,12})/g)) tabIds.add(Number(m[1]));
+      }
+      continue;
+    }
     if (r.type === 'user' && !isToolResult(r.message?.content)) {
       const t = textOf(r.message?.content).trimStart();
       boundIn(t);
@@ -323,7 +340,7 @@ export function readTranscript(text, now = Date.now()) {
       if (!machine && t) lastOwnerPrompt = Math.max(lastOwnerPrompt, at);
     }
   }
-  return { keys, lastOwnerPrompt, wakeupAt: wakeupAt > now ? wakeupAt : 0 };
+  return { keys, lastOwnerPrompt, wakeupAt: wakeupAt > now ? wakeupAt : 0, tabIds: [...tabIds] };
 }
 
 // ── Gathering ──────────────────────────────────────────────────────────────────────────────
@@ -366,12 +383,25 @@ export async function gather(args, deps) {
       const ref = hasCopy ? 'claude-config' : 'package';
       return { file: f, ref, liveDiffers: !sameFile(path.join(cfg, 'commands', f), hasCopy ? copy : tpl), copiesDiffer: hasCopy && !sameFile(tpl, copy) };
     });
-  return {
+  const F = {
     main, mainRef, cfg, wts: worktrees(main), agents, ps, cwds, ports, npm, mainVersion, distStale, statusByKey, statuses,
     portSlots: allocations && Array.isArray(allocations.ports) ? allocations.ports : null,
     leases: leases && Array.isArray(leases.leases) ? leases.leases : null,
     configRepo, configWts: configRepo ? worktrees(configRepo) : [], hookStale, skills, now: deps.now(),
   };
+  F.ticketOfDir = (dir) => { const w = worktreeOf(dir, F.wts); const n = w && path.resolve(w.path) !== path.resolve(main) ? ticketNumberOf(w) : null; return n ? `TCK-${n}` : null; };
+  F.bySid = new Map();
+  // Every live session, background agents too: a background loop still works on its ticket (its tabs are in use).
+  for (const a of (Array.isArray(agents) ? agents : []).filter((x) => x && sidOk(x.sessionId))) {
+    const tf = transcriptFile(a.sessionId, cfg);
+    const transcript = readTranscript(tf ? tail(tf, TRANSCRIPT_TAIL_BYTES) : '', F.now);
+    F.bySid.set(a.sessionId, { agent: a, transcript, ev: ticketEvidence(a.sessionId, a.cwd, F, transcript) });
+  }
+  // The loop tabs in Chrome (coord-tabs.mjs): null when AppleScript fails. coord-tabs reads them itself (withTabs: false).
+  const tabResult = args.withTabs === false || !deps.tabs ? { tabs: [], nonLocalBySession: {} } : await deps.tabs(F);
+  F.tabs = tabResult ? tabResult.tabs : null;
+  F.tabsNonLocal = tabResult ? tabResult.nonLocalBySession || {} : {};
+  return F;
 }
 
 const ALL_STATUSES = ['created', 'planning', 'ready_to_implement', 'implementing', 'iterating', 'ready_to_merge', 'deploying', 'shipped', 'merged', 'dropped'];
@@ -496,9 +526,9 @@ export async function checkSession(agent, F, deps) {
   const reasons = [];
   const followUps = [];
   const add = (code, text, fixer, extra) => reasons.push({ code, text, fixer, ...(extra || {}) });
-  const tf = transcriptFile(sid, F.cfg);
-  const transcript = readTranscript(tf ? tail(tf, TRANSCRIPT_TAIL_BYTES) : '', F.now);
-  const ev = ticketEvidence(sid, agent.cwd, F, transcript);
+  const cached = F.bySid && F.bySid.get(sid);
+  const transcript = cached ? cached.transcript : (() => { const tf = transcriptFile(sid, F.cfg); return readTranscript(tf ? tail(tf, TRANSCRIPT_TAIL_BYTES) : '', F.now); })();
+  const ev = cached ? cached.ev : ticketEvidence(sid, agent.cwd, F, transcript);
   const key = ev.key;
   const status = key ? statusOf(key, F) : null;
   const wt = workFolder(agent.cwd, key, ev.sidecar, F);
@@ -509,6 +539,7 @@ export async function checkSession(agent, F, deps) {
   // The facts the check could not read.
   if (!F.ps || !F.cwds) add('facts-failed', `the check could not read the processes (${!F.ps ? 'ps' : 'lsof'} failed)`, 'chief');
   if (!F.portSlots || !F.leases) add('facts-failed', 'the check could not read the port slots and leases from the server', 'chief');
+  if (F.tabs === null) add('facts-failed', 'the check could not read the Chrome tabs', 'chief');
 
   // The ticket.
   if (key && !status) add('ticket-unknown', `the check could not read ${key}'s status`, 'chief');
@@ -548,6 +579,12 @@ export async function checkSession(agent, F, deps) {
     }
     for (const p of found) add('process', `${p.mine ? 'its own process' : 'a process'} runs from ${folderOf(wt.path)}: pid ${p.pid} ${p.command}${p.ports.length ? ` (port ${p.ports.join(', ')})` : ''}`, 'chief', { pid: p.pid, pgid: p.pgid, ports: p.ports });
   }
+
+  // Its Chrome tabs: a loop tab of its ticket, or a tab its own Chrome tools opened.
+  const tabs = (F.tabs || []).filter((t) => (key && t.ticket === key) || (t.openedBy && t.openedBy.sessionId === sid));
+  if (tabs.length) add('tabs', `it has ${tabs.length} Chrome tab${tabs.length > 1 ? 's' : ''} open: ${short(tabs.map((t) => `tab ${t.id} (${t.label})`).join(', '), 200)}`, 'chief', { tabIds: tabs.map((t) => t.id) });
+  const ownNonLocal = (F.tabsNonLocal || {})[sid] || 0;
+  if (ownNonLocal) add('tabs', `it has ${ownNonLocal} other Chrome tab${ownNonLocal > 1 ? 's' : ''} open that its own Chrome tools opened (not local, so the Chief never closes ${ownNonLocal > 1 ? 'them' : 'it'})`, 'session', { nonLocal: ownNonLocal });
 
   // Its port slot and leases.
   if (F.portSlots) {
@@ -917,6 +954,10 @@ async function selftest() {
     const by = (n) => r.sessions.find((s) => s.sessionId === sid(n));
     const codes = (n) => by(n).reasons.map((x) => x.code);
     eq('only interactive sessions are checked (the background agent has no terminal)', r.sessions.length, 6);
+    write(path.join(cfg, 'tck-bindings', `${sid(7)}.json`), JSON.stringify({ key: 'TCK-3', status: 'implementing' }));
+    const G = await gather({ configRepo: null, repo, all: true, withTabs: false }, deps());
+    eq('gather keeps the facts of a background agent too (its loop still works on its ticket)', [G.bySid.has(sid(7)), G.bySid.get(sid(7)) && G.bySid.get(sid(7)).ev.key], [true, 'TCK-3']);
+    fs.rmSync(path.join(cfg, 'tck-bindings', `${sid(7)}.json`));
     eq('s1: the ticket comes from the binding cache, with the transcript as second evidence', by(1).ticket, { key: 'TCK-1', status: 'shipped', by: ['binding-cache', 'transcript', 'worktree-name'] });
     eq('s1: a shipped, clean session with no answer yet waits for the ask and for the processes in its worktree', codes(1), ['process', 'process', 'process', 'process', 'process', 'answer-missing']);
     eq('s1: its own MCP test run, the leftover tsx server and its npm parent, a stray MCP-looking server and a non-shell "zsh" command all count', by(1).reasons.filter((x) => x.code === 'process').map((x) => x.pid), [203, 300, 301, 302, 303]);
@@ -1071,6 +1112,18 @@ async function selftest() {
     eq('the local test-db lease belongs to the session whose process holds it', rLease.sessions.filter((s) => s.reasons.some((x) => x.code === 'test-db-lease')).map((s) => s.name), ['five']);
     fs.rmSync(path.join(cfg, 'coord', 'locks'), { recursive: true, force: true });
 
+    // Its Chrome tabs: a loop tab of its ticket, or one its own tools opened, keeps it open; an unreadable tab list is a reason.
+    const tabsDeps = (t, nonLocalBySession = {}) => deps({ cwds: () => cwds2, tabs: async () => (t === null ? null : { tabs: t, nonLocalBySession }) });
+    const rt = await check({ configRepo: null, repo, session: sid(1) }, tabsDeps([{ id: 11, ticket: 'TCK-1', label: 'done', openedBy: null }, { id: 12, ticket: 'TCK-9', label: 'in-use', openedBy: { sessionId: sid(1) } }, { id: 13, ticket: 'TCK-9', label: 'in-use', openedBy: null }]));
+    eq('its tabs: the loop tab of its ticket and the tab it opened, not another loop\'s tab', [rt.sessions[0].reasons.filter((x) => x.code === 'tabs').length, (rt.sessions[0].reasons.find((x) => x.code === 'tabs') || {}).tabIds], [1, [11, 12]]);
+    const rtn = await check({ configRepo: null, repo, session: sid(1) }, tabsDeps(null));
+    eq('the Chrome tabs cannot be read: a reason, never yes', [rtn.sessions[0].verdict, rtn.sessions[0].reasons.some((x) => x.text === 'the check could not read the Chrome tabs')], ['no', true]);
+    const rt0 = await check({ configRepo: null, repo, session: sid(1) }, tabsDeps([]));
+    eq('no tabs: no tab reason', rt0.sessions[0].reasons.some((x) => x.code === 'tabs' || /Chrome tabs/.test(x.text)), false);
+    const rtl = await check({ configRepo: null, repo, session: sid(1) }, tabsDeps([], { [sid(1)]: 2, [sid(2)]: 5 }));
+    eq('its own non-local tabs: a count for the session to close, never named', (rtl.sessions[0].reasons.find((x) => x.code === 'tabs') || {}).nonLocal, 2);
+    eq('the real tab path: AppleScript failure is null (a reason), never an empty list', await realDeps({}).tabs({}, () => { throw new Error('osascript failed'); }), null);
+
     // Failures fail closed.
     const r8 = await check({ configRepo: null, repo, session: sid(1) }, deps({ ps: () => null }));
     eq('ps failed: a reason, never yes', [r8.sessions[0].verdict, r8.sessions[0].reasons[0].code], ['no', 'facts-failed']);
@@ -1196,6 +1249,12 @@ async function selftest() {
       line({ type: 'assistant', timestamp: iso(NOW - 10_000), message: { content: [{ type: 'tool_use', name: 'ScheduleWakeup', input: { delaySeconds: 5000 } }] } }),
     ].join('\n'), NOW);
     eq('a wakeup delay is clamped to 3600 s', t.wakeupAt, NOW - 10_000 + 3600_000);
+    // The tab ids a session's own Chrome tools saw (tabs_create_mcp / tabs_context_mcp results).
+    const tt = readTranscript([
+      line({ type: 'assistant', timestamp: iso(NOW - 900), message: { content: [{ type: 'tool_use', id: 'tu1', name: 'mcp__claude-in-chrome__tabs_create_mcp', input: {} }, { type: 'tool_use', id: 'tu2', name: 'mcp__noesis__backlog_get', input: {} }, { type: 'tool_use', id: 'tu3', name: 'mcp__claude-in-chrome__navigate', input: {} }] } }),
+      line({ type: 'user', timestamp: iso(NOW - 899), message: { content: [{ type: 'tool_result', tool_use_id: 'tu1', content: [{ type: 'text', text: '{"tabId":11586499,"url":"http://tck-7.localhost:3701/"}' }, { type: 'text', text: '  • tabId 11586500: "New Tab"' }] }, { type: 'tool_result', tool_use_id: 'tu2', content: '{"tabId":999999}' }, { type: 'tool_result', tool_use_id: 'tu3', content: 'Executed on tabId: 888888' }] } }),
+    ].join('\n'), NOW);
+    eq('tab ids come only from the results of the session\'s own Chrome tab tools', tt.tabIds, [11586499, 11586500]);
     eq('a stopped wakeup is not armed', readTranscript(line({ type: 'assistant', timestamp: iso(NOW - 10_000), message: { content: [{ type: 'tool_use', name: 'ScheduleWakeup', input: { stop: true } }] } }), NOW).wakeupAt, 0);
   } finally {
     if (savedCfg === undefined) delete process.env.CLAUDE_CONFIG_DIR; else process.env.CLAUDE_CONFIG_DIR = savedCfg;
