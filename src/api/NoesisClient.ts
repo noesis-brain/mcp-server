@@ -1726,6 +1726,16 @@ export class NoesisClient {
     return this.requestWithCode('GET', '/api/mcp/coordination/sessions');
   }
 
+  /** TCK-1926: the questions and plan approvals that ticket sessions hold, the oldest first. */
+  async coordRequests(): Promise<any> {
+    return this.requestWithCode('GET', '/api/mcp/coordination/requests');
+  }
+
+  /** TCK-1926: the Chief answers one (the server checks the role, the route and the ticket). */
+  async coordAnswerRequest(id: number, body: Record<string, unknown>): Promise<any> {
+    return this.requestWithCode('POST', `/api/mcp/coordination/requests/${encodeURIComponent(String(id))}/answer`, body);
+  }
+
   /** A plain message to one session, or to every session. Pause and continue are the owner's (409 OWNER_GATE). */
   async coordMessage(body: Record<string, unknown>): Promise<any> {
     return this.requestWithCode('POST', '/api/mcp/coordination/messages', body);

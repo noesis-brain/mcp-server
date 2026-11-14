@@ -84,6 +84,9 @@
 //   - the waits (TCK-1926): PermissionRequest reports what the session (or a subagent) waits for, with no decision,
 //     and the next event of the same actor, Stop, SessionEnd or a detached watcher of `claude agents --json` ends
 //     it, so the Chief view's "Needs you" lists it. Kill switch: COORD_WAITS=off.
+//   - the requests (TCK-1926): `--hold`, from its own PreToolUse entry, holds a bound session's question or plan
+//     approval with no dialog until the Chief of Staff or the owner answers it on the Chief view, then applies the
+//     answer (a plan's through the PermissionRequest that follows). Kill switch: COORD_REQUESTS=off.
 
 import fs from 'node:fs';
 import os from 'node:os';
@@ -814,13 +817,13 @@ export function loadConfig(cwd) {
 
 const CLIENT_OS = process.platform === 'darwin' ? 'darwin' : process.platform === 'win32' ? 'win32' : 'linux';
 
-/** One API call with a short timeout. Throws { status, code } on a non-OK answer. */
-async function api(cfg, method, p, body) {
+/** One API call with a short timeout (a held request's calls pass a longer one). Throws { status, code } on a non-OK answer. */
+async function api(cfg, method, p, body, timeoutMs = TIMEOUT_MS) {
   const res = await fetch(cfg.baseUrl + p, {
     method,
     headers: { Authorization: `Bearer ${cfg.token}`, 'Content-Type': 'application/json', 'X-Client-OS': CLIENT_OS },
     body: body ? JSON.stringify(body) : undefined,
-    signal: AbortSignal.timeout(TIMEOUT_MS),
+    signal: AbortSignal.timeout(timeoutMs),
   });
   let data = null;
   try {
@@ -1651,6 +1654,237 @@ async function watchWait(sessionId, since, cwd) {
   if (w && w.since === since) await clearWait(sessionId, since, cwd || undefined);
 }
 
+// --- Requests (TCK-1926): a ticket session's question or plan approval waits for the Chief of Staff or the owner. ---
+// `--hold` runs from its own PreToolUse entry (AskUserQuestion|ExitPlanMode, timeout 3600 s, with a statusMessage),
+// so the session shows no dialog while it waits. The server decides whether there is a request at all (a ticket
+// bound, the kind not switched off, not a Ticket or Waiting question, not the Chief's own session) and who may answer
+// it. The hook polls it every 2 s:
+//  - a question's answer: allow, with the answers (and the owner's notes) in the tool's input;
+//  - a plan's answer: no decision here. The decision goes to a local file, and PermissionRequest, which fires next,
+//    approves the plan in the mode the session had before plan mode, or sends it back with the owner's note;
+//  - "Answer in the terminal", a gone request, a lost server, the time limit or Esc (SIGTERM): no decision, so the
+//    normal dialog shows and is reported as a wait.
+// A subagent's prompt is never held. Kill switch: COORD_REQUESTS=off (COORD_INBOX=off turns every Chief call off).
+
+const HOLD_POLL_MS = Number(process.env.COORD_HOLD_POLL_MS) || 2000;
+// The hook's timeout is 3600 s: it lets go a minute before, so the dialog shows instead of a killed hook.
+const HOLD_MAX_MS = Number(process.env.COORD_HOLD_MAX_MS) || 3540 * 1000;
+// The server marks a request gone after 20 s without a poll: with no reply for 15 s, the hook lets go first.
+const HOLD_LOST_MS = Number(process.env.COORD_HOLD_LOST_MS) || 15 * 1000;
+// A hold has an hour, so its create and poll calls wait up to 10 s, not the 2.5 s of the hook's other calls. The
+// create takes about 1 s on a warm server (measured on the test stack), longer on a cold one; a timed-out create
+// leaves a request nobody polls, which the server marks gone after 20 s.
+const HOLD_CALL_MS = Number(process.env.COORD_HOLD_CALL_MS) || 10 * 1000;
+/** The hold's timings, for the tests: it lets go before the hook's 3600 s timeout, and polls well inside the 20 s gone rule. */
+export const HOLD_TIMES = { pollMs: HOLD_POLL_MS, maxMs: HOLD_MAX_MS, lostMs: HOLD_LOST_MS, callMs: HOLD_CALL_MS };
+/** A plan's decision applies only to the PermissionRequest that follows at once. */
+const PLAN_DECISION_MS = 60 * 1000;
+const TAIL_READ_BYTES = 256 * 1024;
+const TAIL_MAX = 4000;
+/** The modes an approved plan continues in; any other mode before plan mode becomes acceptEdits (no edit prompts). */
+const BUILD_MODES = new Set(['acceptEdits', 'auto', 'bypassPermissions']);
+
+const planFile = (sessionId) => path.join(coordDir(), `${String(sessionId).replace(/[^A-Za-z0-9_-]/g, '')}.plan.json`);
+
+function dropPlan(sessionId) {
+  try {
+    fs.unlinkSync(planFile(sessionId));
+  } catch {
+    /* none */
+  }
+}
+
+/** The plan's decision, read once: only a fresh one counts. */
+function takePlan(sessionId) {
+  let d = null;
+  try {
+    d = JSON.parse(fs.readFileSync(planFile(sessionId), 'utf8'));
+  } catch {
+    return null;
+  }
+  dropPlan(sessionId);
+  const age = Date.now() - (d && d.at);
+  return d && (d.plan === 'approve' || d.plan === 'send_back') && age >= 0 && age < PLAN_DECISION_MS ? d : null;
+}
+
+/** The session's mode outside plan mode, kept for an approved plan to return to. */
+function noteMode(p) {
+  const m = p.permission_mode;
+  if (typeof m !== 'string' || !m || m === 'plan' || p.agent_id) return;
+  const st = readCoord(p.session_id);
+  if (st.mode !== m) writeCoord(p.session_id, { ...st, mode: m });
+}
+
+const buildMode = (sessionId) => {
+  const m = readCoord(sessionId).mode;
+  return BUILD_MODES.has(m) ? m : 'acceptEdits';
+};
+
+/** The end of the session's conversation, for the Chief: the owner's and Claude's text, never a tool's input or output. */
+export function transcriptTail(file) {
+  if (!file) return '';
+  let fd;
+  try {
+    const size = fs.statSync(file).size;
+    const len = Math.min(size, TAIL_READ_BYTES);
+    const buf = Buffer.alloc(len);
+    fd = fs.openSync(file, 'r');
+    fs.readSync(fd, buf, 0, len, size - len);
+    const lines = buf.toString('utf8').split('\n');
+    if (size > len) lines.shift(); // cut in the middle
+    const parts = [];
+    for (const line of lines) {
+      let e;
+      try {
+        e = JSON.parse(line);
+      } catch {
+        continue;
+      }
+      const who = e && e.type === 'user' ? 'Owner' : e && e.type === 'assistant' ? 'Claude' : null;
+      if (!who || e.isMeta || e.isSidechain) continue;
+      const c = e.message && e.message.content;
+      const text =
+        typeof c === 'string'
+          ? c
+          : Array.isArray(c)
+            ? c.filter((b) => b && b.type === 'text' && typeof b.text === 'string').map((b) => b.text).join('\n')
+            : '';
+      if (text.trim()) parts.push(`${who}: ${text.trim()}`);
+    }
+    return Array.from(parts.join('\n\n')).slice(-TAIL_MAX).join('');
+  } catch {
+    return '';
+  } finally {
+    if (fd !== undefined) {
+      try {
+        fs.closeSync(fd);
+      } catch {
+        /* closed */
+      }
+    }
+  }
+}
+
+/** The request this process holds: released on Esc (SIGTERM). */
+let holding = null;
+/** The release in flight: the process waits for it before it exits, whichever path gets there first. */
+let releasing = null;
+
+function releaseHeld() {
+  const h = holding;
+  holding = null;
+  if (h) releasing = api(h.cfg, 'POST', `/api/mcp/coordination/requests/${h.id}/release`, { session_id: h.sid }).catch(() => null);
+  return releasing || Promise.resolve(null);
+}
+
+/** Who answered, for the session. */
+function answeredBy(kind, cur) {
+  const what = kind === 'plan' ? 'this plan' : 'this question';
+  if (cur.answered_by !== 'chief') return `[chief] The owner answered ${what} on the Chief of Staff page.`;
+  const call = Number.isInteger(cur.decision_id) ? ` (judgment call #${cur.decision_id}; the owner reviews it on the Chief of Staff page)` : '';
+  return `[chief] The Chief of Staff answered ${what} for the owner${call}.`;
+}
+
+/** An answered request, applied: a question now; a plan by the PermissionRequest that follows. */
+function applyAnswer(p, kind, cur) {
+  const a = cur.answer && typeof cur.answer === 'object' ? cur.answer : {};
+  const ti = p.tool_input && typeof p.tool_input === 'object' ? p.tool_input : {};
+  if (kind === 'question') {
+    if (!a.answers || typeof a.answers !== 'object') return null;
+    const notes = Object.entries(a.notes && typeof a.notes === 'object' ? a.notes : {}).filter(([, n]) => typeof n === 'string' && n);
+    const annotations = { ...(ti.annotations && typeof ti.annotations === 'object' ? ti.annotations : {}) };
+    for (const [q, n] of notes) annotations[q] = { ...(annotations[q] && typeof annotations[q] === 'object' ? annotations[q] : {}), notes: n };
+    return pre({
+      permissionDecision: 'allow',
+      updatedInput: { ...ti, answers: a.answers, ...(notes.length ? { annotations } : {}) },
+      additionalContext: [answeredBy(kind, cur), ...notes.map(([q, n]) => `Note on "${oneLine(q, 120)}": ${n}`)].join('\n'),
+    });
+  }
+  if (a.plan !== 'approve' && a.plan !== 'send_back') return null;
+  try {
+    fs.mkdirSync(coordDir(), { recursive: true });
+    fs.writeFileSync(
+      planFile(p.session_id),
+      JSON.stringify({ id: cur.id, plan: a.plan, note: typeof a.note === 'string' ? a.note : '', by: cur.answered_by, at: Date.now() }),
+    );
+  } catch {
+    /* no file: the dialog shows, and the owner answers in the terminal */
+  }
+  return null;
+}
+
+/** PermissionRequest on ExitPlanMode right after a held plan was answered. */
+function planDecision(p, d) {
+  const ti = p.tool_input && typeof p.tool_input === 'object' ? p.tool_input : {};
+  const decision =
+    d.plan === 'approve'
+      ? { behavior: 'allow', updatedInput: ti, updatedPermissions: [{ type: 'setMode', mode: buildMode(p.session_id), destination: 'session' }] }
+      : { behavior: 'deny', message: `The owner sent this plan back on the Chief of Staff page: ${d.note || 'revise it'}` };
+  return { hookSpecificOutput: { hookEventName: 'PermissionRequest', decision } };
+}
+
+/** `--hold`: PreToolUse on AskUserQuestion or ExitPlanMode. Waits for the Chief of Staff or the owner. */
+export async function hold(p) {
+  if (process.env.TCK_SESSION_HOOK === 'off' || process.env.COORD_INBOX === 'off' || process.env.COORD_REQUESTS === 'off') return null;
+  if (!p || p.hook_event_name !== 'PreToolUse' || p.agent_id) return null;
+  const kind = p.tool_name === 'AskUserQuestion' ? 'question' : p.tool_name === 'ExitPlanMode' ? 'plan' : null;
+  const sid = String(p.session_id || '');
+  if (!kind || !SESSION_ID_RE.test(sid) || !loadSwitch()) return null;
+  const entry = readCache(sid);
+  if (!openEntry(entry)) return null; // only a session bound to a ticket waits for the Chief
+  const cfg = loadConfig(p.cwd);
+  if (!cfg) return null;
+  if (kind === 'plan') dropPlan(sid); // an older decision never applies to this plan
+  const ti = p.tool_input && typeof p.tool_input === 'object' ? p.tool_input : {};
+  const tail = transcriptTail(p.transcript_path);
+  let created = null;
+  try {
+    created = await api(cfg, 'POST', '/api/mcp/coordination/requests', {
+      session_id: sid,
+      ticket: entry.key,
+      kind,
+      ...(kind === 'question' ? { questions: ti.questions } : { plan: String(ti.plan || '') }),
+      ...(tail ? { tail } : {}),
+    }, HOLD_CALL_MS);
+  } catch {
+    return null;
+  }
+  const id = created && created.request && created.request.id;
+  if (!Number.isInteger(id)) return null; // no request: the dialog, as before
+  holding = { cfg, id, sid };
+  const started = Date.now();
+  let lastReply = started;
+  while (holding) {
+    await sleep(HOLD_POLL_MS);
+    if (!holding) return null;
+    if (Date.now() - started > HOLD_MAX_MS) {
+      await releaseHeld();
+      return null;
+    }
+    let cur = null;
+    try {
+      cur = (await api(cfg, 'POST', `/api/mcp/coordination/requests/${id}/poll`, { session_id: sid }, HOLD_CALL_MS)).request;
+    } catch (e) {
+      if (e && e.status === 404) {
+        holding = null;
+        return null;
+      }
+    }
+    if (!cur || typeof cur.status !== 'string') {
+      if (Date.now() - lastReply > HOLD_LOST_MS) {
+        await releaseHeld();
+        return null;
+      }
+      continue;
+    }
+    lastReply = Date.now();
+    if (cur.status === 'open') continue;
+    holding = null;
+    return cur.status === 'answered' ? applyAnswer(p, kind, cur) : null;
+  }
+  return null;
+}
+
 export async function decide(p) {
   if (process.env.TCK_SESSION_HOOK === 'off') return null;
   if (!p || !p.session_id) return null;
@@ -1659,6 +1893,9 @@ export async function decide(p) {
   const event = p.hook_event_name;
   // The waits (TCK-1926) cover subagents too; everything below is the session's own.
   if (event === 'PermissionRequest') {
+    // A held plan that was just answered: approve it in its build mode, or send it back.
+    const planned = p.tool_name === 'ExitPlanMode' && !p.agent_id ? takePlan(p.session_id) : null;
+    if (planned) return planDecision(p, planned);
     await reportWait(p, sw).catch(() => null);
     return null;
   }
@@ -1669,6 +1906,9 @@ export async function decide(p) {
   // ticket steps, so the hook still answers within one network timeout.
   const entry = readCache(p.session_id);
   const coord = openEntry(entry) || !!repoOf(p.cwd, sw);
+  // The mode a held plan returns to (AC20). A /cc-loop binds its ticket in plan mode, so the mode is kept before the
+  // binding too: in a listed repo, and on the prompt that hands a ticket over. Unbound sessions elsewhere keep no file.
+  if (process.env.COORD_REQUESTS !== 'off' && (coord || (event === 'UserPromptSubmit' && handedOver(p.prompt)))) noteMode(p);
   const [res, inbox, guard] = await Promise.all([
     decideTicket(p, sw),
     coord ? coordCheck(p.session_id, p.cwd, entry).catch(() => null) : null,
@@ -1810,6 +2050,22 @@ if (isMain && process.argv.includes('--trailer-key')) {
     /* fail open: no trailer */
   }
   process.exit(0);
+} else if (isMain && process.argv[2] === '--hold') {
+  // Esc while held: Claude Code ends the hook with SIGTERM; the request is released first.
+  for (const sig of ['SIGTERM', 'SIGINT', 'SIGHUP']) process.on(sig, () => void releaseHeld().finally(() => process.exit(0)));
+  let raw = '';
+  process.stdin.on('data', (c) => (raw += c));
+  process.stdin.on('end', async () => {
+    try {
+      const res = await hold(JSON.parse(raw || '{}'));
+      if (res) process.stdout.write(JSON.stringify(res));
+    } catch {
+      /* fail open: the dialog shows */
+    }
+    // Esc may have started a release while the loop slept: it is sent before the process exits.
+    await releaseHeld();
+    process.exit(0);
+  });
 } else if (isMain && process.argv[2] === '--watch-wait') {
   watchWait(String(process.argv[3] || ''), String(process.argv[4] || ''), process.argv[5] || '')
     .catch(() => null)

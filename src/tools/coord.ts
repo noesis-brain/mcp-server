@@ -12,6 +12,10 @@
  *
  * Sessions report in (coord_heartbeat) and read their inbox (coord_inbox); the Chief reads the
  * sessions, sends messages, and posts the scanner's findings (coord_report).
+ *
+ * TCK-1926: a ticket session's question or plan approval waits for the Chief or the owner (the ticket hook holds it).
+ * The Chief lists them (coord_requests) and answers the ones on its route (coord_answer_request); the server refuses
+ * an owner gate, the Chief's own ticket and a session that did not report with role chief.
  */
 import fs from 'node:fs';
 import path from 'node:path';
@@ -22,7 +26,7 @@ import type { NoesisClient } from '../api/NoesisClient.js';
 import { currentSessionRef } from './claudeSessions.js';
 
 const CATEGORY_ENUM = z.enum([
-  'ship-order', 'rebase', 'scope', 'cleanup', 'pick', 'other',
+  'ship-order', 'rebase', 'scope', 'cleanup', 'pick', 'other', 'question', 'plan',
   'ship', 'prod-schema', 'mcp-publish', 'merge-tickets', 'stop-session',
 ]);
 const STATUS_ENUM = z.enum(['auto', 'review', 'pending', 'answered', 'reverted']);
@@ -239,6 +243,7 @@ export function registerCoordTools(server: McpServer, client: NoesisClient): voi
       state: SESSION_STATE_ENUM,
       ticket: z.string().optional().describe('The ticket this session works on, like TCK-7'),
       note: z.string().max(200).optional().describe('One line: what it is doing or waiting for'),
+      role: z.enum(['chief']).optional().describe('chief when the Chief of Staff reports in: only a session with this role may answer the questions and plans that wait (coord_answer_request). Left out, the last role stays'),
     },
     async (args) => {
       try {
@@ -249,7 +254,50 @@ export function registerCoordTools(server: McpServer, client: NoesisClient): voi
         if (fits(current.ref.cwd, 500)) body.cwd = current.ref.cwd;
         if (args.ticket !== undefined) body.ticket = args.ticket;
         if (args.note !== undefined) body.note = args.note;
+        if (args.role !== undefined) body.role = args.role;
         return jsonText(await client.coordSessionHeartbeat(body));
+      } catch (e) {
+        return errText(e);
+      }
+    }
+  );
+
+  server.tool(
+    'coord_requests',
+    'List the questions and plan approvals that ticket sessions hold for the Chief of Staff or the owner, the oldest first. Each has its session, ticket, kind (question or plan), ' +
+      'route (chief: the Chief may answer it, and the owner may answer first; owner: the owner alone), the questions with their options or the plan text, and the end of the session\'s conversation (tail). ' +
+      '`chief_running` says whether a Chief reported in during the last 10 minutes.',
+    {},
+    async () => {
+      try {
+        return jsonText(await client.coordRequests());
+      } catch (e) {
+        return errText(e);
+      }
+    }
+  );
+
+  server.tool(
+    'coord_answer_request',
+    'Answer a question or plan approval that a ticket session holds. The Chief of Staff only: this session must have reported with coord_heartbeat role chief. ' +
+      'A question: picks, one per question in order, each {labels: [option labels]}: one label, or several when the question allows several; never typed text. ' +
+      'A plan: approve, or to_owner with a note that says why the owner should decide. The Chief never sends a plan back. ' +
+      'reason: one line the owner reads under "Judgment calls to review". Never answer an owner gate (ship, production, npm, merge, stop a session): those requests have route owner, and the server refuses them. ' +
+      'Errors: NOT_CHIEF, OWN_REQUEST, SAME_TICKET (a session bound to the same ticket), OWNER_GATE (route owner), KIND_OFF (the owner switched this kind off), NOT_OPEN (answered, released or gone), BAD_ANSWER, NOTE_REQUIRED, NOT_FOUND.',
+    {
+      id: z.number().int().positive(),
+      picks: z.array(z.object({ labels: z.array(z.string()).min(1) })).optional().describe('A question: one {labels} per question, in order'),
+      plan: z.enum(['approve', 'to_owner']).optional().describe('A plan: approve it, or hand it to the owner with a note'),
+      note: z.string().max(500).optional().describe('One line; needed with to_owner'),
+      reason: z.string().min(1).max(500).describe('Why this answer, one line'),
+    },
+    async (args) => {
+      try {
+        const sid = sessionId();
+        if (!sid) return errText(new Error(NO_SESSION));
+        const body: Record<string, unknown> = { session_id: sid, reason: args.reason };
+        for (const k of ['picks', 'plan', 'note'] as const) if (args[k] !== undefined) body[k] = args[k];
+        return jsonText(await client.coordAnswerRequest(args.id, body));
       } catch (e) {
         return errText(e);
       }

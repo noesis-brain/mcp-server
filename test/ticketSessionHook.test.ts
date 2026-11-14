@@ -26,7 +26,7 @@ const HOOK_SID = 'hook-session-after-clear-0001';
 const BOUND_SID = '3f0c1d2e-4a5b-4c6d-8e7f-a1b2c3d4e5f6';
 
 interface Req { method: string; url: string; body: any; auth: string | undefined }
-type Reply = { status: number; body: unknown } | 'hang';
+type Reply = { status: number; body: unknown; delayMs?: number } | 'hang';
 
 const requests: Req[] = [];
 let respond: (method: string, url: string, body: any) => Reply = () => ({ status: 200, body: { issue: {} } });
@@ -40,8 +40,12 @@ const server = http.createServer((req, res) => {
     requests.push({ method: req.method!, url: req.url!, body, auth: req.headers.authorization });
     const r = respond(req.method!, req.url!, body);
     if (r === 'hang') return; // never answer: the hook must give up by itself
-    res.writeHead(r.status, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify(r.body));
+    const send = () => {
+      res.writeHead(r.status, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify(r.body));
+    };
+    if (r.delayMs) setTimeout(send, r.delayMs); // a slow server (TCK-1926: a cold start)
+    else send();
   });
 });
 
@@ -2143,4 +2147,370 @@ describe('TCK-1926: the sessions that wait for the owner', () => {
     expect(clearCalls()).toHaveLength(0);
     expect(fs.existsSync(waitPath(broken))).toBe(true);
   }, 20_000);
+});
+
+describe('TCK-1926: a question or plan waits for the Chief of Staff or the owner (--hold)', () => {
+  const SAME = { ...BOUND, bound_session_id: HOOK_SID };
+  const FAST = { COORD_INBOX: 'on', COORD_GUARD: 'off', COORD_WAIT_WATCH: 'off', COORD_HOLD_POLL_MS: '40', COORD_HOLD_LOST_MS: '600' };
+  const boundHome = () => {
+    const home = sandbox();
+    seed(home, SAME);
+    return home;
+  };
+  const planPath = (home: string) => path.join(home, '.claude', 'coord-inbox', `${HOOK_SID}.plan.json`);
+  const coordPath = (home: string) => path.join(home, '.claude', 'coord-inbox', `${HOOK_SID}.json`);
+  const QUESTIONS = [
+    { question: 'Which file first?', header: 'Order', multiSelect: false, options: [{ label: 'UpNext.tsx', description: 'the list' }, { label: 'NeedsYou.tsx', description: '' }] },
+    { question: 'Which checks?', header: 'Checks', multiSelect: true, options: [{ label: 'tsc', description: '' }, { label: 'vitest', description: '' }] },
+  ];
+  const askQ = (extra: Record<string, unknown> = {}) => ({ hook_event_name: 'PreToolUse', tool_name: 'AskUserQuestion', tool_input: { questions: QUESTIONS }, cwd: '/tmp', ...extra });
+  const askPlan = (extra: Record<string, unknown> = {}) => ({ hook_event_name: 'PreToolUse', tool_name: 'ExitPlanMode', tool_input: { plan: '# Plan\n\nStep 1.', planFilePath: '/p.md' }, permission_mode: 'plan', cwd: '/tmp', ...extra });
+  const createCalls = () => requests.filter((r) => r.url === '/api/mcp/coordination/requests');
+  const pollCalls = () => requests.filter((r) => /^\/api\/mcp\/coordination\/requests\/\d+\/poll$/.test(r.url));
+  const releaseCalls = () => requests.filter((r) => /^\/api\/mcp\/coordination\/requests\/\d+\/release$/.test(r.url));
+
+  /** The polls' replies, in order; the last one repeats. 'fail' answers 500, 'hang' never answers. */
+  let polls: Array<Record<string, unknown> | 'fail' | 'hang' | 404> = [];
+  let created: Record<string, unknown> = {};
+  let createDelay = 0;
+  let pollDelay = 0;
+  beforeEach(() => {
+    createDelay = 0;
+    pollDelay = 0;
+    polls = [{ status: 'open' }];
+    created = { request: { id: 41, status: 'open', route: 'chief' }, why: null, chief_running: true };
+    respond = (_method, url) => {
+      if (url === '/api/mcp/coordination/requests') return { status: (created.request ? 201 : 200), body: created, delayMs: createDelay };
+      if (url === '/api/mcp/coordination/requests/41/poll') {
+        const next = polls.length > 1 ? polls.shift()! : polls[0];
+        if (next === 'hang') return 'hang';
+        if (next === 'fail') return { status: 500, body: { error_code: 'INTERNAL' } };
+        if (next === 404) return { status: 404, body: { error_code: 'NOT_FOUND' } };
+        return { status: 200, body: { request: { id: 41, kind: 'question', ...next } }, delayMs: pollDelay };
+      }
+      if (url === '/api/mcp/coordination/requests/41/release') return { status: 200, body: { request: { id: 41, status: 'released' } } };
+      if (url.startsWith('/api/mcp/coordination/inbox')) return { status: 200, body: { messages: [], cursor: 0, pause: { paused: false, since: null, message_id: null, body: null } } };
+      if (url === '/api/mcp/coordination/sessions/heartbeat') return { status: 200, body: { session: {} } };
+      if (url.endsWith('/wait')) return { status: 200, body: { session: { waiting: { since: '2026-11-13T08:00:00.000Z' } } } };
+      return { status: 200, body: {} };
+    };
+  });
+
+  /** The hook with `--hold`; `kill` sends SIGTERM after that many ms (Esc while held). */
+  function runHold(home: string, payload: Record<string, unknown>, extraEnv: Record<string, string | undefined> = {}, kill?: number): Promise<Run> {
+    return new Promise((resolve) => {
+      const env: Record<string, string | undefined> = { ...process.env, HOME: home, USERPROFILE: home, NOESIS_API_URL: baseUrl(), NOESIS_API_TOKEN: 'noe_test_token', ...extraEnv };
+      for (const k of ['TCK_SESSION_HOOK', 'TCK_BINDINGS_DIR', 'NOESIS_TICKET_CONFIG', 'COORD_STATE_DIR', 'COORD_REQUESTS', 'COORD_HOLD_MAX_MS']) if (!(k in extraEnv)) delete env[k];
+      if (!('COORD_INBOX' in extraEnv)) env.COORD_INBOX = 'off';
+      for (const k of Object.keys(env)) if (env[k] === undefined) delete env[k];
+      const started = Date.now();
+      const child = spawn(process.execPath, [HOOK, '--hold'], { env: env as NodeJS.ProcessEnv });
+      let out = '';
+      child.stdout.on('data', (c) => (out += c));
+      if (kill !== undefined) setTimeout(() => child.kill('SIGTERM'), kill);
+      child.on('close', (code) => {
+        let json: any = null;
+        try {
+          json = out.trim() ? JSON.parse(out) : null;
+        } catch {
+          json = { unparsable: out };
+        }
+        resolve({ code, json, ms: Date.now() - started, ctx: json?.hookSpecificOutput?.additionalContext ?? '' });
+      });
+      child.stdin.end(JSON.stringify({ session_id: HOOK_SID, ...payload }));
+    });
+  }
+
+  it('a bound question is held until the owner answers on the page; the answers and notes go into the tool input', async () => {
+    const home = boundHome();
+    polls = [{ status: 'open' }, { status: 'open' }, { status: 'answered', answered_by: 'owner', answer: { answers: { 'Which file first?': 'UpNext.tsx', 'Which checks?': 'tsc, vitest' }, notes: { 'Which checks?': 'both, please' } } }];
+    const r = await runHold(home, askQ(), FAST);
+    expect(r.code).toBe(0);
+    expect(createCalls().map((c) => c.body)).toEqual([{ session_id: HOOK_SID, ticket: 'TCK-12', kind: 'question', questions: QUESTIONS }]);
+    expect(pollCalls()).toHaveLength(3);
+    expect(pollCalls().every((c) => c.body.session_id === HOOK_SID)).toBe(true);
+    expect(r.json.hookSpecificOutput).toEqual({
+      hookEventName: 'PreToolUse',
+      permissionDecision: 'allow',
+      updatedInput: {
+        questions: QUESTIONS,
+        answers: { 'Which file first?': 'UpNext.tsx', 'Which checks?': 'tsc, vitest' },
+        annotations: { 'Which checks?': { notes: 'both, please' } },
+      },
+      additionalContext: '[chief] The owner answered this question on the Chief of Staff page.\nNote on "Which checks?": both, please',
+    });
+    expect(releaseCalls()).toEqual([]);
+  });
+
+  it('a slow server (a create that takes 3 s, as on a cold start) still holds: the hold waits longer than the hook\'s 2.5 s', async () => {
+    const home = boundHome();
+    createDelay = 3000;
+    polls = [{ status: 'answered', answered_by: 'owner', answer: { answers: { 'Which file first?': 'UpNext.tsx', 'Which checks?': 'tsc' }, notes: {} } }];
+    const r = await runHold(home, askQ(), FAST);
+    expect(r.json?.hookSpecificOutput?.permissionDecision).toBe('allow');
+    expect(r.ms).toBeGreaterThan(3000);
+    expect(pollCalls()).toHaveLength(1);
+    // A slow poll, too.
+    requests.length = 0;
+    createDelay = 0;
+    pollDelay = 3000;
+    const p = await runHold(home, askQ(), FAST);
+    expect(p.json?.hookSpecificOutput?.permissionDecision).toBe('allow');
+    expect(pollCalls()).toHaveLength(1);
+  }, 30_000);
+
+  it("the Chief's answer names its judgment call; with no notes the input gains only the answers", async () => {
+    const home = boundHome();
+    polls = [{ status: 'answered', answered_by: 'chief', decision_id: 8067, answer: { answers: { 'Which file first?': 'NeedsYou.tsx', 'Which checks?': 'tsc' }, notes: {} } }];
+    const r = await runHold(home, askQ({ tool_input: { questions: QUESTIONS, annotations: { 'Which file first?': { preview: 'x' } } } }), FAST);
+    expect(r.json.hookSpecificOutput.updatedInput).toEqual({
+      questions: QUESTIONS,
+      annotations: { 'Which file first?': { preview: 'x' } },
+      answers: { 'Which file first?': 'NeedsYou.tsx', 'Which checks?': 'tsc' },
+    });
+    expect(r.ctx).toBe('[chief] The Chief of Staff answered this question for the owner (judgment call #8067; the owner reviews it on the Chief of Staff page).');
+  });
+
+  it('the end of the conversation goes with it: the owner\'s and Claude\'s text only, the last 4000 characters', async () => {
+    const home = boundHome();
+    const t = path.join(home, 'transcript.jsonl');
+    const line = (o: unknown) => JSON.stringify(o);
+    fs.writeFileSync(t, [
+      line({ type: 'user', message: { role: 'user', content: 'Build the list first.' } }),
+      line({ type: 'assistant', message: { role: 'assistant', content: [{ type: 'text', text: 'I will start with UpNext.' }, { type: 'tool_use', name: 'Bash', input: { command: 'curl SECRET-1' } }] } }),
+      line({ type: 'user', message: { role: 'user', content: [{ type: 'tool_result', content: 'SECRET-2 output' }] } }),
+      line({ type: 'user', isMeta: true, message: { role: 'user', content: 'meta SECRET-3' } }),
+      line({ type: 'assistant', isSidechain: true, message: { role: 'assistant', content: [{ type: 'text', text: 'subagent SECRET-4' }] } }),
+      line({ type: 'system', content: 'SECRET-5' }),
+      'not json',
+      line({ type: 'assistant', message: { role: 'assistant', content: [{ type: 'text', text: 'Which file first?' }] } }),
+    ].join('\n') + '\n');
+    polls = [{ status: 'released' }];
+    await runHold(home, askQ({ transcript_path: t }), FAST);
+    expect(createCalls()[0].body.tail).toBe('Owner: Build the list first.\n\nClaude: I will start with UpNext.\n\nClaude: Which file first?');
+    expect(JSON.stringify(createCalls())).not.toContain('SECRET');
+    requests.length = 0;
+    fs.writeFileSync(t, line({ type: 'assistant', message: { content: [{ type: 'text', text: `${'a'.repeat(5000)}END` }] } }) + '\n');
+    await runHold(home, askQ({ transcript_path: t }), FAST);
+    const tail = createCalls()[0].body.tail as string;
+    expect(Array.from(tail)).toHaveLength(4000);
+    expect(tail.endsWith('aaaEND')).toBe(true);
+    // No transcript: no tail at all.
+    requests.length = 0;
+    await runHold(home, askQ({ transcript_path: path.join(home, 'none.jsonl') }), FAST);
+    expect('tail' in createCalls()[0].body).toBe(false);
+  });
+
+  it('"Answer in the terminal", a gone request and a 404 let go with no decision: the dialog shows', async () => {
+    const home = boundHome();
+    for (const last of [{ status: 'released', answer: { terminal: true } }, { status: 'gone' }, 404 as const]) {
+      requests.length = 0;
+      polls = [{ status: 'open' }, last];
+      const r = await runHold(home, askQ(), FAST);
+      expect(r.code).toBe(0);
+      expect(r.json).toBeNull();
+      expect(pollCalls()).toHaveLength(2);
+      expect(releaseCalls()).toEqual([]);
+    }
+  });
+
+  it('a request that is no longer open applies nothing, even when it carries an answer', async () => {
+    const home = boundHome();
+    for (const status of ['released', 'gone']) {
+      polls = [{ status, answered_by: 'owner', answer: { answers: { 'Which file first?': 'UpNext.tsx', 'Which checks?': 'tsc' }, notes: {} } }];
+      expect((await runHold(home, askQ(), FAST)).json, status).toBeNull();
+    }
+  });
+
+  it('no request (the kind is off, a Ticket question, the Chief itself): no poll and no decision, at once', async () => {
+    const home = boundHome();
+    created = { request: null, why: 'off', chief_running: true };
+    const r = await runHold(home, askQ(), FAST);
+    expect(r.json).toBeNull();
+    expect(createCalls()).toHaveLength(1);
+    expect(pollCalls()).toEqual([]);
+  });
+
+  it('never held, with no network: an unbound session, a closed ticket, a subagent, another tool, the switches off', async () => {
+    const unbound = sandbox();
+    const closed = sandbox();
+    seed(closed, { ...SAME, status: 'shipped' });
+    const home = boundHome();
+    const cases: Array<[string, Record<string, unknown>, Record<string, string>]> = [
+      [unbound, askQ(), FAST],
+      [closed, askQ(), FAST],
+      [home, askQ({ agent_id: 'a1', agent_type: 'Explore' }), FAST],
+      [home, askQ({ hook_event_name: 'PermissionRequest' }), FAST],
+      [home, { ...askQ(), tool_name: 'Bash', tool_input: { command: 'ls' } }, FAST],
+      [home, askQ(), { ...FAST, COORD_REQUESTS: 'off' }],
+      [home, askQ(), { ...FAST, COORD_INBOX: 'off' }],
+      [home, askQ(), { ...FAST, TCK_SESSION_HOOK: 'off' }],
+    ];
+    for (const [h, payload, env] of cases) {
+      const r = await runHold(h as string, payload, env);
+      expect(r.json).toBeNull();
+    }
+    const noSwitch = sandbox(null);
+    seed(noSwitch, SAME);
+    expect((await runHold(noSwitch, askQ(), FAST)).json).toBeNull();
+    expect(requests).toEqual([]);
+  });
+
+  it('a lost server: past the lost limit with no reply, it releases and lets go; a short failure does not', async () => {
+    const home = boundHome();
+    polls = ['fail', 'fail', { status: 'answered', answered_by: 'owner', answer: { answers: { 'Which file first?': 'UpNext.tsx', 'Which checks?': 'tsc' }, notes: {} } }];
+    const ok = await runHold(home, askQ(), FAST);
+    expect(ok.json.hookSpecificOutput.permissionDecision).toBe('allow');
+    requests.length = 0;
+    polls = ['fail'];
+    const lost = await runHold(home, askQ(), { ...FAST, COORD_HOLD_LOST_MS: '300' });
+    expect(lost.json).toBeNull();
+    expect(lost.ms).toBeLessThan(5000);
+    expect(releaseCalls().map((c) => c.body)).toEqual([{ session_id: HOOK_SID }]);
+  });
+
+  it('the time limit releases the request and lets go (the hook never runs into its own timeout)', async () => {
+    const home = boundHome();
+    const r = await runHold(home, askQ(), { ...FAST, COORD_HOLD_MAX_MS: '300' });
+    expect(r.json).toBeNull();
+    expect(pollCalls().length).toBeGreaterThan(0);
+    expect(releaseCalls().map((c) => c.url)).toEqual(['/api/mcp/coordination/requests/41/release']);
+  });
+
+  it('Esc while held (SIGTERM): the request is released and nothing is printed', async () => {
+    const home = boundHome();
+    const r = await runHold(home, askQ(), FAST, 400);
+    expect(r.json).toBeNull();
+    expect(r.code).toBe(0);
+    expect(releaseCalls().map((c) => c.body)).toEqual([{ session_id: HOOK_SID }]);
+  });
+
+  it('Esc while a poll is in flight: the release is still sent before the process exits', async () => {
+    // 1 ms polls: the signal lands while a poll is on its way, so the main path may finish first; it waits for the release.
+    for (let i = 0; i < 3; i++) {
+      requests.length = 0;
+      const home = boundHome();
+      const r = await runHold(home, askQ(), { ...FAST, COORD_HOLD_POLL_MS: '1' }, 300 + i * 37);
+      expect(r.json, `run ${i}`).toBeNull();
+      expect(releaseCalls().map((c) => c.body), `run ${i}`).toEqual([{ session_id: HOOK_SID }]);
+    }
+  }, 30_000);
+
+  it('a plan approved on the page: no decision while held, then PermissionRequest approves it in the mode from before plan mode', async () => {
+    const home = boundHome();
+    // The session ran in bypass mode before plan mode; the hook records it on its own events.
+    await run(home, { hook_event_name: 'PreToolUse', tool_name: 'Read', tool_input: { file_path: '/a' }, permission_mode: 'bypassPermissions', cwd: '/tmp' }, FAST);
+    await run(home, { hook_event_name: 'UserPromptSubmit', prompt: 'plan it', permission_mode: 'plan', cwd: '/tmp' }, FAST);
+    expect(JSON.parse(fs.readFileSync(coordPath(home), 'utf8')).mode).toBe('bypassPermissions');
+    requests.length = 0;
+    polls = [{ status: 'answered', kind: 'plan', answered_by: 'owner', answer: { plan: 'approve' } }];
+    const held = await runHold(home, askPlan(), FAST);
+    expect(held.json).toBeNull();
+    expect(createCalls().map((c) => c.body)).toEqual([{ session_id: HOOK_SID, ticket: 'TCK-12', kind: 'plan', plan: '# Plan\n\nStep 1.' }]);
+    const perm = await run(home, { ...askPlan(), hook_event_name: 'PermissionRequest' }, FAST);
+    expect(perm.json).toEqual({ hookSpecificOutput: { hookEventName: 'PermissionRequest', decision: {
+      behavior: 'allow',
+      updatedInput: { plan: '# Plan\n\nStep 1.', planFilePath: '/p.md' },
+      updatedPermissions: [{ type: 'setMode', mode: 'bypassPermissions', destination: 'session' }],
+    } } });
+    // The decision applied: it is not reported as a wait, and it is read once.
+    expect(requests.filter((r) => r.url.endsWith('/wait'))).toEqual([]);
+    expect(fs.existsSync(planPath(home))).toBe(false);
+    const again = await run(home, { ...askPlan(), hook_event_name: 'PermissionRequest' }, FAST);
+    expect(again.json).toBeNull();
+    expect(requests.filter((r) => r.url.endsWith('/wait'))).toHaveLength(1);
+  });
+
+  it('a session in default mode before plan mode builds in acceptEdits; auto stays auto', async () => {
+    for (const [before, after] of [['default', 'acceptEdits'], ['auto', 'auto'], ['acceptEdits', 'acceptEdits'], [null, 'acceptEdits']] as const) {
+      const home = boundHome();
+      if (before) await run(home, { hook_event_name: 'UserPromptSubmit', prompt: 'go', permission_mode: before, cwd: '/tmp' }, FAST);
+      polls = [{ status: 'answered', kind: 'plan', answered_by: 'chief', decision_id: 9, answer: { plan: 'approve' } }];
+      await runHold(home, askPlan(), FAST);
+      const perm = await run(home, { ...askPlan(), hook_event_name: 'PermissionRequest' }, FAST);
+      expect(perm.json.hookSpecificOutput.decision.updatedPermissions).toEqual([{ type: 'setMode', mode: after, destination: 'session' }]);
+    }
+  });
+
+  it("a plan sent back: PermissionRequest denies it with the owner's note; the next plan drops an old decision", async () => {
+    const home = boundHome();
+    polls = [{ status: 'answered', kind: 'plan', answered_by: 'owner', answer: { plan: 'send_back', note: 'Add a test step.' } }];
+    await runHold(home, askPlan(), FAST);
+    const perm = await run(home, { ...askPlan(), hook_event_name: 'PermissionRequest' }, FAST);
+    expect(perm.json).toEqual({ hookSpecificOutput: { hookEventName: 'PermissionRequest', decision: {
+      behavior: 'deny', message: 'The owner sent this plan back on the Chief of Staff page: Add a test step.',
+    } } });
+    // A decision left behind (a PermissionRequest that never came) never applies to the next plan.
+    fs.writeFileSync(planPath(home), JSON.stringify({ id: 40, plan: 'approve', note: '', by: 'owner', at: Date.now() }));
+    polls = [{ status: 'released' }];
+    await runHold(home, askPlan(), FAST);
+    expect(fs.existsSync(planPath(home))).toBe(false);
+    expect((await run(home, { ...askPlan(), hook_event_name: 'PermissionRequest' }, FAST)).json).toBeNull();
+  });
+
+  it('the production timings: let go a minute before the 3600 s hook timeout, poll well inside the 20 s gone rule', async () => {
+    const saved = Object.fromEntries(['COORD_HOLD_POLL_MS', 'COORD_HOLD_MAX_MS', 'COORD_HOLD_LOST_MS', 'COORD_HOLD_CALL_MS'].map((k) => [k, process.env[k]]));
+    for (const k of Object.keys(saved)) delete process.env[k];
+    try {
+      const { pathToFileURL } = await import('node:url');
+      const { HOLD_TIMES } = await import(`${pathToFileURL(HOOK).href}?defaults=${Date.now()}`);
+      expect(HOLD_TIMES).toEqual({ pollMs: 2000, maxMs: 3540_000, lostMs: 15_000, callMs: 10_000 });
+      // The last poll after the limit still ends before Claude Code's 3600 s timeout kills the hook.
+      expect(HOLD_TIMES.maxMs + HOLD_TIMES.pollMs + HOLD_TIMES.callMs).toBeLessThan(3600_000);
+      // A slow poll plus the sleep stays inside the server's 20 s; the hook lets go before the server says gone.
+      expect(HOLD_TIMES.pollMs + HOLD_TIMES.callMs).toBeLessThan(20_000);
+      expect(HOLD_TIMES.lostMs).toBeLessThan(20_000);
+    } finally {
+      for (const [k, v] of Object.entries(saved)) if (v !== undefined) process.env[k] = v;
+    }
+  });
+
+  it('a failed poll after good ones is no lost server: the hold keeps waiting and applies the answer', async () => {
+    const home = boundHome();
+    polls = [...Array.from({ length: 15 }, () => ({ status: 'open' })), 'fail', { status: 'answered', answered_by: 'owner', answer: { answers: { 'Which file first?': 'UpNext.tsx', 'Which checks?': 'tsc' }, notes: {} } }];
+    const r = await runHold(home, askQ(), { ...FAST, COORD_HOLD_LOST_MS: '400' });
+    expect(r.json?.hookSpecificOutput?.permissionDecision).toBe('allow');
+    expect(releaseCalls()).toEqual([]);
+  });
+
+  it('the mode before plan mode is kept before the ticket is bound: in a listed repo, and on the prompt that hands it over', async () => {
+    const listed = sandbox({ enabled: true, repos: [{ remote: 'git@github.com:noesis-owner/notes-app.git', deployBranch: 'main' }] });
+    const repo = gitRepo('https://github.com/noesis-owner/notes-app.git');
+    await run(listed, { hook_event_name: 'PreToolUse', tool_name: 'Read', tool_input: { file_path: '/a' }, permission_mode: 'auto', cwd: repo }, FAST);
+    await run(listed, { hook_event_name: 'UserPromptSubmit', prompt: 'plan it', permission_mode: 'plan', cwd: repo }, FAST);
+    expect(JSON.parse(fs.readFileSync(coordPath(listed), 'utf8')).mode).toBe('auto');
+    seed(listed, SAME);
+    polls = [{ status: 'answered', kind: 'plan', answered_by: 'chief', decision_id: 3, answer: { plan: 'approve' } }];
+    await runHold(listed, askPlan({ cwd: repo }), FAST);
+    const perm = await run(listed, { ...askPlan({ cwd: repo }), hook_event_name: 'PermissionRequest' }, FAST);
+    expect(perm.json.hookSpecificOutput.decision.updatedPermissions).toEqual([{ type: 'setMode', mode: 'auto', destination: 'session' }]);
+    // Outside a listed repo, an unbound session keeps no file, until a prompt hands it a ticket.
+    const plain = sandbox();
+    await run(plain, { hook_event_name: 'UserPromptSubmit', prompt: 'hello', permission_mode: 'auto', cwd: '/tmp' }, FAST);
+    expect(fs.existsSync(coordPath(plain))).toBe(false);
+    await run(plain, { hook_event_name: 'UserPromptSubmit', prompt: 'run TCK-12', permission_mode: 'bypassPermissions', cwd: '/tmp' }, FAST);
+    expect(JSON.parse(fs.readFileSync(coordPath(plain), 'utf8')).mode).toBe('bypassPermissions');
+  });
+
+  it("a plan's decision never answers another tool's prompt: a Bash prompt is a wait, and the plan still gets it", async () => {
+    const home = boundHome();
+    fs.mkdirSync(path.dirname(planPath(home)), { recursive: true });
+    fs.writeFileSync(planPath(home), JSON.stringify({ id: 40, plan: 'approve', note: '', by: 'owner', at: Date.now() }));
+    const bash = await run(home, { hook_event_name: 'PermissionRequest', tool_name: 'Bash', tool_input: { command: 'ls', description: 'List' }, cwd: '/tmp' }, FAST);
+    expect(bash.json).toBeNull();
+    expect(requests.filter((r) => r.url.endsWith('/wait')).map((r) => r.body.kind)).toEqual(['permission']);
+    expect(fs.existsSync(planPath(home))).toBe(true);
+    const plan = await run(home, { ...askPlan(), hook_event_name: 'PermissionRequest' }, FAST);
+    expect(plan.json.hookSpecificOutput.decision.behavior).toBe('allow');
+  });
+
+  it('a stale decision (over a minute old) or one for a subagent never applies', async () => {
+    const home = boundHome();
+    fs.mkdirSync(path.dirname(planPath(home)), { recursive: true });
+    fs.writeFileSync(planPath(home), JSON.stringify({ id: 40, plan: 'approve', note: '', by: 'owner', at: Date.now() - 61_000 }));
+    expect((await run(home, { ...askPlan(), hook_event_name: 'PermissionRequest' }, FAST)).json).toBeNull();
+    fs.writeFileSync(planPath(home), JSON.stringify({ id: 40, plan: 'approve', note: '', by: 'owner', at: Date.now() }));
+    expect((await run(home, { ...askPlan(), hook_event_name: 'PermissionRequest', agent_id: 'a1' }, FAST)).json).toBeNull();
+    expect(fs.existsSync(planPath(home))).toBe(true);
+  });
 });

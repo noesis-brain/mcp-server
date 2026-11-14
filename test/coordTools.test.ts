@@ -154,12 +154,15 @@ describe('coordination tools → client', () => {
   });
   const run = (name: string, args: Record<string, unknown>) => handlers.get(name)!(args);
 
-  it('registers exactly these tools, and none that answers, reviews, changes the policy, pauses or continues', () => {
+  it('registers exactly these tools, and none that answers a card, reviews, changes the policy, pauses or continues', () => {
     expect([...handlers.keys()].sort()).toEqual([
-      'coord_allocate_mcp_version', 'coord_conflicts', 'coord_decide', 'coord_decision_get', 'coord_decisions', 'coord_heartbeat', 'coord_inbox',
-      'coord_lease', 'coord_leases', 'coord_message', 'coord_policy', 'coord_port', 'coord_report', 'coord_sessions',
+      'coord_allocate_mcp_version', 'coord_answer_request', 'coord_conflicts', 'coord_decide', 'coord_decision_get', 'coord_decisions', 'coord_heartbeat', 'coord_inbox',
+      'coord_lease', 'coord_leases', 'coord_message', 'coord_policy', 'coord_port', 'coord_report', 'coord_requests', 'coord_sessions',
     ]);
-    for (const name of handlers.keys()) expect(name).not.toMatch(/answer|review|approve|set_policy|force|pause|continue/);
+    // TCK-1926: coord_answer_request answers a session's question or plan (the server refuses an owner gate); it has no
+    // decision, option or verdict field, so it cannot answer a card or review a call.
+    for (const name of handlers.keys()) if (name !== 'coord_answer_request') expect(name).not.toMatch(/answer|review|approve|set_policy|force|pause|continue/);
+    expect(Object.keys(schemas.get('coord_answer_request')!).sort()).toEqual(['id', 'note', 'picks', 'plan', 'reason']);
     // coord_message has no kind: it cannot send a pause or a continue.
     expect(Object.keys(schemas.get('coord_message')!).sort()).toEqual(['as_chief', 'body', 'ticket', 'to_session']);
   });
@@ -225,6 +228,60 @@ describe('coordination tools → client', () => {
       ['coordDecisionGet', 7],
       ['coordPolicy'],
       ['coordLeases'],
+    ]);
+  });
+
+  it('TCK-1926: coord_requests lists; coord_answer_request answers as this session, with only the fields given', async () => {
+    process.env.CLAUDE_CODE_SESSION_ID = SESSION;
+    await run('coord_requests', {});
+    await run('coord_answer_request', { id: 7, picks: [{ labels: ['UpNext.tsx'] }], reason: 'The list is what the owner reads first.' });
+    await run('coord_answer_request', { id: 8, plan: 'to_owner', note: 'It changes the MCP package.', reason: 'An owner step is in it.' });
+    expect(calls).toEqual([
+      ['coordRequests'],
+      ['coordAnswerRequest', 7, { session_id: SESSION, reason: 'The list is what the owner reads first.', picks: [{ labels: ['UpNext.tsx'] }] }],
+      ['coordAnswerRequest', 8, { session_id: SESSION, reason: 'An owner step is in it.', plan: 'to_owner', note: 'It changes the MCP package.' }],
+    ]);
+    const schema = schemas.get('coord_answer_request')!;
+    // The Chief never sends a plan back, never types an answer, and always says why.
+    expect(schema.plan.safeParse('send_back').success).toBe(false);
+    for (const ok of ['approve', 'to_owner']) expect(schema.plan.safeParse(ok).success, ok).toBe(true);
+    expect(schema.picks.parse([{ labels: ['A'], other: 'typed' }])).toEqual([{ labels: ['A'] }]);
+    expect(schema.picks.safeParse([{ labels: [] }]).success).toBe(false);
+    expect(schema.reason.safeParse('').success).toBe(false);
+    calls.length = 0;
+    delete process.env.CLAUDE_CODE_SESSION_ID;
+    const res = await run('coord_answer_request', { id: 7, picks: [{ labels: ['A'] }], reason: 'r' });
+    expect(res.isError).toBe(true);
+    expect(res.content[0].text).toContain('CLAUDE_CODE_SESSION_ID');
+    expect(calls).toEqual([]);
+  });
+
+  it('TCK-1926: coord_heartbeat sends the role only when given; the categories include session questions and plan approvals', async () => {
+    process.env.CLAUDE_CODE_SESSION_ID = SESSION;
+    await run('coord_heartbeat', { state: 'running', role: 'chief' });
+    expect(calls).toEqual([['coordSessionHeartbeat', { session_id: SESSION, state: 'running', machine: os.hostname(), cwd: '/work/proj', role: 'chief' }]]);
+    expect(schemas.get('coord_heartbeat')!.role.safeParse('owner').success).toBe(false);
+    for (const c of ['question', 'plan']) expect(schemas.get('coord_decisions')!.category.safeParse(c).success).toBe(true);
+  });
+
+  it('TCK-1926: the client paths of the requests', async () => {
+    const seen: Array<[string, string | undefined]> = [];
+    const saved = globalThis.fetch;
+    try {
+      globalThis.fetch = vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
+        seen.push([String(url), init?.method]);
+        return new Response('{}', { status: 200, headers: { 'Content-Type': 'application/json' } });
+      }) as typeof fetch;
+      const { NoesisClient } = await import('../src/api/NoesisClient.js');
+      const c = new NoesisClient('https://example.test', 'noe_x');
+      await c.coordRequests();
+      await c.coordAnswerRequest(12, { session_id: 's', reason: 'r' });
+    } finally {
+      globalThis.fetch = saved;
+    }
+    expect(seen).toEqual([
+      ['https://example.test/api/mcp/coordination/requests', 'GET'],
+      ['https://example.test/api/mcp/coordination/requests/12/answer', 'POST'],
     ]);
   });
 
@@ -422,13 +479,13 @@ describe('coordination tools → client', () => {
     expect(parse('coord_report', { conflicts: Array.from({ length: 201 }, () => ({})) })).toBe(false);
   });
 
-  it('the lists match the server\'s: 11 categories, 5 statuses, 4 resources', () => {
+  it('the lists match the server\'s: 13 categories, 5 statuses, 4 resources', () => {
     const options = (tool: string, field: string) => (schemas.get(tool)![field] as unknown as { unwrap?: () => { options: string[] }; options?: string[] });
     const opts = (tool: string, field: string) => {
       const f = options(tool, field);
       return [...(f.options ?? f.unwrap!().options)].sort();
     };
-    expect(opts('coord_decide', 'category')).toEqual(['cleanup', 'mcp-publish', 'merge-tickets', 'other', 'pick', 'prod-schema', 'rebase', 'scope', 'ship', 'ship-order', 'stop-session']);
+    expect(opts('coord_decide', 'category')).toEqual(['cleanup', 'mcp-publish', 'merge-tickets', 'other', 'pick', 'plan', 'prod-schema', 'question', 'rebase', 'scope', 'ship', 'ship-order', 'stop-session']);
     expect(opts('coord_decisions', 'category')).toEqual(opts('coord_decide', 'category'));
     expect(opts('coord_decisions', 'status')).toEqual(['answered', 'auto', 'pending', 'reverted', 'review']);
     expect(opts('coord_lease', 'resource')).toEqual(['mcp-publish', 'prod-schema', 'ship', 'test-db']);
@@ -551,6 +608,8 @@ describe('a client refusal reaches the session through every tool', () => {
       coord_report: { conflicts: [] },
       coord_conflicts: {},
       coord_port: {},
+      coord_requests: {},
+      coord_answer_request: { id: 1, picks: [{ labels: ['A'] }], reason: 'r' },
     };
     expect([...handlers.keys()].sort()).toEqual(Object.keys(args).sort());
     for (const [name, a] of Object.entries(args)) {
@@ -572,8 +631,8 @@ describe('the package registers the coordination tools', () => {
     registerTools(server as never, { client } as never);
     const coord = names.filter((n) => n.startsWith('coord_')).sort();
     expect(coord).toEqual([
-      'coord_allocate_mcp_version', 'coord_conflicts', 'coord_decide', 'coord_decision_get', 'coord_decisions', 'coord_heartbeat', 'coord_inbox',
-      'coord_lease', 'coord_leases', 'coord_message', 'coord_policy', 'coord_port', 'coord_report', 'coord_sessions',
+      'coord_allocate_mcp_version', 'coord_answer_request', 'coord_conflicts', 'coord_decide', 'coord_decision_get', 'coord_decisions', 'coord_heartbeat', 'coord_inbox',
+      'coord_lease', 'coord_leases', 'coord_message', 'coord_policy', 'coord_port', 'coord_report', 'coord_requests', 'coord_sessions',
     ]);
   });
 });

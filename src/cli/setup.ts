@@ -430,7 +430,9 @@ async function resolveCaptureChoice(options: SetupOptions, alreadyInstalled: boo
 // Optional Jot ticket hook (opt-in).
 //
 // Copies scripts/noesis-ticket-session.mjs to ~/.claude/hooks/ and runs it from seven
-// events (TCK-1926 added PermissionRequest, Stop and SessionEnd, which report the dialogs a session waits at), so a session bound to a Jot ticket keeps its status current without relying on
+// events (TCK-1926 added PermissionRequest, Stop and SessionEnd, which report the dialogs a session waits at, and a
+// second PreToolUse entry, `--hold`, where a question or plan waits for the Chief of Staff or the owner with no
+// dialog, for up to an hour), so a session bound to a Jot ticket keeps its status current without relying on
 // the model's memory: a reminder on every prompt, Ready to implement / Implementing at the
 // plan steps (back to Planning after a rejected plan, and no other status), and a closed ticket never moves. The copy (not the package
 // path, as the capture hook uses) gives a stable path that survives an npx cache or a
@@ -448,7 +450,7 @@ const TICKET_HOOK_MARKER = 'noesis-ticket-session';
 const LEGACY_TICKET_HOOK_RE = /(?:^|[\s"'\\/])tck-session\.js\b/;
 const HOOKS_DIR = path.join(CLAUDE_DIR, 'hooks');
 const TICKET_HOOK_PATH = path.join(HOOKS_DIR, TICKET_HOOK_FILE);
-const TICKET_HOOK_EVENTS: ReadonlyArray<{ event: string; matcher: string }> = [
+const TICKET_HOOK_EVENTS: ReadonlyArray<{ event: string; matcher: string; hold?: true }> = [
   { event: 'UserPromptSubmit', matcher: '' },
   { event: 'PreToolUse', matcher: '*' },
   // Bash: the branch record and the push read-back; AskUserQuestion: the owner's "Ticket" answer.
@@ -460,7 +462,13 @@ const TICKET_HOOK_EVENTS: ReadonlyArray<{ event: string; matcher: string }> = [
   { event: 'PermissionRequest', matcher: '*' },
   { event: 'Stop', matcher: '' },
   { event: 'SessionEnd', matcher: '' },
+  // TCK-1926: a bound session's question or plan approval waits here for the Chief of Staff or the owner, with no
+  // dialog; the spinner says so. Its own entry: the hour-long timeout must not cover the hook's other steps.
+  { event: 'PreToolUse', matcher: 'AskUserQuestion|ExitPlanMode', hold: true },
 ];
+const HOLD_ARG = '--hold';
+const HOLD_TIMEOUT_S = 3600;
+const HOLD_STATUS = 'Waiting for the Chief of Staff or the owner…';
 /** The hook's per-computer switch. Missing means the hook does nothing at all; setup writes this
  *  default so an installed hook keeps working, and the owner lists repos in it for the checkpoint. */
 const TICKET_SWITCH_PATH = path.join(CLAUDE_DIR, 'noesis-ticket.json');
@@ -476,10 +484,14 @@ const TICKET_TOOLS_ALLOW = [
   'mcp__noesis__backlog_set_gut',
 ];
 
-/** The exact command we register: the copied script, absolute, forward slashes. */
-function ticketHookCommand(): string {
-  return `node "${TICKET_HOOK_PATH.replace(/\\/g, '/')}"`;
+/** The exact command we register: the copied script, absolute, forward slashes (`--hold` for the hold entry). */
+function ticketHookCommand(hold = false): string {
+  return `node "${TICKET_HOOK_PATH.replace(/\\/g, '/')}"${hold ? ` ${HOLD_ARG}` : ''}`;
 }
+
+const HOLD_SUFFIX_RE = /\s+--hold\s*$/;
+/** The hold entry's command ends with `--hold`; every other entry's does not. */
+const isHoldCommand = (cmd: unknown): boolean => typeof cmd === 'string' && HOLD_SUFFIX_RE.test(cmd);
 
 /** The script a `node <path>` command runs, with ~ expanded, for comparing two spellings. */
 function commandScript(cmd: string): string | null {
@@ -494,9 +506,9 @@ function commandScript(cmd: string): string | null {
 const isOurTicketCommand = (cmd: unknown): boolean => typeof cmd === 'string' && cmd.includes(TICKET_HOOK_MARKER);
 const isLegacyTicketCommand = (cmd: unknown): boolean =>
   typeof cmd === 'string' && !cmd.includes(TICKET_HOOK_MARKER) && LEGACY_TICKET_HOOK_RE.test(cmd);
-/** Ours and pointing at the copied file (absolute or ~/ spelling). */
+/** Ours and pointing at the copied file (absolute or ~/ spelling); a `--hold` suffix is left out of the comparison. */
 const isCanonicalTicketCommand = (cmd: string): boolean => {
-  const a = commandScript(cmd);
+  const a = commandScript(cmd.replace(HOLD_SUFFIX_RE, ''));
   return a !== null && a === commandScript(ticketHookCommand());
 };
 
@@ -565,7 +577,6 @@ function registerTicketHook(install: boolean, dryRun: boolean): { settings: Bloc
   const settings = loaded ?? {};
   assertTicketSettingsShape(settings);
   const wasInstalled = settingsHasTicketHook(settings);
-  const command = ticketHookCommand();
   let changed = false;
 
   if (!install) {
@@ -614,16 +625,21 @@ function registerTicketHook(install: boolean, dryRun: boolean): { settings: Bloc
   }
 
   if (settings.hooks == null) settings.hooks = {};
-  for (const { event, matcher } of TICKET_HOOK_EVENTS) {
+  for (const { event, matcher, hold = false } of TICKET_HOOK_EVENTS) {
     if (settings.hooks[event] == null) settings.hooks[event] = [];
     const arr = settings.hooks[event] as any[];
+    const want = ticketHookCommand(hold);
+    // The hold entry's extra fields: an hour to wait, and the spinner text.
+    const extra = hold ? { timeout: HOLD_TIMEOUT_S, statusMessage: HOLD_STATUS } : null;
     let found = false;
     for (const g of arr) {
       if (!Array.isArray(g?.hooks)) continue;
       const rightMatcher = sameMatcher(g.matcher, matcher);
       g.hooks = g.hooks.filter((h: any) => {
         const cmd = h?.command;
-        if (!isOurTicketCommand(cmd) && !isLegacyTicketCommand(cmd)) return true;
+        // Each entry owns only its own kind of command: the hold entry the `--hold` one, the others the plain one.
+        const mine = isOurTicketCommand(cmd) ? isHoldCommand(cmd) === hold : !hold && isLegacyTicketCommand(cmd);
+        if (!mine) return true;
         if (found || !rightMatcher) {
           // A second copy in this event, or one under a matcher that would not fire for
           // every tool the hook needs: drop it (the right group gets the command below).
@@ -632,7 +648,11 @@ function registerTicketHook(install: boolean, dryRun: boolean): { settings: Bloc
         }
         found = true;
         if (!isCanonicalTicketCommand(cmd)) {
-          h.command = command; // a legacy hook or a stale path, replaced in place
+          h.command = want; // a legacy hook or a stale path, replaced in place
+          changed = true;
+        }
+        if (extra && (h.timeout !== extra.timeout || h.statusMessage !== extra.statusMessage)) {
+          Object.assign(h, extra);
           changed = true;
         }
         return true;
@@ -640,9 +660,10 @@ function registerTicketHook(install: boolean, dryRun: boolean): { settings: Bloc
     }
     settings.hooks[event] = arr.filter((g: any) => !Array.isArray(g?.hooks) || g.hooks.length > 0);
     if (!found) {
+      const entry = { type: 'command', command: want, ...(extra ?? {}) };
       const group = (settings.hooks[event] as any[]).find((g: any) => sameMatcher(g?.matcher, matcher) && Array.isArray(g?.hooks));
-      if (group) group.hooks.push({ type: 'command', command });
-      else settings.hooks[event].push({ matcher, hooks: [{ type: 'command', command }] });
+      if (group) group.hooks.push(entry);
+      else settings.hooks[event].push({ matcher, hooks: [entry] });
       changed = true;
     }
   }
