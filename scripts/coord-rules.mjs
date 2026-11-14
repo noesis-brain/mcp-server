@@ -11,6 +11,11 @@
 //     ticket that ships (C1), a production schema apply (C6), an npm publish (C7), and merging two
 //     tickets that share a worktree (C13).
 //
+//   - C20 (can a session close?): an `ask-close` for each session the Chief may ask "Can I close the
+//     session?" (coord-close.mjs ask --session <id> --by-message, then SendMessage); a note for each
+//     session that can close; and for the sure-orphan loop tabs, one cleanup judgment and a
+//     `close-tabs` (coord-tabs.mjs close --ids). C20 rows never count toward the ship lane.
+//
 // Every action has a key (kind, the pair, the action), so the Chief acts once per conflict, not on
 // every scan: it passes the keys it already acted on as `done`.
 //
@@ -32,6 +37,8 @@ const SHARED_TWO_WAY = { reversible: true, shared: true, userVisible: false, tou
 const ONE_WAY = (touches) => ({ reversible: false, shared: true, userVisible: true, touches, confidence: 'high', evidence: 'measured' });
 /** A cleanup of another session's process: reversible only by restarting it, so it is user-visible. */
 const CLEANUP = { reversible: false, shared: true, userVisible: true, touches: [], confidence: 'low', evidence: 'measured' };
+/** Closing sure-orphan loop tabs: the owner sees it, and a tab can be opened again from its address. */
+const TAB_CLEANUP = { reversible: true, shared: false, userVisible: true, touches: [], confidence: 'high', evidence: 'measured' };
 
 const ticketNumber = (k) => Number(String(k).slice(4));
 
@@ -57,6 +64,8 @@ function sessionOf(scan, key) {
  *              or the main checkout holds, sorted; the server cannot see them, so the next version skips them)
  *   decide     {category, rubric, choice, reason, ticket, evidence, card?}   (a judgment or an owner gate)
  *   note       {text}   (a rule that needs no step: logged once in the report)
+ *   ask-close  {to_session, name, ticket}   (C20: ask that session "Can I close the session?" once)
+ *   close-tabs {ids, tickets}   (C20: close these sure-orphan loop tabs, after the cleanup decide)
  * Conflicts whose key is in `done` give no action.
  */
 export function rulesFor(scan, done = []) {
@@ -67,7 +76,8 @@ export function rulesFor(scan, done = []) {
   const inBranches = [...new Set(held.filter((v) => typeof v === 'string' && v))]
     .sort((x, y) => x.localeCompare(y, undefined, { numeric: true }));
   // How many conflicts in this scan name a ticket: the one with fewer ships first (fewer rebases after it).
-  const load = (k) => (scan.conflicts || []).filter((x) => x.a === k || x.b === k).length;
+  // C20 rows (can a session close?) are no conflict between tickets, so they never count.
+  const load = (k) => (scan.conflicts || []).filter((x) => x.kind !== 'C20' && (x.a === k || x.b === k)).length;
   // C1: every ticket in a waiting-to-ship pair is in one ship lane, in the recommended order: fewer
   // conflicts first, then the lower number.
   const lane = [...new Set((scan.conflicts || []).filter((x) => x.kind === 'C1' && isTicket(x.a) && isTicket(x.b)).flatMap((x) => [x.a, x.b]))]
@@ -224,6 +234,24 @@ export function rulesFor(scan, done = []) {
       case 'C17':
         push(c, 'note', { type: 'note', text: `${c.a}: ${c.detail}` });
         break;
+      case 'C20': {
+        const e = c.evidence || {};
+        if (c.a === 'chrome-tabs') {
+          const ids = [...new Set((Array.isArray(e.sureOrphans) ? e.sureOrphans : []).filter((x) => Number.isSafeInteger(x)))].sort((x, y) => x - y);
+          if (!ids.length) break;
+          const listed = Array.isArray(e.tabs) ? e.tabs : [];
+          const tickets = [...new Set(listed.filter((t) => t && ids.includes(t.id) && isTicket(t.ticket)).map((t) => t.ticket))].sort((x, y) => ticketNumber(x) - ticketNumber(y));
+          const tag = ids.join(',');
+          // The choice names at most 8 tab ids: the server refuses a choice over 500 characters.
+          const named = `${ids.slice(0, 8).join(',')}${ids.length > 8 ? ` and ${ids.length - 8} more` : ''}`;
+          push(c, `cleanup:${tag}`, { type: 'decide', category: 'cleanup', rubric: TAB_CLEANUP, ticket: tickets[0] || null, choice: `Close ${ids.length} sure-orphan Chrome tab${ids.length === 1 ? '' : 's'} (${named})${tickets.length ? ` of ${tickets.slice(0, 5).join(', ')}${tickets.length > 5 ? ' and others' : ''}` : ''}`, reason: 'Their ticket is closed, or their server stopped and their session ended; coord-tabs.mjs reads each tab again before it closes it.', evidence: tickets.slice(0, 10) });
+          push(c, `close-tabs:${tag}`, { type: 'close-tabs', ids, tickets });
+        } else if (!e.self) {
+          if (e.askable === true) push(c, 'ask-close', { type: 'ask-close', to_session: c.a, name: e.name || null, ticket: isTicket(e.ticket) ? e.ticket : null });
+          else if (e.verdict === 'yes') push(c, 'ready', { type: 'note', text: `${e.name || c.a.slice(0, 8)} (${e.ticket || 'no ticket'}) can close: run /noesis-chief close` });
+        }
+        break;
+      }
       default:
         push(c, 'note', { type: 'note', text: `${c.kind} ${c.a}${c.b ? ` / ${c.b}` : ''}: ${c.detail}` });
     }
@@ -390,6 +418,32 @@ function selftest() {
   eq('rules: the later ticket is the higher number, whatever the pair order', reversed.map((a) => [a.type, a.ticket, a.choice || a.to_session]), [
     ['decide', 'TCK-10', 'TCK-10 rebases on TCK-9 after TCK-9 ships'], ['decide', 'TCK-10', 'TCK-9 ships before TCK-10'], ['message', 'TCK-10', 's10'],
   ]);
+
+  // C20: can a session close? One row per session (a = its id) and one for the loop tabs no session owns.
+  const sx = (n) => `11111111-aaaa-4bbb-8ccc-00000000000${n}`;
+  const c20 = [
+    { kind: 'C20', severity: 'low', a: sx(1), b: '', detail: 'alpha', evidence: { verdict: 'no', askable: true, self: false, name: 'alpha', ticket: 'TCK-1' } },
+    { kind: 'C20', severity: 'low', a: sx(2), b: '', detail: 'zeta', evidence: { verdict: 'yes', askable: false, self: false, name: 'zeta', ticket: 'TCK-2' } },
+    { kind: 'C20', severity: 'low', a: sx(3), b: '', detail: 'chief', evidence: { verdict: 'yes', askable: true, self: true, name: 'chief', ticket: null } },
+    { kind: 'C20', severity: 'low', a: sx(4), b: '', detail: 'busy', evidence: { verdict: 'no', askable: false, self: false } },
+    { kind: 'C20', severity: 'low', a: sx(5), b: '', detail: 'loose', evidence: { verdict: 'maybe', askable: 'true', self: false } },
+    { kind: 'C20', severity: 'low', a: 'chrome-tabs', b: '', detail: 'tabs', evidence: { tabs: [{ id: 9, ticket: 'TCK-9' }, { id: 8, ticket: 'TCK-8' }, { id: 5, ticket: 'TCK-12' }], sureOrphans: [9, 5, 9, 'x', 2.5] } },
+  ];
+  const r20 = rulesFor({ tickets: [], conflicts: c20 });
+  eq('rules C20: ask the askable session, note the one that can close, one cleanup decide and one close-tabs for the sure orphans; nothing for the Chief\'s own session, a "no" or a loose askable', r20.map((a) => [a.type, a.key]), [
+    ['ask-close', `C20|${sx(1)}||ask-close`], ['note', `C20|${sx(2)}||ready`], ['decide', 'C20|chrome-tabs||cleanup:5,9'], ['close-tabs', 'C20|chrome-tabs||close-tabs:5,9'],
+  ]);
+  const ofType = (t) => r20.find((a) => a.type === t);
+  eq('rules C20: the ask names its session, and the note says how to close it', [ofType('ask-close').to_session, ofType('ask-close').name, ofType('ask-close').ticket, ofType('note').text], [sx(1), 'alpha', 'TCK-1', 'zeta (TCK-2) can close: run /noesis-chief close']);
+  const tabDecide = ofType('decide');
+  eq('rules C20: the tab cleanup is a reviewed judgment (reversible, not shared, the owner sees it), with its tickets in number order', [tabDecide.category, tabDecide.rubric, tabDecide.ticket, tabDecide.evidence, ofType('close-tabs').ids, ofType('close-tabs').tickets], ['cleanup', TAB_CLEANUP, 'TCK-9', ['TCK-9', 'TCK-12'], [5, 9], ['TCK-9', 'TCK-12']]);
+  eq('rules C20: done keys: a session is asked once, the same tabs are closed once', rulesFor({ conflicts: c20 }, r20.map((a) => a.key)).length, 0);
+  const more = rulesFor({ conflicts: [{ ...c20[5], evidence: { ...c20[5].evidence, sureOrphans: [5, 9, 11] } }] }, r20.map((a) => a.key));
+  eq('rules C20: a new orphan joins: a new cleanup and close-tabs for the new set', more.map((a) => a.key), ['C20|chrome-tabs||cleanup:5,9,11', 'C20|chrome-tabs||close-tabs:5,9,11']);
+  const many = rulesFor({ conflicts: [{ ...c20[5], evidence: { tabs: [], sureOrphans: Array.from({ length: 300 }, (_, i) => 11586000 + i) } }] });
+  eq('rules C20: 300 sure orphans with 8-digit ids: the choice names 8 and stays within the 500 characters the server takes; close-tabs keeps every id', [many[0].choice.length <= 500, many[0].choice, many[1].ids.length], [true, 'Close 300 sure-orphan Chrome tabs (11586000,11586001,11586002,11586003,11586004,11586005,11586006,11586007 and 292 more)', 300]);
+  eq('rules C20: no sure orphan, no tab action', rulesFor({ conflicts: [{ ...c20[5], evidence: { ...c20[5].evidence, sureOrphans: [] } }] }).length, 0);
+  eq('rules C20: C20 rows never count toward the ship lane (a stored row naming a ticket included)', laneCard([shipScan.conflicts[0], ...[1, 2, 3].map((n) => ({ kind: 'C20', severity: 'low', a: 'TCK-9', b: '', detail: `x${n}`, evidence: {} }))]).card.options[0].label, 'Ship TCK-9 first, then TCK-10');
   console.log(failed ? `${failed} FAILED` : 'all passed');
   return failed ? 1 : 0;
 }

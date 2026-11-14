@@ -2,10 +2,12 @@
 // coord-close.mjs — "Can this session close?" for the Chief of Staff (TCK-1930).
 // The rules are in references/chief-conflict-catalogue.md, row C20.
 //
-//   node coord-close.mjs check [--session <id> | --pid <pid> | --all] [--closed <file>] [--repo <main checkout>]
+//   node coord-close.mjs check [--session <id> | --pid <pid> | --all [--save]] [--closed <file>] [--repo <main checkout>]
 //                              [--agents <agents.json>] [--npm-latest <version>] [--config-repo <claude-config>] [--json]
 //   node coord-close.mjs record (--pid <pid> | --session <id>) --verdict yes|no [--left <text>]...
 //   node coord-close.mjs candidates [--self-pid <pid>] [same options as check] [--json]
+//   node coord-close.mjs ask --session <id> [--by-message] [same options as check] [--json]
+//   node coord-close.mjs close --session <id> [same options as check] [--json]
 //   node coord-close.mjs --selftest
 //
 // `check` gives each local interactive Claude Code session a verdict: yes, no or maybe. Each reason
@@ -31,9 +33,26 @@
 // question holds at most 4 options). It never lists the Chief's own session (--self-pid), a
 // background agent, or a session whose loop still runs.
 //
+// `check --all --save` also writes the result to ~/.claude/coord/close-check.json, with whether
+// the Chief may ask each session now and which loop tabs no session owns. coord-scan.mjs reads that
+// file and posts one C20 row per session, so the Chief's pass and the watcher's scan post the same rows.
+//
+// `ask` asks "Can I close the session?" once, only of an idle session whose ticket is Shipped, Merged
+// or Dropped and that has not answered. It writes askedAt first, so a session is never asked twice.
+// With --by-message it prints the line for the Chief to send with SendMessage (that wakes an idle
+// session); otherwise it types the line into the session's iTerm2 tab.
+//
+// `close` closes one session that the owner chose: it stops while the owner's pause is in force or
+// when the check says no (only the processes, the port slot and the tabs, which it fixes itself, let
+// it go on). It stops the session's processes, releases its port slot, closes its sure-orphan tabs,
+// types /exit once into an idle session with an empty prompt line, closes the iTerm2 session by its
+// unique id when only shells run in it, reports the session as gone, and prints
+// `claude --resume <id>`. It never closes the Chief's own session or a background agent.
+//
 // It only reads: `claude agents --json`, `ps`, `lsof`, git (with GIT_OPTIONAL_LOCKS=0), the files
-// named above, the installed hook and skills, and `npm view`. Its API calls are GETs. The only file
-// it writes is the answer file of `record`, under ~/.claude/coord/close/. A fact it cannot read is a
+// named above, the installed hook and skills, and `npm view`. Its API calls are GETs. Check and
+// candidates write nothing; `record` and `ask` write only the session's file under
+// ~/.claude/coord/close/, and --save only ~/.claude/coord/close-check.json. A fact it cannot read is a
 // reason of its own, so a failure never reads as "yes": ps, lsof, `claude agents`, git, the ticket
 // lists, the port slots and leases, and npm's version when the session's own commits changed the MCP.
 // --prove-read-only (check and candidates) shows it: every side effect then throws and is listed
@@ -130,6 +149,8 @@ export const COPIED_FROM_SCAN = ['IGNORED', 'git', 'lines', 'keep', 'mainCheckou
 
 const configDir = () => process.env.CLAUDE_CONFIG_DIR || path.join(os.homedir(), '.claude');
 export const closeDir = () => path.join(configDir(), 'coord', 'close');
+/** The saved check for the Chief's scan (check --all --save): coord-scan.mjs turns it into C20 rows. */
+export const closeCheckFile = () => path.join(configDir(), 'coord', 'close-check.json');
 const sidOk = (s) => typeof s === 'string' && /^[A-Za-z0-9-]{8,64}$/.test(s);
 export const short = (s, n) => { const t = String(s ?? ''); return t.length > n ? `${t.slice(0, n - 1)}…` : t; };
 const folderOf = (p) => (p ? path.basename(p) : null);
@@ -401,6 +422,7 @@ export async function gather(args, deps) {
   const tabResult = args.withTabs === false || !deps.tabs ? { tabs: [], nonLocalBySession: {} } : await deps.tabs(F);
   F.tabs = tabResult ? tabResult.tabs : null;
   F.tabsNonLocal = tabResult ? tabResult.nonLocalBySession || {} : {};
+  F.tabCounts = tabResult ? { otherLocal: tabResult.otherLocal || 0, nonLocal: tabResult.nonLocal || 0 } : null;
   return F;
 }
 
@@ -653,7 +675,45 @@ export async function check(args, deps) {
   else if (args.pid) rows = rows.filter((a) => a.pid === Number(args.pid));
   const sessions = [];
   for (const a of rows) sessions.push(await checkSession(a, F, deps));
-  return { checkedAt: new Date(F.now).toISOString(), main: F.main, npmLatest: F.npm, mainMcpVersion: F.mainVersion, sessions, followUps: machineFollowUps(F) };
+  // The loop tabs (local, of a ticket); every other tab is only counted.
+  const tabs = F.tabs === null ? null : {
+    loop: F.tabs.map((t) => ({ id: t.id, ticket: t.ticket, status: t.status, label: t.label, sureOrphan: t.sureOrphan, active: t.active, url: t.url, title: t.title, openedBy: t.openedBy ? t.openedBy.sessionId : null })),
+    ...(F.tabCounts || { otherLocal: 0, nonLocal: 0 }),
+  };
+  return { checkedAt: new Date(F.now).toISOString(), main: F.main, npmLatest: F.npm, mainMcpVersion: F.mainVersion, sessions, followUps: machineFollowUps(F), tabs };
+}
+
+/**
+ * The check as the scan reads it (check --all --save): each session also says whether the Chief may
+ * ask it now (askable) and whether it is the Chief's own (self); the tabs say which loop tabs no
+ * checked session owns (unowned).
+ */
+export function forScan(result, selfPid) {
+  const owned = new Set(result.sessions.flatMap((s) => s.reasons.filter((x) => x.code === 'tabs' && Array.isArray(x.tabIds)).flatMap((x) => x.tabIds)));
+  return {
+    version: 1,
+    checkedAt: result.checkedAt,
+    main: result.main,
+    followUps: result.followUps || [],
+    sessions: result.sessions.map((s) => ({ ...s, self: Boolean(selfPid) && s.pid === selfPid, askable: askRefusal(s, selfPid) === null })),
+    tabs: result.tabs ? { ...result.tabs, unowned: result.tabs.loop.filter((t) => !owned.has(t.id)).map((t) => t.id) } : null,
+  };
+}
+
+/** check --all --save: the check, saved for the scan, with the Chief's own session marked (self), so the rules never ask it. */
+export async function checkAndSave(args, deps) {
+  const r = await check(args, deps);
+  if (!r.error) r.savedTo = saveCheck(forScan(r, chiefPid(args, deps)));
+  return r;
+}
+
+/** Write the saved check whole: a temporary file in the same folder, then a rename, so a reader never sees half of it. */
+export function saveCheck(saved, file = closeCheckFile()) {
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  const tmp = `${file}.${process.pid}.tmp`;
+  fs.writeFileSync(tmp, JSON.stringify(saved));
+  fs.renameSync(tmp, file);
+  return file;
 }
 
 /** The sessions that can close now, in groups of at most GROUP_SIZE; the "maybe" ones apart. */
@@ -853,7 +913,7 @@ export async function ask(args, deps) {
   const r = await check({ ...args, all: false }, deps);
   if (r.error) return { asked: false, why: r.error };
   const s = r.sessions[0];
-  const self = args.selfPid || selfSessionPid(deps.ps());
+  const self = chiefPid(args, deps);
   const why = askRefusal(s, self);
   if (why) return { asked: false, why, sessionId: s && s.sessionId };
   // --by-message: the Chief sends the line itself with SendMessage, which wakes an idle session
@@ -877,7 +937,7 @@ export async function ask(args, deps) {
 export async function closeSession(args, deps) {
   const steps = [];
   const stop = (why) => ({ closed: false, why, steps });
-  const self = args.selfPid || selfSessionPid(deps.ps());
+  const self = chiefPid(args, deps);
   // The owner's pause is in the inbox of this (the Chief's) session: the server reads it per session.
   const paused = await deps.paused(self ? sessionOfPid(self, deps) : null);
   if (paused !== false) return stop(paused === null ? "the owner's pause cannot be read" : 'the owner has paused every session');
@@ -1412,6 +1472,8 @@ async function selftest() {
     await refuseAsk('a session with an open ticket', 3, actFake(), /not closed/);
     await refuseAsk('a session with no ticket', 4, actFake(), /no ticket/);
     { acts.length = 0; const r = await ask({ configRepo: null, repo, session: sid(11), selfPid: 111 }, actFake()); eq("ask refuses the Chief's own session (by pid)", [r.asked, typed().length], [false, 0]); }
+    { acts.length = 0; const under = new Map([...ps, [111, { pid: 111, ppid: 1, pgid: 111, command: 'claude' }], [process.pid, { pid: process.pid, ppid: 111, pgid: 1, command: 'node coord-close.mjs ask' }]]); const r = await ask({ configRepo: null, repo, session: sid(11) }, actFake({ ps: () => under })); eq("ask without --self-pid refuses the claude process it runs under (the Chief's own session)", [r.asked, /Chief's own session/.test(r.why || ''), typed().length], [false, true, 0]); }
+    { acts.length = 0; const under = new Map([...ps, [process.pid, { pid: process.pid, ppid: 101, pgid: 1, command: 'node coord-close.mjs close' }]]); const r = await closeSession({ configRepo: null, repo, session: sid(1) }, actFake({ ps: () => under })); eq("close without --self-pid refuses the claude process it runs under (the Chief's own session), and changes nothing", [r.closed, /Chief's own session/.test(r.why || ''), acts.length], [false, true, 0]); }
     { acts.length = 0; const r = await ask({ configRepo: null, repo, session: sid(11), selfPid: 1 }, actFake({ ps: () => null })); eq('ask refuses a session whose facts cannot be read (facts-failed)', [r.asked, /not done: the check could not read the processes/.test(r.why || ''), typed().length], [false, true, 0]); }
     // close s1 (TCK-1 shipped, a fresh yes): its processes are stopped (groups when the leader is one of them), /exit typed once, the iTerm tab closed, gone reported.
     acts.length = 0;
@@ -1437,6 +1499,7 @@ async function selftest() {
     { acts.length = 0; const slotGet = async (p) => (p === '/api/mcp/coordination/allocations' ? { allocations: [], ports: [{ slot: 9, backend_port: 5709, frontend_port: 3709, host: 'tck-1.localhost', ticket: 'TCK-1', holder: 'h-1' }] } : baseGet(p)); const r = await closeSession({ configRepo: null, repo, session: sid(1), selfPid: 1 }, actFake({ get: slotGet, tabs: async () => ({ tabs: [{ id: 77, ticket: 'TCK-1', label: 'done', openedBy: null }], nonLocalBySession: {} }) })); eq('close: its port slot is released and its tabs go to the tab closer', [r.closed, acts.filter((a) => a[0] === 'post' && /port\/release/.test(a[1])).map((a) => a[2]), acts.filter((a) => a[0] === 'tabs').map((a) => a[1])], [true, [{ holder: 'h-1', ticket: 'TCK-1' }], [[77]]]); }
     { const seen = []; const d = actDeps({}, { ...realDeps({}), get: async (p) => { seen.push(p); return { pause: { paused: false } }; } }); eq('the real pause read asks the server for this session\'s inbox, and no session id reads as unknown', [await d.paused('abc-123'), await d.paused(null), seen], [false, null, ['/api/mcp/coordination/inbox?session=abc-123&limit=1']]); }
     eq('the iTerm scripts: by unique id, by tty, the tab count, and the shared-tab guard before close', [/if \(\(unique id of s\) as text\) is "U-1" then/.test(paneScript('U-1')), /if \(\(unique id of s\) as text\) is "U-1" then/.test(typeLineScript('U-1', 'x')), /if \(tty of s\) is "\/dev\/ttys1" then/.test(itermSessionsScript('/dev/ttys1')), /set n to count of sessions of t/.test(itermSessionsScript('/dev/ttys1')), /if \(count of sessions of t\) is not 1 then return "shared"\n\s*close s/.test(closeItermScript('U-1'))], [true, true, true, true, true]);
+    { const fakePs = new Map([[process.pid, { pid: process.pid, ppid: 4242, pgid: 1, command: 'node coord-close.mjs' }], [4242, { pid: 4242, ppid: 1, pgid: 1, command: '/usr/local/bin/claude --resume x' }]]); eq("chiefPid: --self-pid first, else the claude process this script runs under, else none", [chiefPid({ selfPid: 7 }, { ps: () => fakePs }), chiefPid({}, { ps: () => fakePs }), chiefPid({}, { ps: () => null })], [7, 4242, null]); }
     eq('the ask line names the main checkout for the session\'s own check', askLine('/main/repo').includes('check --pid $PPID --repo /main/repo'), true);
     eq("the ask line quotes a path with a space or a quote as one shell word", [askLine('/a b/c').includes("--repo '/a b/c'"), shq("/it's"), shq('/plain/path-1.x')], [true, "'/it'\\''s'", '/plain/path-1.x']);
     eq('close itself fixes exactly these three reasons; every other reason blocks', FIXED_BY_CLOSE, ['process', 'port', 'tabs']);
@@ -1504,6 +1567,35 @@ async function selftest() {
     eq('no tabs: no tab reason', rt0.sessions[0].reasons.some((x) => x.code === 'tabs' || /Chrome tabs/.test(x.text)), false);
     const rtl = await check({ configRepo: null, repo, session: sid(1) }, tabsDeps([], { [sid(1)]: 2, [sid(2)]: 5 }));
     eq('its own non-local tabs: a count for the session to close, never named', (rtl.sessions[0].reasons.find((x) => x.code === 'tabs') || {}).nonLocal, 2);
+    // check --all --save: what the scan reads. The loop tabs without fullUrl or window id; the other tabs only counted.
+    {
+      const loopTabs = [
+        { id: 11, windowId: 5, ticket: 'TCK-1', status: 'shipped', label: 'done', sureOrphan: true, active: false, url: 'http://tck-1.localhost:3701/', title: 'one', openedBy: null, fullUrl: 'http://tck-1.localhost:3701/?long' },
+        { id: 14, windowId: 5, ticket: 'TCK-99', status: 'shipped', label: 'done', sureOrphan: true, active: false, url: 'http://tck-99.localhost:3799/', title: 'ninety-nine', openedBy: null, fullUrl: 'http://tck-99.localhost:3799/' },
+      ];
+      const d = deps({ cwds: () => cwds2, tabs: async () => ({ tabs: loopTabs, nonLocalBySession: {}, otherLocal: 3, nonLocal: 4 }) });
+      const ra = await check({ configRepo: null, repo, all: true }, d);
+      const s2pid = ra.sessions.find((x) => x.sessionId === sid(2)).pid;
+      const other = ra.sessions.find((x) => x.sessionId === sid(3)).pid;
+      const sv = forScan(ra, other);
+      const sv2 = forScan(ra, s2pid);
+      const two = (v) => v.sessions.find((x) => x.sessionId === sid(2));
+      const one = (v) => v.sessions.find((x) => x.sessionId === sid(1));
+      eq("forScan: the Chief may ask s2 (idle, TCK-2 shipped, no answer), not s1 (it answered); as the Chief's own session s2 is never askable", [two(sv).askable, two(sv).self, one(sv).askable, two(sv2).askable, two(sv2).self], [true, false, false, false, true]);
+      eq('forScan: askable is askRefusal(...) === null for every session', sv.sessions.every((x) => x.askable === (askRefusal(ra.sessions.find((y) => y.sessionId === x.sessionId), other) === null)), true);
+      eq('forScan: the loop tabs, which no session owns, and the counts of the other tabs; no full URL or window id', [sv.tabs.loop.map((t) => t.id), sv.tabs.unowned, sv.tabs.otherLocal, sv.tabs.nonLocal, sv.tabs.loop.some((t) => 'fullUrl' in t || 'windowId' in t), sv.version, sv.checkedAt === ra.checkedAt, sv.followUps === ra.followUps], [[11, 14], [14], 3, 4, false, 1, true, true]);
+      const rn = await check({ configRepo: null, repo, all: true }, tabsDeps(null));
+      eq('forScan: unreadable tabs are null, not an empty list', forScan(rn, other).tabs, null);
+      const file = path.join(cfg, 'coord', 'close-check.json');
+      eq('saveCheck writes the whole file under ~/.claude/coord, and leaves no temporary file', [saveCheck(sv), closeCheckFile(), JSON.stringify(readJson(file)) === JSON.stringify(sv), fs.readdirSync(path.dirname(file)).filter((f) => f.endsWith('.tmp'))], [file, file, true, []]);
+      fs.rmSync(file);
+      // No --self-pid: the Chief is the claude process this script runs under (here s2, pid 102), so --save marks s2 self and never askable.
+      const underS2 = new Map([...ps, [process.pid, { pid: process.pid, ppid: 102, pgid: 1, command: 'node coord-close.mjs check --all --save' }]]);
+      const rs = await checkAndSave({ configRepo: null, repo, all: true }, deps({ cwds: () => cwds2, ps: () => underS2, tabs: async () => ({ tabs: loopTabs, nonLocalBySession: {}, otherLocal: 3, nonLocal: 4 }) }));
+      const savedS2 = (readJson(file) || { sessions: [] }).sessions.find((x) => x.sessionId === sid(2)) || {};
+      eq("check --all --save without --self-pid: the claude process it runs under is the Chief's own session, saved self and never askable", [rs.savedTo, savedS2.self, savedS2.askable], [file, true, false]);
+      fs.rmSync(file);
+    }
     eq('the real tab path: AppleScript failure is null (a reason), never an empty list', await realDeps({}).tabs({}, () => { throw new Error('osascript failed'); }), null);
 
     // Failures fail closed.
@@ -1659,6 +1751,7 @@ function parseArgs(argv) {
     else if (a === '--all') args.all = true;
     else if (a === '--prove-read-only') args.proveReadOnly = true;
     else if (a === '--by-message') args.byMessage = true;
+    else if (a === '--save') args.save = true;
     else if (a === '--session') args.session = val();
     else if (a === '--pid') args.pid = Number(val());
     else if (a === '--self-pid') args.selfPid = Number(val());
@@ -1674,7 +1767,7 @@ function parseArgs(argv) {
   return args;
 }
 
-const USAGE = 'usage: coord-close.mjs ask --session <id> [--by-message] [--closed <file>] [--json] | close --session <id> [--closed <file>] [--json] | check [--session <id> | --pid <pid> | --all] [--closed <file>] [--repo <main checkout>] [--agents <file>] [--json] [--prove-read-only] | record (--pid <pid> | --session <id>) --verdict yes|no [--left <text>]... | candidates [--self-pid <pid>] [--json] [--prove-read-only] | --selftest';
+const USAGE = 'usage: coord-close.mjs ask --session <id> [--by-message] [--closed <file>] [--json] | close --session <id> [--closed <file>] [--json] | check [--session <id> | --pid <pid> | --all [--save]] [--closed <file>] [--repo <main checkout>] [--agents <file>] [--json] [--prove-read-only] | record (--pid <pid> | --session <id>) --verdict yes|no [--left <text>]... | candidates [--self-pid <pid>] [--json] [--prove-read-only] | --selftest';
 
 /** The Claude Code process this script runs under (the nearest `claude` among its parents), or null. */
 export function selfSessionPid(ps, from = process.pid) {
@@ -1682,6 +1775,11 @@ export function selfSessionPid(ps, from = process.pid) {
   let p = ps.get(from);
   for (let i = 0; p && i < 64; i++, p = ps.get(p.ppid)) if (p.pid !== from && /(^|\/)claude(\s|$)/.test(p.command)) return p.pid;
   return null;
+}
+
+/** The Chief's own Claude Code process: --self-pid, else the claude process this script runs under. */
+export function chiefPid(args, deps) {
+  return args.selfPid || selfSessionPid(deps.ps());
 }
 
 // No top-level await: coord-tabs.mjs is imported while main runs, and it imports this file back.
@@ -1694,12 +1792,15 @@ async function main(argv) {
   const effects = [];
   if (args.proveReadOnly) {
     if (args.cmd !== 'check' && args.cmd !== 'candidates') { console.error('--prove-read-only works with check and candidates only'); return 2; }
+    if (args.save) { console.error('--prove-read-only cannot --save: saving writes a file'); return 2; }
     await installReadOnlySpy(effects);
   }
   const proof = () => (args.proveReadOnly ? `\nread-only proof: ${effects.length} side effect${effects.length === 1 ? '' : 's'}${effects.map((e) => `\n  ${e}`).join('')}` : '');
   try {
     if (args.cmd === 'check') {
-      const r = await check(args, deps);
+      if (args.save && (!args.all || args.session || args.pid)) { console.error('--save needs --all: the scan reads the whole picture'); return 2; }
+      const r = args.save ? await checkAndSave(args, deps) : await check(args, deps);
+      if (r.savedTo && !args.json) console.log(`saved for the scan: ${r.savedTo}`);
       if (args.proveReadOnly) r.readOnly = { effects };
       console.log(args.json ? JSON.stringify(r, null, 2) : render(r) + proof());
       return effects.length ? 3 : r.error ? 1 : 0;
@@ -1708,7 +1809,7 @@ async function main(argv) {
       const r = await check({ ...args, all: true }, deps);
       if (r.error) { console.error(r.error); return 1; }
       // The Chief's own session is never a candidate: --self-pid, else the claude process this runs under.
-      const self = args.selfPid || selfSessionPid(deps.ps());
+      const self = chiefPid(args, deps);
       const c = candidatesOf(r, self);
       c.selfPid = self || null;
       if (args.proveReadOnly) c.readOnly = { effects };
