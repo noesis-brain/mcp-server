@@ -256,7 +256,7 @@ Sentences). Put what needs the owner first. A section with nothing in it is left
 2. **Waiting for you now.** The C17 sessions that are at a question or a permission prompt, with the ticket and how long they have waited, and the questions and plans of step 3b that you left for the owner.
 3. **What I did.** One line per message sent, per version handed out, per question or plan answered and per pull of the main checkout, with the rule.
 4. **For your review.** How many judgment calls wait in the review list.
-5. **Ready to close.** The sessions whose close check says yes, with their ticket, and "run `/noesis-chief close`". Then the "maybe" ones (no ticket) and the "after you close" items of `close.txt`. Then the Chrome tabs: the ones closed this pass, and the loop tabs left open, with their labels.
+5. **Ready to close.** The sessions that `node $S/coord-close.mjs candidates --repo <repo>` lists (a yes, or only what close fixes itself, which it names), with their ticket, and "run `/noesis-chief close`". Then the "maybe" ones (no ticket) and the "after you close" items of `close.txt`. Then the Chrome tabs: the ones closed this pass, and the loop tabs left open, with their labels.
 6. **Ship order.** The tickets at Ready to merge in the order you recommend, who holds the ship lease (`coord_leases`), and which ship waits for which.
 7. **Up next.** The pick, its reason, and whether it starts now in parallel or after a named ticket ships.
 8. **Conflicts.** Paste `scan.txt` as it is, in a fenced block. Do not retype or summarise its lines.
@@ -266,8 +266,8 @@ Save the report as `~/.claude/coord/report-<date>.md` too.
 In server mode, do not ask the owner the cards in the terminal. The owner answers them on the
 Chief view, and the server sends each answer to the inbox of every session the card concerns.
 
-At the end of an attended one-pass run (no `watch`), when Ready to close lists a session, go on with
-Closing finished sessions. It asks the owner once. In watch mode, never ask in the terminal: a question
+At the end of an attended one-pass run (no `watch`), when `candidates` (Ready to close) lists a session, go on
+with Closing finished sessions. It asks the owner once. In watch mode, never ask in the terminal: a question
 would stop your wakes. Name `/noesis-chief close` in the report instead.
 
 ## Closing finished sessions (`/noesis-chief close`)
@@ -275,9 +275,11 @@ would stop your wakes. Name `/noesis-chief close` in the report instead.
 The owner used to ask each finished session "Can I close the session?" and close each terminal by
 hand (incident 25). Here the Chief does it, with one yes from the owner.
 
-1. Run `node $S/coord-close.mjs candidates --repo <repo> --json`. It lists the sessions whose check
-   says yes, in groups of at most 4. It never lists your own session, a background agent, or a session
-   whose loop still runs. When none is ready, say so, list the "maybe" ones and why, and stop.
+1. Run `node $S/coord-close.mjs candidates --repo <repo> --json`. It lists the sessions that can close
+   now, in groups of at most 4: those whose check says yes, and those whose only reasons are what close
+   fixes itself (a leftover server, its port slot, its tabs; `closeFixes` names them). It never lists
+   your own session, a background agent, or a session whose loop still runs. When none is ready, say
+   so, list the "maybe" ones and why, and stop.
 2. Ask the owner once with AskUserQuestion, header `Close`: "Close all <N> finished sessions?" with the
    options "Close all <N>" and "Let me choose". For "Let me choose", ask one multiSelect question per
    group of at most 4, one option per session (its name, ticket and folder). A question needs two

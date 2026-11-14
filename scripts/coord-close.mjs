@@ -726,11 +726,21 @@ export function saveCheck(saved, file = closeCheckFile()) {
 }
 
 /** The sessions that can close now, in groups of at most GROUP_SIZE; the "maybe" ones apart. */
+/**
+ * Whether the Chief can close this session now: its check says yes, or it is idle, has a ticket, and every reason
+ * left is one that close fixes itself (its processes, its port slot, its tabs: FIXED_BY_CLOSE, fixer chief).
+ */
+export function closable(s, selfPid) {
+  if (s.verdict === 'yes') return true;
+  return Boolean(s.ticket) && Array.isArray(s.reasons) && s.reasons.length > 0 && closeRefusal(s, selfPid) === null;
+}
+
 export function candidatesOf(result, selfPid) {
   const ok = (s) => s.pid !== Number(selfPid);
-  const ready = result.sessions.filter((s) => s.verdict === 'yes' && ok(s));
+  // Ready: a yes, or only what close fixes itself (a leftover server, its port slot, its tabs).
+  const ready = result.sessions.filter((s) => ok(s) && closable(s, Number(selfPid)));
   const maybe = result.sessions.filter((s) => s.verdict === 'maybe' && ok(s));
-  const pick = (s) => ({ sessionId: s.sessionId, name: s.name, pid: s.pid, ticket: s.ticket ? s.ticket.key : null, folder: s.folder, notes: s.followUps.map((f) => f.text) });
+  const pick = (s) => ({ sessionId: s.sessionId, name: s.name, pid: s.pid, ticket: s.ticket ? s.ticket.key : null, folder: s.folder, notes: s.followUps.map((f) => f.text), closeFixes: s.verdict === 'yes' ? [] : (s.reasons || []).map((r) => r.text) });
   const groups = [];
   for (let i = 0; i < ready.length; i += GROUP_SIZE) groups.push(ready.slice(i, i + GROUP_SIZE).map(pick));
   return { ready: ready.map(pick), maybe: maybe.map(pick), groups, followUps: (result.followUps || []).map((f) => f.text) };
@@ -764,6 +774,7 @@ export function render(result) {
   for (const s of result.sessions) {
     out.push('', `${s.verdict.toUpperCase().padEnd(5)} ${s.name || s.sessionId.slice(0, 8)} (${s.sessionId.slice(0, 8)}, pid ${s.pid}, ${s.folder})${s.ticket ? ` ${s.ticket.key} ${s.ticket.status || '?'}` : ' no ticket'}`);
     if (s.selfCheck) out.push('      (it checked itself: its own busy state, its answer and this check\'s process are left out)');
+    if (s.selfCheck && s.verdict !== 'yes' && s.ticket && onlyCloseFixes(s)) out.push('      the Chief\'s close fixes every reason left (it stops the processes, releases the port slot, closes the tabs): you may answer yes');
     for (const r of s.reasons) out.push(`      no: ${r.text} [fix: ${r.fixer}]`);
     for (const f of s.followUps) out.push(`      note: ${f.text}`);
   }
@@ -784,7 +795,10 @@ const SELF = fileURLToPath(import.meta.url);
 /** A path as one shell word: plain paths stay as they are, any other is single-quoted. */
 export const shq = (x) => (/^[\w@%+=:,./-]+$/.test(x) ? x : `'${String(x).replace(/'/g, "'\\''")}'`);
 
-export const askLine = (repo) => `${ASK_PHRASE} (Chief of Staff: run your close check with \`node ${shq(SELF)} check --pid $PPID${repo ? ` --repo ${shq(repo)}` : ''}\`, fix what is yours, then record your answer with \`node ${shq(SELF)} record --pid $PPID --verdict yes|no --left "<what is left>"\`.)`;
+export const askLine = (repo) => `${ASK_PHRASE} (Chief of Staff: run your close check with \`node ${shq(SELF)} check --pid $PPID${repo ? ` --repo ${shq(repo)}` : ''}\`, fix what is yours, then record your answer with \`node ${shq(SELF)} record --pid $PPID --verdict yes|no --left "<what is left>"\`: yes when the check says yes, or says that the Chief's close fixes every reason left; otherwise no.)`;
+
+/** Every reason left is one that close fixes itself (its processes, its port slot, its tabs, fixer chief). */
+export const onlyCloseFixes = (s) => Array.isArray(s.reasons) && s.reasons.length > 0 && s.reasons.every((x) => FIXED_BY_CLOSE.includes(x.code) && x.fixer === 'chief');
 
 const escA = (s) => String(s).replace(/\\/g, '\\\\').replace(/"/g, '\\"');
 const US = String.fromCharCode(31);
@@ -1539,6 +1553,21 @@ async function selftest() {
       fs.rmSync(path.join(cfg, 'loop-supervisor', `${sid(1)}.json`));
       if (s1Kept !== null) write(s1File, s1Kept);
     }
+    eq('onlyCloseFixes: true only for a non-empty list of process, port and tab reasons fixed by the Chief', [onlyCloseFixes({ reasons: [] }), onlyCloseFixes({ reasons: [{ code: 'port', fixer: 'chief' }] }), onlyCloseFixes({ reasons: [{ code: 'facts-failed', fixer: 'chief' }] }), onlyCloseFixes({ reasons: [{ code: 'tabs', fixer: 'session' }] }), onlyCloseFixes({})], [false, true, false, false, false]);
+    eq("the ask line says when to answer yes: a yes, or only what the Chief's close fixes", askLine('/r').includes("yes when the check says yes, or says that the Chief's close fixes every reason left; otherwise no"), true);
+    {
+      const base = { sessionId: sid(1), name: 'one', pid: 101, folder: 'f', ticket: { key: 'TCK-1', status: 'shipped' }, followUps: [], selfCheck: true, verdict: 'no' };
+      const only = render({ checkedAt: 'now', sessions: [{ ...base, reasons: [{ code: 'process', fixer: 'chief', text: 'a process runs' }, { code: 'tabs', fixer: 'chief', text: 'a tab' }] }] });
+      const more = render({ checkedAt: 'now', sessions: [{ ...base, reasons: [{ code: 'process', fixer: 'chief', text: 'a process runs' }, { code: 'uncommitted', fixer: 'session', text: 'x' }] }] });
+      const other = render({ checkedAt: 'now', sessions: [{ ...base, selfCheck: undefined, reasons: [{ code: 'process', fixer: 'chief', text: 'a process runs' }] }] });
+      const ownTab = render({ checkedAt: 'now', sessions: [{ ...base, reasons: [{ code: 'tabs', fixer: 'session', text: 'own non-local tab', nonLocal: 1 }] }] });
+      const yes = /you may answer yes/;
+      const factsOnly = render({ checkedAt: 'now', sessions: [{ ...base, reasons: [{ code: 'facts-failed', fixer: 'chief', text: 'the check could not read the processes' }] }] });
+      const ticketUnknown = render({ checkedAt: 'now', sessions: [{ ...base, reasons: [{ code: 'ticket-unknown', fixer: 'chief', text: 'x' }] }] });
+      const maybeEmpty = render({ checkedAt: 'now', sessions: [{ ...base, ticket: null, verdict: 'maybe', reasons: [] }] });
+      const noTicket = render({ checkedAt: 'now', sessions: [{ ...base, ticket: null, reasons: [{ code: 'process', fixer: 'chief', text: 'a process runs' }] }] });
+      eq("a self-check whose only reasons the Chief's close fixes says the session may answer yes; anything else, a check of another session, its own non-local tab, a chief-fixed fact it could not read, an unknown ticket, an empty maybe or no ticket does not", [yes.test(only), yes.test(more), yes.test(other), yes.test(ownTab), yes.test(factsOnly), yes.test(ticketUnknown), yes.test(maybeEmpty), yes.test(noTicket)], [true, false, false, false, false, false, false, false]);
+    }
     eq('the ask line names the main checkout for the session\'s own check', askLine('/main/repo').includes('check --pid $PPID --repo /main/repo'), true);
     eq("the ask line quotes a path with a space or a quote as one shell word", [askLine('/a b/c').includes("--repo '/a b/c'"), shq("/it's"), shq('/plain/path-1.x')], [true, "'/it'\\''s'", '/plain/path-1.x']);
     eq('close itself fixes exactly these three reasons; every other reason blocks', FIXED_BY_CLOSE, ['process', 'port', 'tabs']);
@@ -1756,6 +1785,14 @@ async function selftest() {
     const fake = { sessions: Array.from({ length: 9 }, (_, i) => ({ sessionId: sid(i), name: `s${i}`, pid: 500 + i, folder: 'f', ticket: { key: `TCK-${i}` }, verdict: i < 7 ? 'yes' : 'maybe', followUps: [] })) };
     const c = candidatesOf(fake, 500);
     eq('candidates: 6 ready (the Chief\'s own pid left out) in groups of 4 and 2; 2 maybe', [c.ready.length, c.groups.map((g) => g.length), c.maybe.length], [6, [4, 2], 2]);
+    // A session whose only reasons are what close fixes itself (a leftover server, its tab) is ready too; anything else keeps it out.
+    const fx = (over) => ({ sessionId: sid(20), name: 'fx', pid: 620, folder: 'f', state: 'idle', ticket: { key: 'TCK-20', status: 'shipped' }, verdict: 'no', followUps: [], answer: { verdict: 'yes' }, reasons: [{ code: 'process', fixer: 'chief', text: 'a process runs from f: pid 9 node server.js' }, { code: 'tabs', fixer: 'chief', text: 'it has 1 Chrome tab open: tab 7 (done)', tabIds: [7] }], ...over });
+    const fxReady = (over) => candidatesOf({ sessions: [fx(over)] }, 1).ready.map((x) => [x.name, x.closeFixes.length]);
+    eq('candidates: closeFixes names what close will fix, as the reasons\' texts', candidatesOf({ sessions: [fx({})] }, 1).ready[0].closeFixes, ['a process runs from f: pid 9 node server.js', 'it has 1 Chrome tab open: tab 7 (done)']);
+    eq('candidates: only what close fixes (process, tabs) → ready, with what close will fix; plus an open ticket, a busy state, a missing answer, its own non-local tab or no ticket → not ready; the Chief\'s own → not ready', [
+      fxReady({}), fxReady({ reasons: [...fx({}).reasons, { code: 'ticket-open', fixer: 'owner', text: 'x' }] }), fxReady({ state: 'busy' }), fxReady({ reasons: [{ code: 'answer-missing', fixer: 'chief', text: 'x' }] }),
+      fxReady({ reasons: [{ code: 'tabs', fixer: 'session', text: 'x', nonLocal: 1 }] }), fxReady({ ticket: null }), candidatesOf({ sessions: [fx({})] }, 620).ready.length,
+    ], [[['fx', 2]], [], [], [], [], [], 0]);
 
     // The transcript reader on its own.
     const t = readTranscript([
@@ -1852,7 +1889,7 @@ async function main(argv) {
       const c = candidatesOf(r, self);
       c.selfPid = self || null;
       if (args.proveReadOnly) c.readOnly = { effects };
-      console.log(args.json ? JSON.stringify(c, null, 2) : [`Ready to close: ${c.ready.length}`, ...c.ready.map((s) => `  ${s.name || s.sessionId.slice(0, 8)} ${s.ticket || ''} (${s.folder})`), `Maybe (no ticket): ${c.maybe.length}`, ...c.maybe.map((s) => `  ${s.name || s.sessionId.slice(0, 8)} (${s.folder})`)].join('\n') + proof());
+      console.log(args.json ? JSON.stringify(c, null, 2) : [`Ready to close: ${c.ready.length}`, ...c.ready.map((s) => `  ${s.name || s.sessionId.slice(0, 8)} ${s.ticket || ''} (${s.folder})${s.closeFixes.length ? `; close will fix: ${s.closeFixes.join('; ')}` : ''}`), `Maybe (no ticket): ${c.maybe.length}`, ...c.maybe.map((s) => `  ${s.name || s.sessionId.slice(0, 8)} (${s.folder})`)].join('\n') + proof());
       return effects.length ? 3 : 0;
     }
     if (args.cmd === 'ask' || args.cmd === 'close') {
