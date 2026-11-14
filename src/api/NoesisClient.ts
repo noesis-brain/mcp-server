@@ -1418,6 +1418,46 @@ export class NoesisClient {
   }
 
   // ============================================
+  // LIVE CHAT REVIEW (TCK-1908)
+  // ============================================
+  // The user's recorded Live conversations, for the live_chat_* tools (/api/mcp/live-voice).
+  // requestWithCode keeps the server's error_code (NOT_FOUND, VALIDATION) in the thrown message.
+
+  async listLiveChats(opts: { limit?: number; offset?: number; unreadOnly?: boolean } = {}): Promise<LiveChatList> {
+    const q = new URLSearchParams();
+    if (opts.limit !== undefined) q.set('limit', String(opts.limit));
+    if (opts.offset !== undefined) q.set('offset', String(opts.offset));
+    q.set('unread', opts.unreadOnly ? 'only' : 'all');
+    return this.requestWithCode<LiveChatList>('GET', `/api/mcp/live-voice/conversations?${q}`);
+  }
+
+  async getLiveChat(id: number, opts: { afterSeq?: number; limit?: number } = {}): Promise<LiveChatPage> {
+    const q = new URLSearchParams();
+    if (opts.afterSeq !== undefined) q.set('after_seq', String(opts.afterSeq));
+    if (opts.limit !== undefined) q.set('limit', String(opts.limit));
+    const qs = q.toString();
+    return this.requestWithCode<LiveChatPage>('GET', `/api/mcp/live-voice/conversations/${id}${qs ? `?${qs}` : ''}`);
+  }
+
+  /** Mark conversations read (with each one's `seen` mark, when known) or unread. All or nothing. */
+  async markLiveChats(read: boolean, conversations: Array<{ id: number; seen?: string }>): Promise<{ updated: number }> {
+    return this.requestWithCode('POST', '/api/mcp/live-voice/conversations/read', { read, conversations });
+  }
+
+  /** Delete a conversation's turns; its row stays, so usage metering keeps working. */
+  async deleteLiveChat(id: number): Promise<{ deleted_turns: number }> {
+    return this.requestWithCode('DELETE', `/api/mcp/live-voice/conversations/${id}`);
+  }
+
+  async getLiveChatRecording(): Promise<{ on: boolean }> {
+    return this.requestWithCode('GET', '/api/mcp/live-voice/recording');
+  }
+
+  async setLiveChatRecording(on: boolean): Promise<{ on: boolean }> {
+    return this.requestWithCode('PUT', '/api/mcp/live-voice/recording', { on });
+  }
+
+  // ============================================
   // SMART LINKS (TCK-1883)
   // ============================================
 
@@ -1766,6 +1806,53 @@ export class NoesisClient {
 }
 
 // ── Smart links (TCK-1883) — the server's shapes, as these tools use them ──────────────────
+
+/** A recorded Live conversation as the review list shows it (TCK-1908, GET /api/mcp/live-voice/conversations). */
+export interface LiveChatEntry {
+  id: number;
+  started_at: string;
+  ended_at: string | null;
+  end_reason: string | null;
+  duration_seconds: number;
+  turn_count: number;
+  unread: boolean;
+  in_progress: boolean;
+  reviewed_at: string | null;
+  /** The last save time, exact to the µs: pass it back to mark-read so later turns stay unread. */
+  seen: string | null;
+  places: Array<{ page: string; note_id?: number; title?: string | null }>;
+  signals: {
+    tool_errors: number;
+    empty_searches: number;
+    cut_off_replies: number;
+    no_answer: number;
+    reconnects: number;
+    slow_first_words: number;
+    error_end: boolean;
+    tickets_added: number;
+  };
+}
+
+export interface LiveChatList {
+  conversations: LiveChatEntry[];
+  total: number;
+  unread_total: number;
+}
+
+export interface LiveChatTurn {
+  seq: number;
+  at: string;
+  kind: 'user' | 'live' | 'tool' | 'page' | 'event' | string;
+  text: string;
+  data: Record<string, unknown> | null;
+  note_title?: string | null;
+}
+
+export interface LiveChatPage {
+  conversation: LiveChatEntry;
+  turns: LiveChatTurn[];
+  next_after_seq: number | null;
+}
 
 export interface SmartLinkTypeInput {
   id: string;

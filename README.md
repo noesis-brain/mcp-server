@@ -299,6 +299,16 @@ Readable link text for pasted URLs and typed keys (Jira issues, GitHub pull requ
 - `smart_links_preview_note` — what "Make smart links in this note" would change, read-only
 - `smart_links_set_settings` — save the whole settings object; the answer holds the previous one for a rollback
 
+### Live Chat review
+
+Read the user's recorded Live conversations to find what went wrong, then keep track of what was reviewed. Live records only the text (never the audio), and only while the user's recording switch is on:
+
+- `live_chat_list` — conversations, unread first: pages and notes visited, and problem signals (tool errors, searches that found nothing, replies cut off, no answer, reconnects, slow first words, an error ending, tickets added)
+- `live_chat_get` — one conversation's turns in order, in pages
+- `live_chat_mark_read` — mark conversations read (pass each one's `seen` mark, so turns saved while you read stay unread) or unread
+- `live_chat_delete` — delete one conversation's turns, only when the user asks; its usage row stays
+- `live_chat_recording` — read or set the "Keep a record of my Live conversations" switch
+
 ### Chat + history
 
 - `analyze_knowledge_base` — generate a summary report of your note collection

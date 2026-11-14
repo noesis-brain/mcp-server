@@ -19,6 +19,7 @@ import { buildIndex, matchSessions } from './sessionIndex.js';
 import { registerNaviTools } from './navis.js';
 import { registerSkillTools } from './skills.js';
 import { registerSmartLinkTools } from './smartLinks.js';
+import { registerLiveChatTools } from './liveChat.js';
 import { registerBacklogTools } from './backlog.js';
 import { registerCoordTools } from './coord.js';
 import { registerExamTools } from './exam.js';
@@ -257,6 +258,7 @@ export function registerTools(server: McpServer, services: ToolServices): void {
   registerBacklogTools(server, client);
   registerCoordTools(server, client);
   registerSmartLinkTools(server, client);
+  registerLiveChatTools(server, client);
   registerExamTools(server, client);
 
   // Register search_notes tool
