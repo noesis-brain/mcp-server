@@ -442,6 +442,7 @@ function selftest() {
   eq('rules C20: a new orphan joins: a new cleanup and close-tabs for the new set', more.map((a) => a.key), ['C20|chrome-tabs||cleanup:5,9,11', 'C20|chrome-tabs||close-tabs:5,9,11']);
   const many = rulesFor({ conflicts: [{ ...c20[5], evidence: { tabs: [], sureOrphans: Array.from({ length: 300 }, (_, i) => 11586000 + i) } }] });
   eq('rules C20: 300 sure orphans with 8-digit ids: the choice names 8 and stays within the 500 characters the server takes; close-tabs keeps every id', [many[0].choice.length <= 500, many[0].choice, many[1].ids.length], [true, 'Close 300 sure-orphan Chrome tabs (11586000,11586001,11586002,11586003,11586004,11586005,11586006,11586007 and 292 more)', 300]);
+  eq('rules C20: a tabs row of a check that could not read the tabs gives no action', rulesFor({ conflicts: [{ ...c20[5], evidence: { unreadable: true, tabs: [], sureOrphans: [], more: 0 } }] }).length, 0);
   eq('rules C20: no sure orphan, no tab action', rulesFor({ conflicts: [{ ...c20[5], evidence: { ...c20[5].evidence, sureOrphans: [] } }] }).length, 0);
   eq('rules C20: C20 rows never count toward the ship lane (a stored row naming a ticket included)', laneCard([shipScan.conflicts[0], ...[1, 2, 3].map((n) => ({ kind: 'C20', severity: 'low', a: 'TCK-9', b: '', detail: `x${n}`, evidence: {} }))]).card.options[0].label, 'Ship TCK-9 first, then TCK-10');
   console.log(failed ? `${failed} FAILED` : 'all passed');

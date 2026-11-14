@@ -16,7 +16,8 @@
 // C20 (can a session close?) comes from the close check the Chief saved with
 // `coord-close.mjs check --all --save` (--close-check, default ~/.claude/coord/close-check.json): one
 // low row per session (a = its session id) and one for the loop tabs no session owns
-// (a = chrome-tabs). Only that local file is read, so the Chief's pass and the watcher's scan post
+// (a = chrome-tabs), posted on every check: an empty list when every loop tab has an owner, and
+// `unreadable` when the check could not read Chrome's tabs. Only that local file is read, so the Chief's pass and the watcher's scan post
 // the same rows. A check older than CLOSE_CHECK_MAX_MIN gives no rows. Only loop tabs are listed;
 // every other tab is a count, so no other tab's title or URL leaves this computer.
 //
@@ -337,19 +338,21 @@ export function closeRows(saved, now = Date.now()) {
       },
     });
   }
-  // The loop tabs no checked session owns (a session's own tabs are a reason in its row).
+  // The loop tabs no checked session owns (a session's own tabs are a reason in its row). The row is posted on
+  // every check, so the Chief view can tell "no check yet" from "no tab left" and from "could not read the tabs".
   const tabs = saved.tabs && Array.isArray(saved.tabs.loop) ? saved.tabs : null;
-  if (tabs) {
+  if (!tabs) {
+    rows.push({ kind: 'C20', severity: 'low', a: 'chrome-tabs', b: '', detail: 'the close check could not read the Chrome tabs: none is listed, and none is closed', evidence: { unreadable: true, tabs: [], more: 0, sureOrphans: [], otherLocal: 0, nonLocal: 0, checkedAt } });
+  } else {
     const unowned = new Set(Array.isArray(tabs.unowned) ? tabs.unowned : []);
     const list = tabs.loop.filter((t) => t && Number.isSafeInteger(t.id) && unowned.has(t.id)).sort((x, y) => x.id - y.id);
-    if (list.length) {
-      const orphans = list.filter((t) => t.sureOrphan === true && t.active !== true).map((t) => t.id);
-      const shown = list.slice(0, TABS_MAX).map((t) => ({ id: t.id, ticket: cleanKey(t.ticket), status: t.status ? clean(t.status, 30) : null, label: clean(t.label, 30), sureOrphan: t.sureOrphan === true && t.active !== true, place: tabPlace(t.url), title: clean(t.title, 40) }));
-      const evidence = { tabs: shown, more: list.length - shown.length, sureOrphans: orphans.slice(0, 100), otherLocal: Number.isSafeInteger(tabs.otherLocal) ? tabs.otherLocal : 0, nonLocal: Number.isSafeInteger(tabs.nonLocal) ? tabs.nonLocal : 0, checkedAt };
-      // Stay inside the server's limits: drop listed tabs from the end (they are still counted in more).
-      while (evidence.tabs.length && (JSON.stringify(evidence).length > EVIDENCE_LIMITS.chars - 200 || evidenceSize(evidence).nodes > EVIDENCE_LIMITS.nodes - 20)) { evidence.tabs.pop(); evidence.more++; }
-      rows.push({ kind: 'C20', severity: 'low', a: 'chrome-tabs', b: '', detail: clean(`${list.length} loop tab${list.length === 1 ? '' : 's'} in Chrome that no session owns, ${orphans.length} of them sure orphans; other tabs: ${evidence.otherLocal} local, ${evidence.nonLocal} not local (not listed)`, 400), evidence });
-    }
+    const orphans = list.filter((t) => t.sureOrphan === true && t.active !== true).map((t) => t.id);
+    const shown = list.slice(0, TABS_MAX).map((t) => ({ id: t.id, ticket: cleanKey(t.ticket), status: t.status ? clean(t.status, 30) : null, label: clean(t.label, 30), sureOrphan: t.sureOrphan === true && t.active !== true, place: tabPlace(t.url), title: clean(t.title, 40) }));
+    const evidence = { tabs: shown, more: list.length - shown.length, sureOrphans: orphans.slice(0, 100), otherLocal: Number.isSafeInteger(tabs.otherLocal) ? tabs.otherLocal : 0, nonLocal: Number.isSafeInteger(tabs.nonLocal) ? tabs.nonLocal : 0, checkedAt };
+    // Stay inside the server's limits: drop listed tabs from the end (they are still counted in more).
+    while (evidence.tabs.length && (JSON.stringify(evidence).length > EVIDENCE_LIMITS.chars - 200 || evidenceSize(evidence).nodes > EVIDENCE_LIMITS.nodes - 20)) { evidence.tabs.pop(); evidence.more++; }
+    const what = list.length ? `${list.length} loop tab${list.length === 1 ? '' : 's'} in Chrome that no session owns, ${orphans.length} of them sure orphans` : 'no loop tab in Chrome is left without a session';
+    rows.push({ kind: 'C20', severity: 'low', a: 'chrome-tabs', b: '', detail: clean(`${what}; other tabs: ${evidence.otherLocal} local, ${evidence.nonLocal} not local (not listed)`, 400), evidence });
   }
   return rows;
 }
@@ -923,7 +926,11 @@ function selftest() {
     const tabRow = row('chrome-tabs');
     eq('C20: the tabs row lists only the loop tabs no session owns (tab 7 is alpha\'s), a sure orphan only when not active, and counts the other tabs', [tabRow.evidence.tabs.map((t) => [t.id, t.label, t.sureOrphan, t.place]), tabRow.evidence.sureOrphans, tabRow.evidence.otherLocal, tabRow.evidence.nonLocal, tabRow.evidence.more], [[[8, 'done', false, 'tck-8.localhost:3708'], [9, 'done', true, 'tck-9.localhost:3709']], [9], 2, 5, 0]);
     eq('C20: no tab query and no owned tab\'s address leave this computer', /secret|notes\/5/.test(JSON.stringify(rows20)), false);
-    eq('C20: no tab is listed when every loop tab has an owner, and none when the tabs could not be read', [closeRows({ ...saved, tabs: { ...saved.tabs, unowned: [] } }, NOW20).some((r) => r.a === 'chrome-tabs'), closeRows({ ...saved, tabs: null }, NOW20).some((r) => r.a === 'chrome-tabs')], [false, false]);
+    {
+      const none = closeRows({ ...saved, tabs: { ...saved.tabs, unowned: [] } }, NOW20).find((r) => r.a === 'chrome-tabs');
+      const unread = closeRows({ ...saved, tabs: null }, NOW20).find((r) => r.a === 'chrome-tabs');
+      eq('C20: the tabs row is posted on every check: an empty list when every loop tab has an owner, and unreadable when the tabs could not be read', [none?.evidence.tabs, none?.evidence.sureOrphans, none?.evidence.unreadable, none?.evidence.otherLocal, none?.detail, unread?.evidence.unreadable, unread?.evidence.tabs, unread?.evidence.sureOrphans, unread?.evidence.checkedAt, unread?.severity], [[], [], undefined, 2, 'no loop tab in Chrome is left without a session; other tabs: 2 local, 5 not local (not listed)', true, [], [], saved.checkedAt, 'low']);
+    }
     eq(`C20: a check older than ${CLOSE_CHECK_MAX_MIN} min, one from the future, no check or a malformed one gives no rows`, [closeRows(saved, NOW20 + (CLOSE_CHECK_MAX_MIN - 11) * 60_000).length, closeRows(saved, NOW20 + (CLOSE_CHECK_MAX_MIN - 9) * 60_000).length, closeRows(saved, NOW20 - 16 * 60_000).length, closeRows(null, NOW20).length, closeRows({ sessions: 'x', checkedAt: saved.checkedAt }, NOW20).length, closeRows({ ...saved, checkedAt: 'soon' }, NOW20).length], [5, 0, 0, 0, 0, 0]);
     eq('C20: a check is shown for exactly 120 minutes: 119 gives rows, 121 gives none', [CLOSE_CHECK_MAX_MIN, closeRows({ ...saved, checkedAt: new Date(NOW20 - 119 * 60_000).toISOString() }, NOW20).length, closeRows({ ...saved, checkedAt: new Date(NOW20 - 121 * 60_000).toISOString() }, NOW20).length], [120, 5, 0]);
     {
@@ -981,7 +988,7 @@ function selftest() {
       const r = spawnSync(process.execPath, [fileURLToPath(import.meta.url), '--board', boardFile, '--repo', repo, '--agents', path.join(root, 'no-agents.json'), '--npm-latest', '2.12.0', '--json', ...extra], { encoding: 'utf8', env: { ...process.env, CLAUDE_CONFIG_DIR: cfg20 }, timeout: 120_000 });
       try { return JSON.parse(r.stdout).conflicts.filter((c) => c.kind === 'C20').map((c) => c.a); } catch { return `exit ${r.status}: ${r.stderr.slice(0, 200)}`; }
     };
-    eq('C20 CLI: the default ~/.claude/coord/close-check.json, or the file --close-check names', [cli(), cli('--close-check', other), cli('--close-check', path.join(root, 'missing.json'))], [[sidN(3), sidN(1), sidN(4), sidN(2), 'chrome-tabs'], [sidN(2)], []]);
+    eq('C20 CLI: the default ~/.claude/coord/close-check.json, or the file --close-check names', [cli(), cli('--close-check', other), cli('--close-check', path.join(root, 'missing.json'))], [[sidN(3), sidN(1), sidN(4), sidN(2), 'chrome-tabs'], [sidN(2), 'chrome-tabs'], []]);
     const watchSrc = fs.readFileSync(path.join(path.dirname(fileURLToPath(import.meta.url)), 'coord-watch.mjs'), 'utf8');
     eq('C20: the watcher runs this scan without --close-check, so it reads the same default file as the Chief', [watchSrc.includes("[path.join(HERE, 'coord-scan.mjs'), '--board', boardFile, '--repo', args.repo, '--json']"), watchSrc.includes('close-check')], [true, false]);
   } finally {
