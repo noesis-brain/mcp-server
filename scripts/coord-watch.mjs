@@ -18,6 +18,9 @@
 //   permission prompt (`waiting`), or while it works, the wake waits: typing there could answer a
 //   dialog. A change that could not wake the Chief stays pending until it can;
 // - it exits within 10 s of the Chief's process ending, so a new Chief can start its own watcher.
+// - TCK-1926: on every tick it also reads the questions and plan approvals that ticket sessions hold. A new one on
+//   the Chief's route wakes the Chief, as a changed scan does; one for the owner alone does not. The first read only
+//   sets the baseline, because the Chief has just made its own pass.
 //
 // It runs in its own iTerm2 tab, because macOS lets only a terminal-attached process drive iTerm2
 // (measured for the loop watchdog, 2026-08-22). --start opens that tab and goes back to the tab you
@@ -134,11 +137,43 @@ export async function pausedNow(deps, pid) {
   }
 }
 
-/** One 10-second tick: a scan on every `every`-th tick, then a wake when one is pending and the owner has not paused. */
+/**
+ * The questions and plans that wait for the Chief (TCK-1926): `state.requests` holds the open ids on its route. A new
+ * id makes the wake pending. A failed read changes nothing; the first read only sets the baseline.
+ */
+export async function checkRequests(deps, state) {
+  if (!deps.openRequests) return null;
+  let list;
+  try {
+    list = await deps.openRequests();
+  } catch {
+    return null;
+  }
+  if (!Array.isArray(list)) return null;
+  const ids = list.filter((r) => r && r.route === 'chief' && r.status === 'open' && Number.isInteger(r.id)).map((r) => r.id);
+  const known = state.requests;
+  state.requests = ids;
+  if (!Array.isArray(known)) return null;
+  const fresh = ids.filter((id) => !known.includes(id));
+  if (!fresh.length) return null;
+  state.pending = true;
+  return { fresh };
+}
+
+/** The open requests as the server lists them; anything but a list (a reply without `requests`) changes nothing. */
+export const REQUESTS_PATH = '/api/mcp/coordination/requests';
+export const requestsReader = (call) => async () => {
+  const r = await call('GET', REQUESTS_PATH);
+  return r ? r.requests : undefined;
+};
+
+/** One 10-second tick: a scan on every `every`-th tick and a read of the requests, then a wake when one is pending and the owner has not paused. */
 export async function tick(deps, state, pid, every) {
   const out = {};
   if (state.ticks % every === 0) out.scan = await step(deps, state);
   state.ticks++;
+  const asked = await checkRequests(deps, state);
+  if (asked) out.requests = asked;
   if (state.pending) {
     // While paused, the change stays pending and the Chief is woken after "Continue all".
     const w = deps.alive(pid) && (await pausedNow(deps, pid)) ? { woke: 0, reason: 'the owner paused the sessions' } : wakeChief(pid, WAKE_LINE, deps);
@@ -326,6 +361,8 @@ async function realDeps(args, cfg) {
       const r = await call('GET', `/api/mcp/coordination/inbox?session=${encodeURIComponent(session)}&limit=1`);
       return !!(r && r.pause && r.pause.paused);
     },
+    // TCK-1926: the open questions and plans; the watcher keeps only those on the Chief's route.
+    openRequests: requestsReader(call),
     alive,
     statusOf: agentsStatus,
     ttyOf,
@@ -407,6 +444,7 @@ async function main(argv) {
     if (s && s.error) console.log(`${stamp()} scan failed, kept the old baseline: ${s.error}`);
     else if (s && s.baseline) console.log(`${stamp()} baseline: ${s.size} line(s)`);
     else if (s && s.changed) console.log(`${stamp()} changed: +${s.added.length} -${s.gone.length}; posted ${s.posted}`);
+    if (r.requests) console.log(`${stamp()} ${r.requests.fresh.length} new question(s) or plan(s) for the Chief`);
     if (r.wake && r.wake.gone) return console.log(`${stamp()} the Chief (pid ${args.chiefPid}) has ended; stopping`);
     if (r.wake && r.wake.woke > 0) console.log(`${stamp()} woke the Chief`);
     else if (r.wake && r.wake.reason && s && s.changed) console.log(`${stamp()} wake waits: ${r.wake.reason}`);
@@ -519,6 +557,43 @@ async function selftest() {
   paused = true;
   eq('pause: a Chief that has ended is gone, paused or not', (await tick({ ...pausing, alive: () => false }, { last: [], pending: true, ticks: 1 }, 42, 3)).wake, { gone: true });
   eq('pause: no reader at all wakes as before', [await pausedNow({}, 42), await pausedNow({ paused: async () => true }, 42)], [false, true]);
+  // The questions and plans that wait for the Chief (TCK-1926): a new one wakes it, as a changed scan does.
+  // 1000 ticks per scan: these ticks read the requests only.
+  calls.length = 0;
+  let open = [{ id: 5, route: 'chief', status: 'open' }, { id: 6, route: 'owner', status: 'open' }];
+  const asking = { ...deps, alive: () => true, statusOf: () => 'idle', ttyOf: () => '/dev/ttys012', count: () => 1, openRequests: async () => open };
+  const rs = { last: [], pending: false, ticks: 1 };
+  eq('requests: the first read is the baseline, no wake', [await tick(asking, rs, 42, 1000), rs.requests, rs.pending], [{}, [5], false]);
+  open = [{ id: 5, route: 'chief', status: 'open' }, { id: 7, route: 'chief', status: 'open' }, { id: 6, route: 'owner', status: 'open' }, { id: 8, route: 'chief', status: 'answered' }];
+  eq('requests: a new one on the Chief\'s route wakes it; the owner\'s and an answered one do not count', [await tick(asking, rs, 42, 1000), rs.pending, only('type')], [{ requests: { fresh: [7] }, wake: { woke: 1 } }, false, ['type /dev/ttys012 /noesis-chief watch']]);
+  eq('requests: the same ones again: no second wake', await tick(asking, rs, 42, 1000), {});
+  open = [{ id: 7, route: 'chief', status: 'open' }, { id: 9, route: 'owner', status: 'open' }];
+  eq('requests: one answered, one for the owner alone: nothing new', [await tick(asking, rs, 42, 1000), rs.requests], [{}, [7]]);
+  eq('requests: a failed read or a list that is not a list changes nothing',
+    [await tick({ ...asking, openRequests: async () => { throw new Error('HTTP 503'); } }, rs, 42, 1000), await tick({ ...asking, openRequests: async () => ({}) }, rs, 42, 1000), rs.requests],
+    [{}, {}, [7]]);
+  open = [{ id: 7, route: 'chief', status: 'open' }, { id: 10, route: 'chief', status: 'open' }];
+  const pausedAsk = { ...asking, paused: async () => true };
+  eq('requests: while paused, a new one waits for "Continue all"', [await tick(pausedAsk, rs, 42, 1000), rs.pending], [{ requests: { fresh: [10] }, wake: { woke: 0, reason: 'the owner paused the sessions' } }, true]);
+  eq('requests: after "Continue all" the held one wakes the Chief once', [await tick(asking, rs, 42, 1000), rs.pending], [{ wake: { woke: 1 } }, false]);
+  // The open set changes without growing (7 answered, 12 asked between two reads): 12 is new, and wakes the Chief.
+  const swap = { last: [], pending: false, ticks: 1, requests: [7] };
+  open = [{ id: 12, route: 'chief', status: 'open' }];
+  eq('requests: one answered and one new between two reads: the new one wakes the Chief', [await tick(asking, swap, 42, 1000), swap.requests], [{ requests: { fresh: [12] }, wake: { woke: 1 } }, [12]]);
+  // A first read that fails sets no baseline: the next good read is the baseline, and wakes nothing.
+  const late = { last: [], pending: false, ticks: 1 };
+  calls.length = 0;
+  eq('requests: a failed first read, then a good one: the good one is the baseline, nothing typed',
+    [await tick({ ...asking, openRequests: async () => { throw new Error('HTTP 503'); } }, late, 42, 1000), late.requests, await tick({ ...asking, openRequests: async () => [{ id: 20, route: 'chief', status: 'open' }] }, late, 42, 1000), late.requests, only('type')],
+    [{}, undefined, {}, [20], []]);
+  const asked2 = [];
+  const reader = requestsReader(async (method, p) => (asked2.push(`${method} ${p}`), { requests: [{ id: 3 }] }));
+  eq('requests: the reader asks the Chief\'s MCP route and returns its list', [await reader(), asked2], [[{ id: 3 }], ['GET /api/mcp/coordination/requests']]);
+  eq('requests: a reply without the list is no list (it changes nothing)', await requestsReader(async () => ({}))(), undefined);
+  // The needle is built from two parts, so this line itself never matches it: only realDeps' line can.
+  eq('requests: the real watcher uses this reader', fs.readFileSync(fileURLToPath(import.meta.url), 'utf8').includes(['    openRequests', ': requestsReader(call),'].join('')), true);
+  eq('requests: no reader (an older server): no requests key', await tick({ ...asking, openRequests: undefined }, { last: [], pending: false, ticks: 1 }, 42, 1000), {});
+  calls.length = 0;
   eq('session id: the row with this pid, else null',
     [sessionIdIn([{ pid: 7, sessionId: 'a' }, { pid: 42, sessionId: 'b' }], 42), sessionIdIn([{ pid: 42 }], 42), sessionIdIn([{ pid: 42, sessionId: '' }], 42), sessionIdIn('x', 42), sessionIdIn([{ pid: 9, sessionId: 'c' }], 42)],
     ['b', null, null, null, null]);

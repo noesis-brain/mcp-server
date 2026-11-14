@@ -28,6 +28,8 @@ conflicts, the leases, the decisions, the thresholds and Up next.
 | Send rule messages with `coord_message`, without asking | Stop a process or a session (`stop-session` is an owner gate) |
 | Hand out MCP versions and ports (`coord_allocate_mcp_version`, `coord_port`) | Answer an owner gate (the server refuses it with `OWNER_GATE`) |
 | Record judgment calls, picks and owner-gate cards with `coord_decide` (`as_chief: true`) | Carry out an answered card: the session that owns the ticket does it |
+| Answer a ticket session's question or plan approval on your route (`coord_answer_request`, step 3b) | Answer one for the owner alone, send a plan back, type an answer, or answer a tool permission prompt |
+| Pull the main checkout after a ship, fast-forward only (step 3c) | Pull when a tracked file there is modified, or anything but a fast-forward |
 
 A Chief message to a session is coordination, never scope. It says one thing to do (rename a
 file, wait for the test-db lease, rebase after a ship, run `/mcp`), and why.
@@ -74,8 +76,13 @@ Work files for one pass go in `~/.claude/coord/`. They are scratch: the record i
 ### 0. Paused?
 
 Read `coord_inbox` first. When `pause.paused` is true, the owner pressed "Pause all" on the Chief view, and that
-pauses you too. Report `coord_heartbeat` with `state: "paused"`, do nothing else in this pass, and in watch mode end
-the turn with `ScheduleWakeup` (1800 seconds). Go on only when a later read says the pause has ended ("Continue all").
+pauses you too. Report `coord_heartbeat` with `state: "paused"` and `role: "chief"`, do nothing else in this pass, and
+in watch mode end the turn with `ScheduleWakeup` (1800 seconds). Go on only when a later read says the pause has ended
+("Continue all").
+
+Otherwise report `coord_heartbeat` with `state: "running"` and `role: "chief"`. The role is what lets you answer the
+questions and plans of step 3b: the server refuses an answer from a session that did not report it (`NOT_CHIEF`). The
+Chief view says "No Chief of Staff is running" when no Chief reported in for 10 minutes.
 
 ### 1. The board
 
@@ -133,6 +140,61 @@ noesis_test at the same time." Add the key `C9|lease|<date>` to `done.json`.
 A message for a session on another machine still goes through `coord_message`: its inbox reaches
 it there. Never send a message other than the actions' messages and the C9 message.
 
+### 3b. Questions and plans that wait (TCK-1926)
+
+A ticket session's question (AskUserQuestion) or plan approval (ExitPlanMode) waits for you or the owner: its hook
+holds it with no dialog, and the owner may answer it first on the Chief view. Call `coord_requests`. For each request
+with `route: "chief"`, the oldest first:
+
+1. Read the ticket with `mcp__noesis__backlog_get` (`images: false`): its refined text, its team lead gut and its
+   recent messages. Read the request's `tail` (the end of the session's conversation) and, for a plan, its `plan`.
+2. **A question.** Pick the option that the ticket's own words and the conversation support, and call
+   `coord_answer_request` with `picks` (one `{labels}` per question, in order) and a one-line `reason` that names
+   the words you relied on. When no option is supported, or the question asks for new scope, leave it: it stays on
+   the Chief view for the owner. Name it under Needs you in the report.
+3. **A plan.** Approve it (`plan: "approve"`) when it builds only what the ticket's refined text asks, keeps to its
+   NOT-do, and names how each part is checked. Otherwise call `plan: "to_owner"` with a `note` that names the part the
+   owner must decide. You never send a plan back: only the owner does.
+4. Never answer a request with `route: "owner"` (a Ship question, an owner gate, a plan the owner sent back): the
+   server refuses it (`OWNER_GATE`). Tool permission prompts are never requests: they stay with the owner.
+5. Each answer is recorded as a judgment call (category `question` or `plan`) under "Judgment calls to review". In
+   `observe` mode the owner reviews it; in `off` mode no request reaches you (the owner answers in the terminal). A
+   `NOT_OPEN` answer means the owner or the session got there first: go on.
+
+### 3c. After a ship: pull the main checkout (TCK-1926)
+
+When a ship has moved `origin/main`, pull the main checkout yourself, and leave the record for the owner's review
+instead of asking:
+
+```bash
+git -C <repo> fetch -q origin main
+git -C <repo> rev-parse --abbrev-ref HEAD            # must be main
+git -C <repo> rev-list --count HEAD..origin/main     # > 0: the checkout is behind
+git -C <repo> merge-base --is-ancestor HEAD origin/main # exit 0: a fast-forward is possible
+git -C <repo> status --porcelain --untracked-files=no # must be empty (the MCP submodule counts)
+git -C <repo> pull --ff-only --recurse-submodules -q origin main
+```
+
+- Pull only when the checkout is on `main`, behind `origin/main`, a fast-forward is possible, and no tracked file is
+  modified (a session may be working there). Untracked files do not block the pull. `--recurse-submodules` also
+  checks out the MCP package (`md-manager-mcp-server`) at the commit main records: a plain pull would move only the
+  pointer, and the submodule would then show as modified and block every later pull. When a fast-forward is not
+  possible, pull nothing, and record why (below).
+- Record the pull with `coord_decide` just before you pull (after the checks above): `category: "other"`, `choice`
+  "Pulled the main checkout to <short sha of origin/main> after the ship of TCK-<n>", `reason` with the old and the
+  new commit, `evidence` = the shipped tickets and the new sha, `undo` "git -C <repo> reset --keep <old sha> && git -C <repo> submodule update", a
+  rubric with `reversible: true, shared: true, userVisible: false, touches: [], confidence: "high", evidence:
+  "measured"`, and `as_chief: true`. The answer `proceed` or `review` means: pull now. It goes to the owner's review
+  list. When the pull itself then fails, record that the same way.
+- A skipped pull (modified files, another branch, not a fast-forward) is recorded the same way, with the choice "Left
+  the main checkout at <short sha>: <why>", so the owner sees why it did not move.
+- When `CARD_REQUIRED` comes back, the owner's policy keeps this call for the owner: do not pull, and send the card
+  (step 4).
+- Any other action you take that the owner should know about is recorded the same way (`coord_decide`, `category:
+  "other"`, `as_chief: true`), for the owner's review, instead of a question. Owner gates still wait for the owner.
+- When the pull changed the MCP package's files (main moved the submodule), the scan's C8 line follows on the next
+  pass: build the MCP package there as that rule says, then tell the sessions with old tools to run `/mcp`.
+
 ### 4. Check each card before it is sent
 
 1. Write the card text to `~/.claude/coord/cards/<date>-<slug>.md` in the format of `decision-card.md`, using only facts from this pass.
@@ -174,8 +236,8 @@ Write the report in plain sentences (`~/.claude/references/note-style-guide.md` 
 Sentences). Put what needs the owner first. A section with nothing in it is left out.
 
 1. **Needs you.** The owner-only steps found first (an npm login, a key, a production SQL yes), how many cards wait, the `Decide:` line of each, and the link to the Chief view.
-2. **Waiting for you now.** The C17 sessions that are at a question or a permission prompt, with the ticket and how long they have waited.
-3. **What I did.** One line per message sent and per version handed out, with the rule.
+2. **Waiting for you now.** The C17 sessions that are at a question or a permission prompt, with the ticket and how long they have waited, and the questions and plans of step 3b that you left for the owner.
+3. **What I did.** One line per message sent, per version handed out, per question or plan answered and per pull of the main checkout, with the rule.
 4. **For your review.** How many judgment calls wait in the review list.
 5. **Ship order.** The tickets at Ready to merge in the order you recommend, who holds the ship lease (`coord_leases`), and which ship waits for which.
 6. **Up next.** The pick, its reason, and whether it starts now in parallel or after a named ticket ships.
@@ -197,15 +259,16 @@ node $S/coord-watch.mjs --start --chief-pid $PPID --repo <repo>
 
 `$PPID` in the Bash tool is this session's Claude Code process. The watcher opens its own iTerm2
 tab, because macOS lets only a process with a terminal drive iTerm2, and goes back to this tab.
-Every 5 minutes it scans. When the result changes, it posts the scan and types
+Every 5 minutes it scans, and every 10 seconds it reads the questions and plans that wait. When the scan
+changes, or a new question or plan on your route arrives, it posts the scan and types
 `/noesis-chief watch` into this session, but only when this session is idle: never at a question
 or a permission prompt, and never while the owner has paused the sessions. It stops when this session ends, and it starts nothing while another
 watcher serves a live Chief. It has no model, so it costs no tokens. Also call
 `ScheduleWakeup` with 1800 seconds and the prompt `/noesis-chief watch`: that wake comes when
 nothing changes, or when the watcher is not running. On a wake:
-1. Run steps 0–3 again (`done.json` keeps the rules from repeating). Step 0 comes first: a paused wake only reports `paused` and waits.
+1. Run steps 0–3c again (`done.json` keeps the rules from repeating). Step 0 comes first: a paused wake only reports `paused` and waits.
 2. Compare the result with the last `scan.json`, by conflict kind and ticket pair.
-3. Report only the new and the resolved findings, and any new card.
+3. Report only the new and the resolved findings, any new card, the questions and plans you answered or left, and any pull.
 
 End each turn with this line:
 `⏳ STILL WORKING — Waiting on: the next Chief pass · started <HH:MM> · ETA up to 30 min → about <HH:MM> · next: scan again and report changes · nothing needed from you.`

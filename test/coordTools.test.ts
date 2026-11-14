@@ -664,7 +664,33 @@ describe('the /noesis-chief skill ships in this package (TCK-1890)', () => {
     expect(template).toContain('# /noesis-chief — the Chief of Staff, version 1');
     // TCK-1926: the owner's pause comes first on every pass and every wake; no pick while picks are off.
     expect(template).toContain('### 0. Paused?\n\nRead `coord_inbox` first. When `pause.paused` is true, the owner pressed "Pause all" on the Chief view, and that\npauses you too.');
-    expect(template).toContain('1. Run steps 0–3 again (`done.json` keeps the rules from repeating). Step 0 comes first: a paused wake only reports `paused` and waits.');
+    expect(template).toContain('1. Run steps 0–3c again (`done.json` keeps the rules from repeating). Step 0 comes first: a paused wake only reports `paused` and waits.');
+    // TCK-1926: the Chief reports its role, answers the questions and plans on its route, and pulls main after a ship.
+    expect(template).toContain('report `coord_heartbeat` with `state: "running"` and `role: "chief"`');
+    expect(template).toContain('Report `coord_heartbeat` with `state: "paused"` and `role: "chief"`');
+    const at = (h: string) => template.indexOf(h);
+    expect(at('### 3. The rules')).toBeLessThan(at('### 3b. Questions and plans that wait (TCK-1926)'));
+    expect(at('### 3b. Questions and plans that wait (TCK-1926)')).toBeLessThan(at('### 3c. After a ship: pull the main checkout (TCK-1926)'));
+    expect(at('### 3c. After a ship: pull the main checkout (TCK-1926)')).toBeLessThan(at('### 4. Check each card before it is sent'));
+    for (const rule of [
+      'For each request\nwith `route: "chief"`',
+      'You never send a plan back: only the owner does.',
+      'Never answer a request with `route: "owner"`',
+      'Tool permission prompts are never requests: they stay with the owner.',
+      'git -C <repo> status --porcelain --untracked-files=no # must be empty',
+      'git -C <repo> pull --ff-only --recurse-submodules -q origin main',
+      'git -C <repo> merge-base --is-ancestor HEAD origin/main # exit 0: a fast-forward is possible',
+      'Pull only when the checkout is on `main`, behind `origin/main`, a fast-forward is possible, and no tracked file is\n  modified',
+      'A skipped pull (modified files, another branch, not a fast-forward) is recorded the same way',
+      'When the pull itself then fails, record that the same way.',
+      'for the owner\'s review, instead of a question. Owner gates still wait for the owner.',
+      '`undo` "git -C <repo> reset --keep <old sha> && git -C <repo> submodule update"',
+      'When a fast-forward is not\n  possible, pull nothing, and record why (below).',
+      'Any other action you take that the owner should know about is recorded the same way',
+      'Record the pull with `coord_decide` just before you pull (after the checks above)',
+      'The answer `proceed` or `review` means: pull now.',
+      'When `CARD_REQUIRED` comes back, the owner\'s policy keeps this call for the owner: do not pull',
+    ]) expect(template, rule).toContain(rule);
     expect(template).toContain("When its mode is `off`, the owner has switched your picks off: skip\nthis step and record no pick. The server refuses one then (409 `PICKS_OFF`)");
     expect(template.indexOf('### 0. Paused?')).toBeLessThan(template.indexOf('### 1. The board'));
     expect(template).toContain('Answer an owner gate (the server refuses it with `OWNER_GATE`)');
