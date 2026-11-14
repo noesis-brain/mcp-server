@@ -3,7 +3,7 @@
 // The conditions and their rules are in references/chief-conflict-catalogue.md.
 //
 //   node coord-scan.mjs --board <tickets.json> [--repo <main checkout>] [--agents <agents.json>]
-//                       [--npm-latest <version>] [--plans <plans.json>] [--json]
+//                       [--npm-latest <version>] [--plans <plans.json>] [--close-check <file>] [--json]
 //   node coord-scan.mjs --selftest
 //
 // --board is the Jot board as `backlog_get` returns it ({"issues": [...]} or a plain array). The
@@ -12,6 +12,14 @@
 // `claude agents --json`, and --npm-latest replaces `npm view`, for tests. --plans maps ticket keys
 // to plan files ({"TCK-7": "/path/plan.md"}); without it, a planning ticket's plan is the newest
 // ~/.claude/plans/*.md its bound session's transcript names (C15).
+//
+// C20 (can a session close?) comes from the close check the Chief saved with
+// `coord-close.mjs check --all --save` (--close-check, default ~/.claude/coord/close-check.json): one
+// low row per session (a = its session id) and one for the loop tabs no session owns
+// (a = chrome-tabs), posted on every check: an empty list when every loop tab has an owner, and
+// `unreadable` when the check could not read Chrome's tabs. Only that local file is read, so the Chief's pass and the watcher's scan post
+// the same rows. A check older than CLOSE_CHECK_MAX_MIN gives no rows. Only loop tabs are listed;
+// every other tab is a count, so no other tab's title or URL leaves this computer.
 //
 // It only reads: git status, diff, rev-list and worktree list, the files of each worktree, the
 // loop registry (~/.claude/loop-supervisor/<session>.json), the tail of a planning ticket's session
@@ -49,6 +57,8 @@ const SEVERITY = { high: 0, medium: 1, low: 2 };
 /** Tickets whose plan, not their diff, says what they will touch: C15 reads their plan file. */
 const PLANNING = ['planning', 'ready_to_implement'];
 const TRANSCRIPT_TAIL_BYTES = 4 * 1024 * 1024;
+/** A saved close check older than this gives no C20 rows: a session's state changes quickly. */
+export const CLOSE_CHECK_MAX_MIN = 120;
 
 /** A pair of two tickets is always named in ticket-number order (as numbers: TCK-9 before TCK-10), so a change
  *  in the board order never turns one pair into "another" (the server keys a conflict by kind, a and b). Pairs
@@ -258,7 +268,96 @@ export function planFiles(markdown) {
 /** Whether a changed file is one a plan names: the same path, or inside a folder the plan names. */
 const namedBy = (planned, file) => planned.some((p) => (p.endsWith('/') ? file.startsWith(p) : file === p));
 
-export function scan({ repo, board, agents, npm, plans = {}, withProcesses = true, listen = listeners }) {
+// ── C20: can a session close? ────────────────────────────────────────────────
+
+// The server refuses a whole report when one string holds a control or invisible character
+// (UNSAFE_TEXT_RE in src/shared/coordination/card.ts), and checks the evidence's size
+// (EVIDENCE_LIMITS in src/shared/coordination/inbox.ts). These are copies of both.
+const UNSAFE_ALL_RE = /[\p{Cc}\p{Cf}\p{Cs}\p{Zl}\p{Zp}\p{Default_Ignorable_Code_Point}]/gu;
+export const EVIDENCE_LIMITS = { depth: 6, nodes: 500, chars: 8000 };
+const CONFLICT_KEY_RE = /^[A-Za-z0-9._:/@-]{1,100}$/;
+const TICKET_KEY_RE = /^TCK-\d{1,9}$/;
+const TABS_MAX = 30;
+
+/** A string the server takes: line breaks become spaces, invisible characters go, at most n characters (cut by code point, never inside a pair). */
+export function clean(value, n) {
+  const chars = Array.from(String(value ?? '').replace(/[\r\n\t\u2028\u2029]+/g, ' ').replace(UNSAFE_ALL_RE, '').trim());
+  return chars.length > n ? `${chars.slice(0, n - 1).join('')}…` : chars.join('');
+}
+const cleanKey = (k) => (typeof k === 'string' && TICKET_KEY_RE.test(k) ? k : null);
+
+/** The size of a value as the server counts it: its depth and its number of values. */
+export function evidenceSize(value) {
+  let nodes = 0;
+  let depth = 0;
+  const walk = (v, d) => {
+    nodes++;
+    depth = Math.max(depth, d);
+    if (v && typeof v === 'object') for (const x of Object.values(v)) walk(x, d + 1);
+  };
+  walk(value, 1);
+  return { nodes, depth, chars: JSON.stringify(value).length };
+}
+
+/** A tab's address without its query: host, port and the start of its path. */
+function tabPlace(url) {
+  try { const u = new URL(url); return clean(`${u.host}${u.pathname === '/' ? '' : u.pathname}`, 60); } catch { return ''; }
+}
+
+/**
+ * The C20 rows of a saved close check: one per session and one for the loop tabs no session owns.
+ * Pure: the same saved check and time give the same rows.
+ */
+export function closeRows(saved, now = Date.now()) {
+  if (!saved || typeof saved !== 'object' || !Array.isArray(saved.sessions)) return [];
+  const at = Date.parse(saved.checkedAt);
+  if (!Number.isFinite(at) || now - at > CLOSE_CHECK_MAX_MIN * 60_000 || at - now > 5 * 60_000) return [];
+  const checkedAt = new Date(at).toISOString();
+  const afterClose = (Array.isArray(saved.followUps) ? saved.followUps : []).slice(0, 5).map((f) => clean(f && f.text, 160)).filter(Boolean);
+  const rows = [];
+  const sessions = saved.sessions.filter((x) => x && typeof x.sessionId === 'string' && CONFLICT_KEY_RE.test(x.sessionId))
+    .sort((x, y) => String(x.name || x.sessionId).localeCompare(String(y.name || y.sessionId)) || x.sessionId.localeCompare(y.sessionId));
+  for (const x of sessions.slice(0, 60)) {
+    const verdict = ['yes', 'no', 'maybe'].includes(x.verdict) ? x.verdict : 'no';
+    const key = x.ticket ? cleanKey(x.ticket.key) : null;
+    const status = x.ticket && typeof x.ticket.status === 'string' ? clean(x.ticket.status, 30) : null;
+    const reasons = (Array.isArray(x.reasons) ? x.reasons : []).map((r) => ({ code: clean(r && r.code, 30), fixer: ['chief', 'session', 'owner'].includes(r && r.fixer) ? r.fixer : 'owner', text: clean(r && r.text, 160) }));
+    const notes = (Array.isArray(x.followUps) ? x.followUps : []).slice(0, 3).map((f) => clean(f && f.text, 160)).filter(Boolean);
+    const name = x.name ? clean(x.name, 60) : null;
+    const who = `${name || x.sessionId.slice(0, 8)} · ${key ? `${key} ${status || 'unknown'}` : 'no ticket'}`;
+    const first = reasons[0];
+    rows.push({
+      kind: 'C20', severity: 'low', a: x.sessionId, b: '',
+      detail: clean(`${who}: can close: ${verdict}${first ? ` (${reasons.length} reason${reasons.length === 1 ? '' : 's'}; ${first.text})` : ''}`, 400),
+      evidence: {
+        verdict, name, folder: x.folder ? clean(x.folder, 80) : null, ticket: key, status, state: x.state ? clean(x.state, 20) : null,
+        reasons: reasons.slice(0, 8), more: Math.max(0, reasons.length - 8), notes, afterClose,
+        answer: x.answer && ['yes', 'no'].includes(x.answer.verdict) ? { verdict: x.answer.verdict, at: clean(x.answer.at, 40), stale: Boolean(x.answer.stale) } : null,
+        askedAt: x.askedAt ? clean(x.askedAt, 40) : null,
+        askable: x.askable === true, self: x.self === true, checkedAt,
+      },
+    });
+  }
+  // The loop tabs no checked session owns (a session's own tabs are a reason in its row). The row is posted on
+  // every check, so the Chief view can tell "no check yet" from "no tab left" and from "could not read the tabs".
+  const tabs = saved.tabs && Array.isArray(saved.tabs.loop) ? saved.tabs : null;
+  if (!tabs) {
+    rows.push({ kind: 'C20', severity: 'low', a: 'chrome-tabs', b: '', detail: 'the close check could not read the Chrome tabs: none is listed, and none is closed', evidence: { unreadable: true, tabs: [], more: 0, sureOrphans: [], otherLocal: 0, nonLocal: 0, checkedAt } });
+  } else {
+    const unowned = new Set(Array.isArray(tabs.unowned) ? tabs.unowned : []);
+    const list = tabs.loop.filter((t) => t && Number.isSafeInteger(t.id) && unowned.has(t.id)).sort((x, y) => x.id - y.id);
+    const orphans = list.filter((t) => t.sureOrphan === true && t.active !== true).map((t) => t.id);
+    const shown = list.slice(0, TABS_MAX).map((t) => ({ id: t.id, ticket: cleanKey(t.ticket), status: t.status ? clean(t.status, 30) : null, label: clean(t.label, 30), sureOrphan: t.sureOrphan === true && t.active !== true, place: tabPlace(t.url), title: clean(t.title, 40) }));
+    const evidence = { tabs: shown, more: list.length - shown.length, sureOrphans: orphans.slice(0, 100), otherLocal: Number.isSafeInteger(tabs.otherLocal) ? tabs.otherLocal : 0, nonLocal: Number.isSafeInteger(tabs.nonLocal) ? tabs.nonLocal : 0, checkedAt };
+    // Stay inside the server's limits: drop listed tabs from the end (they are still counted in more).
+    while (evidence.tabs.length && (JSON.stringify(evidence).length > EVIDENCE_LIMITS.chars - 200 || evidenceSize(evidence).nodes > EVIDENCE_LIMITS.nodes - 20)) { evidence.tabs.pop(); evidence.more++; }
+    const what = list.length ? `${list.length} loop tab${list.length === 1 ? '' : 's'} in Chrome that no session owns, ${orphans.length} of them sure orphans` : 'no loop tab in Chrome is left without a session';
+    rows.push({ kind: 'C20', severity: 'low', a: 'chrome-tabs', b: '', detail: clean(`${what}; other tabs: ${evidence.otherLocal} local, ${evidence.nonLocal} not local (not listed)`, 400), evidence });
+  }
+  return rows;
+}
+
+export function scan({ repo, board, agents, npm, plans = {}, withProcesses = true, listen = listeners, closeCheck = null, now = Date.now() }) {
   const main = mainCheckout(repo);
   if (!main) throw new Error(`not a git repository: ${repo}`);
   const mainRef = git(main, ['rev-parse', '--abbrev-ref', 'HEAD']).out || 'main';
@@ -454,8 +553,12 @@ export function scan({ repo, board, agents, npm, plans = {}, withProcesses = tru
   for (const p of processes) {
     if (p.orphan) add('C10', 'low', `pid-${p.pid}`, '', `${p.command} (pid ${p.pid}) listens on ${p.ports.join(', ')} in ${path.basename(p.worktree)}, where no active ticket works`, { pid: p.pid, ports: p.ports, worktree: p.worktree });
   }
+  // C20: one row per session from the saved close check, and one for the loop tabs no session owns.
+  const c20 = closeRows(closeCheck, now);
+  conflicts.push(...c20);
   conflicts.sort((x, y) => SEVERITY[x.severity] - SEVERITY[y.severity] || x.kind.localeCompare(y.kind));
-  return { generatedAt: new Date().toISOString(), main: { path: main, ref: mainRef, phases: mainPhases.length, nextPhase: mainMax + 1, mcpVersion: mainVersion, npmLatest: npm, distStale: Boolean(dist && dist.newestSource > dist.builtAt) }, tickets, conflicts, processes };
+  const close = closeCheck ? { checkedAt: closeCheck.checkedAt || null, rows: c20.length } : null;
+  return { generatedAt: new Date().toISOString(), close, main: { path: main, ref: mainRef, phases: mainPhases.length, nextPhase: mainMax + 1, mcpVersion: mainVersion, npmLatest: npm, distStale: Boolean(dist && dist.newestSource > dist.builtAt) }, tickets, conflicts, processes };
 }
 
 function report(r) {
@@ -468,6 +571,7 @@ function report(r) {
     out.push(`  ${t.key} ${t.status} · session ${t.sessionId ? `${t.sessionId.slice(0, 8)} ${t.sessionState || '?'}` : 'none'} · ${t.worktree ? `${path.basename(t.worktree)} (${t.branch || 'detached'}, by ${t.mapBy})` : t.note}${t.behind ? ` · ${t.behind} behind` : ''}`);
     if (t.worktree) out.push(`      ${t.committed.length} committed + ${t.uncommitted.length} uncommitted file(s)${t.phases.length ? ` · phases ${t.phases.map((p) => path.basename(p)).join(', ')}` : ''}${t.mcp ? ` · MCP changed, ${t.mcp.version || '?'}` : t.mcpCheckout ? ` · MCP checkout ${t.mcpCheckout}` : ''}`);
   }
+  if (r.close) out.push(`close check ${r.close.checkedAt || '?'}: ${r.close.rows} C20 row(s)${r.close.rows ? '' : ` (none: older than ${CLOSE_CHECK_MAX_MIN} min, or no sessions)`}`);
   out.push('', r.conflicts.length ? 'Conflicts:' : 'Conflicts: none');
   for (const c of r.conflicts) out.push(`  [${c.severity}] ${c.kind} ${c.a} <-> ${c.b}: ${c.detail}`);
   const orphans = r.processes.filter((p) => p.orphan);
@@ -789,6 +893,104 @@ function selftest() {
     fs.utimesSync(planMerge, old2h, old2h);
     const rm = scan({ repo, board: { issues: [{ key: 'TCK-20', work_status: 'planning' }] }, agents: [], npm: '2.12.0', plans: { 'TCK-20': planMerge }, withProcesses: false });
     eq('C15: a ship by merge counts, by the date it reached main; a sync merge on the branch does not', rm.conflicts.filter((c) => c.kind === 'C15').map((c) => c.evidence.files), [['src/merged.ts']]);
+
+    // C20: the rows of a saved close check (coord-close.mjs check --all --save).
+    const NOW20 = Date.parse('2026-11-15T01:00:00Z');
+    const sidN = (n) => `11111111-aaaa-4bbb-8ccc-00000000000${n}`;
+    const saved = {
+      version: 1, checkedAt: new Date(NOW20 - 10 * 60_000).toISOString(), main: repo,
+      followUps: [{ code: 'npm', text: 'MCP 2.18.0 on main is not on npm yet (npm has 2.16.0)' }],
+      sessions: [
+        { sessionId: sidN(2), name: 'zeta', pid: 2, folder: 'repo-tck-2', state: 'idle', ticket: { key: 'TCK-2', status: 'shipped' }, verdict: 'yes', reasons: [], followUps: [], answer: { verdict: 'yes', at: '2026-11-15T00:40:00.000Z', left: [], stale: false }, askedAt: '2026-11-15T00:39:00.000Z', askable: false, self: false },
+        { sessionId: sidN(1), name: 'alpha', pid: 1, folder: 'repo-tck-1', state: 'idle', ticket: { key: 'TCK-1', status: 'shipped' }, verdict: 'no', reasons: [{ code: 'answer-missing', fixer: 'chief', text: 'it has not answered "Can I close the session?" yet' }, { code: 'tabs', fixer: 'chief', text: 'it has 1 Chrome tab open: tab 7 (done)', tabIds: [7] }], followUps: [], answer: null, askedAt: null, askable: true, self: false },
+        { sessionId: sidN(3), name: null, pid: 3, folder: 'md-manager', state: 'busy', ticket: null, verdict: 'maybe', reasons: [], followUps: [{ code: 'no-ticket', text: 'it has no ticket, so only the session itself can confirm' }], answer: null, askedAt: null, askable: false, self: true },
+        { sessionId: sidN(4), name: 'odd', state: 'idle', ticket: { key: 'not-a-key', status: 'shipped' }, verdict: 'perhaps', reasons: [{ code: 'x', fixer: 'nobody', text: 't' }], followUps: [], askable: 'yes' },
+        { sessionId: 'not a session id', verdict: 'yes', reasons: [] },
+      ],
+      tabs: {
+        loop: [
+          { id: 7, ticket: 'TCK-1', status: 'shipped', label: 'done', sureOrphan: true, active: false, url: 'http://tck-1.localhost:3701/notes/5?x=secret1', title: 'One', openedBy: null },
+          { id: 9, ticket: 'TCK-9', status: 'shipped', label: 'done', sureOrphan: true, active: false, url: 'http://tck-9.localhost:3709/?q=secret9', title: 'Nine', openedBy: null },
+          { id: 8, ticket: 'TCK-8', status: 'shipped', label: 'done', sureOrphan: true, active: true, url: 'http://tck-8.localhost:3708/', title: 'Eight', openedBy: null },
+        ],
+        unowned: [9, 8], otherLocal: 2, nonLocal: 5,
+      },
+    };
+    const rows20 = closeRows(saved, NOW20);
+    const row = (a) => rows20.find((r) => r.a === a);
+    eq('C20: one low row per session (a = its session id, b empty), sorted by name, and one for the loop tabs no session owns; a bad session id gives none', rows20.map((r) => [r.kind, r.severity, r.a, r.b]), [['C20', 'low', sidN(3), ''], ['C20', 'low', sidN(1), ''], ['C20', 'low', sidN(4), ''], ['C20', 'low', sidN(2), ''], ['C20', 'low', 'chrome-tabs', '']]);
+    eq('C20: a session row names it, its ticket and the verdict; the reasons keep who fixes each; the machine items are "after you close"', [row(sidN(1)).detail, row(sidN(1)).evidence.reasons.map((x) => [x.code, x.fixer]), row(sidN(1)).evidence.afterClose, row(sidN(1)).evidence.askable, row(sidN(1)).evidence.checkedAt], ['alpha · TCK-1 shipped: can close: no (2 reasons; it has not answered "Can I close the session?" yet)', [['answer-missing', 'chief'], ['tabs', 'chief']], ['MCP 2.18.0 on main is not on npm yet (npm has 2.16.0)'], true, '2026-11-15T00:50:00.000Z']);
+    eq('C20: a session with no ticket is "maybe" with its note; the Chief\'s own session says self', [row(sidN(3)).detail, row(sidN(3)).evidence.ticket, row(sidN(3)).evidence.notes, row(sidN(3)).evidence.self, row(sidN(3)).evidence.askable], ['11111111 · no ticket: can close: maybe', null, ['it has no ticket, so only the session itself can confirm'], true, false]);
+    eq('C20: an unknown verdict reads as no, an unknown fixer as the owner, a bad ticket key as none, and only askable: true asks', [row(sidN(4)).evidence.verdict, row(sidN(4)).evidence.reasons[0].fixer, row(sidN(4)).evidence.ticket, row(sidN(4)).evidence.askable], ['no', 'owner', null, false]);
+    eq('C20: the answer and askedAt travel with the row', [row(sidN(2)).evidence.answer, row(sidN(2)).evidence.askedAt], [{ verdict: 'yes', at: '2026-11-15T00:40:00.000Z', stale: false }, '2026-11-15T00:39:00.000Z']);
+    const tabRow = row('chrome-tabs');
+    eq('C20: the tabs row lists only the loop tabs no session owns (tab 7 is alpha\'s), a sure orphan only when not active, and counts the other tabs', [tabRow.evidence.tabs.map((t) => [t.id, t.label, t.sureOrphan, t.place]), tabRow.evidence.sureOrphans, tabRow.evidence.otherLocal, tabRow.evidence.nonLocal, tabRow.evidence.more], [[[8, 'done', false, 'tck-8.localhost:3708'], [9, 'done', true, 'tck-9.localhost:3709']], [9], 2, 5, 0]);
+    eq('C20: no tab query and no owned tab\'s address leave this computer', /secret|notes\/5/.test(JSON.stringify(rows20)), false);
+    {
+      const none = closeRows({ ...saved, tabs: { ...saved.tabs, unowned: [] } }, NOW20).find((r) => r.a === 'chrome-tabs');
+      const unread = closeRows({ ...saved, tabs: null }, NOW20).find((r) => r.a === 'chrome-tabs');
+      eq('C20: the tabs row is posted on every check: an empty list when every loop tab has an owner, and unreadable when the tabs could not be read', [none?.evidence.tabs, none?.evidence.sureOrphans, none?.evidence.unreadable, none?.evidence.otherLocal, none?.detail, unread?.evidence.unreadable, unread?.evidence.tabs, unread?.evidence.sureOrphans, unread?.evidence.checkedAt, unread?.severity], [[], [], undefined, 2, 'no loop tab in Chrome is left without a session; other tabs: 2 local, 5 not local (not listed)', true, [], [], saved.checkedAt, 'low']);
+    }
+    eq(`C20: a check older than ${CLOSE_CHECK_MAX_MIN} min, one from the future, no check or a malformed one gives no rows`, [closeRows(saved, NOW20 + (CLOSE_CHECK_MAX_MIN - 11) * 60_000).length, closeRows(saved, NOW20 + (CLOSE_CHECK_MAX_MIN - 9) * 60_000).length, closeRows(saved, NOW20 - 16 * 60_000).length, closeRows(null, NOW20).length, closeRows({ sessions: 'x', checkedAt: saved.checkedAt }, NOW20).length, closeRows({ ...saved, checkedAt: 'soon' }, NOW20).length], [5, 0, 0, 0, 0, 0]);
+    eq('C20: a check is shown for exactly 120 minutes: 119 gives rows, 121 gives none', [CLOSE_CHECK_MAX_MIN, closeRows({ ...saved, checkedAt: new Date(NOW20 - 119 * 60_000).toISOString() }, NOW20).length, closeRows({ ...saved, checkedAt: new Date(NOW20 - 121 * 60_000).toISOString() }, NOW20).length], [120, 5, 0]);
+    {
+      const kept = { id: 31, ticket: 'TCK-31', status: 'ready_to_merge', label: 'left-for-you', sureOrphan: false, active: false, url: 'http://tck-31.localhost:3731/', title: 'Kept', openedBy: null };
+      const tr = closeRows({ ...saved, tabs: { ...saved.tabs, loop: [...saved.tabs.loop, kept], unowned: [9, 8, 31] } }, NOW20).find((r) => r.a === 'chrome-tabs');
+      eq('C20: an unowned tab that is not active but no sure orphan (left for your check) is listed, never a sure orphan', [tr.evidence.tabs.map((t) => [t.id, t.sureOrphan]), tr.evidence.sureOrphans], [[[8, false], [9, true], [31, false]], [9]]);
+      const leak = { id: 41, ticket: 'TCK-41', status: 'shipped', label: 'done', sureOrphan: true, active: false, url: 'http://user:pw@tck-41.localhost:3741/notes/7?q=1#frag', title: 't', openedBy: null };
+      const lr = closeRows({ ...saved, tabs: { ...saved.tabs, loop: [leak], unowned: [41] } }, NOW20).find((r) => r.a === 'chrome-tabs');
+      eq('C20: a tab place keeps the host, the port and the path: no user name, password, query or fragment', lr.evidence.tabs[0].place, 'tck-41.localhost:3741/notes/7');
+      const crowded = { ...saved.sessions[1], name: 'n'.repeat(9000), reasons: Array.from({ length: 20 }, (_, i) => ({ code: 'process', fixer: 'chief', text: `a process runs from md-manager-tck-1: pid ${1000 + i} ${'x'.repeat(300)}` })) };
+      const cr = closeRows({ ...saved, sessions: [crowded], tabs: null }, NOW20)[0];
+      eq('C20: 20 long reasons and a 9000-character name: 8 reasons kept (12 counted in more), the name cut to 60, inside the server limits', [cr.evidence.reasons.length, cr.evidence.more, cr.evidence.name.length, cr.evidence.reasons.every((r) => Array.from(r.text).length <= 160), JSON.stringify(cr.evidence).length <= EVIDENCE_LIMITS.chars, evidenceSize(cr.evidence).nodes <= EVIDENCE_LIMITS.nodes], [8, 12, 60, true, true, true]);
+    }
+    eq('C20: the same saved check gives the same rows', JSON.stringify(closeRows(saved, NOW20)) === JSON.stringify(closeRows(JSON.parse(JSON.stringify(saved)), NOW20)), true);
+    const s20 = scan({ repo, board: { issues: [] }, agents: [], npm: '2.12.0', withProcesses: false, closeCheck: saved, now: NOW20 });
+    eq('C20: scan posts exactly these rows, and says when the check was made', [JSON.stringify(s20.conflicts.filter((c) => c.kind === 'C20')) === JSON.stringify(rows20), s20.close], [true, { checkedAt: saved.checkedAt, rows: 5 }]);
+    eq('C20: no saved check, no rows', scan({ repo, board: { issues: [] }, agents: [], npm: '2.12.0', withProcesses: false }).conflicts.filter((c) => c.kind === 'C20').length, 0);
+
+    // C20 with hostile text: VS16, ZWJ, NUL, a right-to-left override, line breaks, emoji at the cut, 40 tabs with 2 KB addresses.
+    const hostile = {
+      ...saved,
+      sessions: [{ ...saved.sessions[1], name: 'al‍pha️\u0000', reasons: [{ code: 'x​', fixer: 'chief', text: `line\nbreak ‮evil ${'\u{1F600}'.repeat(200)}` }] }],
+      tabs: {
+        loop: Array.from({ length: 40 }, (_, i) => ({ id: 100 + i, ticket: `TCK-${i + 1}`, status: 'shipped', label: 'done', sureOrphan: true, active: false, url: `http://tck-${i + 1}.localhost:${3700 + i}/${'p'.repeat(2048)}?q=${'x'.repeat(100)}`, title: `Tab \u{1F469}‍\u{1F4BB}️ ${i} ${'é'.repeat(100)}`, openedBy: null })),
+        unowned: Array.from({ length: 40 }, (_, i) => 100 + i), otherLocal: 0, nonLocal: 0,
+      },
+    };
+    const hr = closeRows(hostile, NOW20);
+    const strings = [];
+    const walk = (v) => { if (typeof v === 'string') strings.push(v); else if (v && typeof v === 'object') for (const [k, x] of Object.entries(v)) { strings.push(k); walk(x); } };
+    for (const r of hr) { walk(r.evidence); strings.push(r.detail, r.a); }
+    eq('C20: no string holds a control or invisible character (the server\'s UNSAFE_TEXT_RE)', strings.filter((t) => /[\p{Cc}\p{Cf}\p{Cs}\p{Zl}\p{Zp}\p{Default_Ignorable_Code_Point}]/u.test(t)), []);
+    eq('C20: every row fits the server limits (8000 characters, 500 values, depth 6, a detail of 1 to 1000 characters)', hr.map((r) => { const z = evidenceSize(r.evidence); return z.chars <= EVIDENCE_LIMITS.chars && z.nodes <= EVIDENCE_LIMITS.nodes && z.depth <= EVIDENCE_LIMITS.depth && r.detail.length >= 1 && r.detail.length <= 1000; }), [true, true]);
+    const ht = hr.find((r) => r.a === 'chrome-tabs');
+    eq('C20: 40 tabs with 2 KB addresses: listed plus more is 40, every sure orphan id is kept, places are short and without a query', [ht.evidence.tabs.length + ht.evidence.more, ht.evidence.sureOrphans.length, ht.evidence.tabs.every((t) => t.place.length <= 60 && !t.place.includes('?')), ht.evidence.tabs.length > 0], [40, 40, true, true]);
+    // The worst text a tab can carry after the caps: emoji titles, labels and statuses (2 UTF-16 units each) and quotes (escaped in JSON).
+    const worst = { ...saved, tabs: { loop: Array.from({ length: 40 }, (_, i) => ({ id: 2000 + i, ticket: `TCK-${123456789 - i}`, status: '\u{1F600}'.repeat(30), label: '"\u{1F4A5}'.repeat(15), sureOrphan: true, active: false, url: `http://tck-${i + 1}.localhost:3700/${'\u{1F600}'.repeat(80)}`, title: '"\u{1F469}'.repeat(30), openedBy: null })), unowned: Array.from({ length: 40 }, (_, i) => 2000 + i), otherLocal: 0, nonLocal: 0 } };
+    const worstRow = closeRows(worst, NOW20).find((r) => r.a === 'chrome-tabs');
+    eq('C20: the worst tab text still fits the server limits: tabs are dropped from the end of the list and counted in more', [JSON.stringify(worstRow.evidence).length <= EVIDENCE_LIMITS.chars, evidenceSize(worstRow.evidence).nodes <= EVIDENCE_LIMITS.nodes, worstRow.evidence.tabs.length < 30, worstRow.evidence.tabs.length + worstRow.evidence.more, worstRow.evidence.sureOrphans.length], [true, true, true, 40, 40]);
+    eq('C20: a ticket key longer than 9 digits is no ticket', closeRows({ ...saved, sessions: [{ ...saved.sessions[1], ticket: { key: 'TCK-1234567890', status: 'shipped' } }] }, NOW20)[0].evidence.ticket, null);
+    eq('C20: a cut never leaves half of a surrogate pair', strings.some((t) => /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/.test(t)), false);
+    eq('C20: clean keeps visible text and cuts by character', [clean('a‍b️c', 10), clean('\u{1F600}\u{1F600}\u{1F600}', 2), clean('x\ny', 5)], ['abc', '\u{1F600}…', 'x y']);
+
+    // C20 through the command line: the default file under the Claude folder, or --close-check; the watcher passes neither, so it reads the same file.
+    const cfg20 = path.join(root, 'cfg20');
+    fs.mkdirSync(path.join(cfg20, 'coord'), { recursive: true });
+    const live = { ...saved, checkedAt: new Date(Date.now() - 60_000).toISOString() };
+    fs.writeFileSync(path.join(cfg20, 'coord', 'close-check.json'), JSON.stringify(live));
+    const other = path.join(root, 'other-check.json');
+    fs.writeFileSync(other, JSON.stringify({ ...live, sessions: [live.sessions[0]], tabs: null }));
+    const boardFile = path.join(root, 'board20.json');
+    fs.writeFileSync(boardFile, JSON.stringify({ issues: [] }));
+    fs.writeFileSync(path.join(root, 'no-agents.json'), '[]');
+    const cli = (...extra) => {
+      const r = spawnSync(process.execPath, [fileURLToPath(import.meta.url), '--board', boardFile, '--repo', repo, '--agents', path.join(root, 'no-agents.json'), '--npm-latest', '2.12.0', '--json', ...extra], { encoding: 'utf8', env: { ...process.env, CLAUDE_CONFIG_DIR: cfg20 }, timeout: 120_000 });
+      try { return JSON.parse(r.stdout).conflicts.filter((c) => c.kind === 'C20').map((c) => c.a); } catch { return `exit ${r.status}: ${r.stderr.slice(0, 200)}`; }
+    };
+    eq('C20 CLI: the default ~/.claude/coord/close-check.json, or the file --close-check names', [cli(), cli('--close-check', other), cli('--close-check', path.join(root, 'missing.json'))], [[sidN(3), sidN(1), sidN(4), sidN(2), 'chrome-tabs'], [sidN(2), 'chrome-tabs'], []]);
+    const watchSrc = fs.readFileSync(path.join(path.dirname(fileURLToPath(import.meta.url)), 'coord-watch.mjs'), 'utf8');
+    eq('C20: the watcher runs this scan without --close-check, so it reads the same default file as the Chief', [watchSrc.includes("[path.join(HERE, 'coord-scan.mjs'), '--board', boardFile, '--repo', args.repo, '--json']"), watchSrc.includes('close-check')], [true, false]);
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }
@@ -798,13 +1000,19 @@ function selftest() {
 
 // ── main ─────────────────────────────────────────────────────────────────────
 
+/** The saved close check (coord-close.mjs check --all --save): the given file, else the default one; null when there is none or it does not parse. */
+export function readCloseCheck(file) {
+  const f = typeof file === 'string' ? file : path.join(process.env.CLAUDE_CONFIG_DIR || path.join(os.homedir(), '.claude'), 'coord', 'close-check.json');
+  try { return JSON.parse(fs.readFileSync(f, 'utf8')); } catch { return null; }
+}
+
 function parseArgs(argv) {
   const out = {};
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (!a.startsWith('--')) continue;
     const next = argv[i + 1];
-    if (next !== undefined && !next.startsWith('--') && ['repo', 'board', 'agents', 'npm-latest', 'plans'].includes(a.slice(2))) { out[a.slice(2)] = next; i++; } else out[a.slice(2)] = true;
+    if (next !== undefined && !next.startsWith('--') && ['repo', 'board', 'agents', 'npm-latest', 'plans', 'close-check'].includes(a.slice(2))) { out[a.slice(2)] = next; i++; } else out[a.slice(2)] = true;
   }
   return out;
 }
@@ -813,10 +1021,10 @@ if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.me
   const args = parseArgs(process.argv.slice(2));
   if (args.selftest) process.exit(selftest());
   if (!args.board || !fs.existsSync(args.board)) {
-    console.error('usage: coord-scan.mjs --board <tickets.json> [--repo <main checkout>] [--agents <agents.json>] [--npm-latest <version>] [--plans <{"TCK-n": "plan.md"}>] [--json] | --selftest');
+    console.error('usage: coord-scan.mjs --board <tickets.json> [--repo <main checkout>] [--agents <agents.json>] [--npm-latest <version>] [--plans <{"TCK-n": "plan.md"}>] [--close-check <file>] [--json] | --selftest');
     process.exit(2);
   }
   const plans = args.plans ? JSON.parse(fs.readFileSync(args.plans, 'utf8')) : {};
-  const result = scan({ repo: path.resolve(args.repo || process.cwd()), board: JSON.parse(fs.readFileSync(args.board, 'utf8')), agents: loadAgents(args.agents), npm: npmLatest(args['npm-latest']), plans });
+  const result = scan({ repo: path.resolve(args.repo || process.cwd()), board: JSON.parse(fs.readFileSync(args.board, 'utf8')), agents: loadAgents(args.agents), npm: npmLatest(args['npm-latest']), plans, closeCheck: readCloseCheck(args['close-check']) });
   console.log(args.json ? JSON.stringify(result, null, 2) : report(result));
 }

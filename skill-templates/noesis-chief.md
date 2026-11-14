@@ -1,6 +1,6 @@
 ---
 description: Run the Chief of Staff (TCK-1890) — the coordinator for parallel Claude Code sessions that build Noesis Jot tickets. It reads the Jot board and the running sessions, scans every ticket worktree for conflicts, applies the mechanical rules itself (messages, MCP versions), records its judgment calls for the owner's review, and sends the decisions that need the owner to the Chief view on the Jot page as Decision Cards checked by cold readers. Use when the user says '/noesis-chief', 'chief of staff', 'run the chief', 'coordinate my sessions', 'check my sessions for conflicts', 'which ticket should ship first', 'what is waiting for me', 'what blocks my sessions', 'what should I start next', or 'chief watch'.
-argument-hint: "[watch] [--repo <main checkout>]"
+argument-hint: "[watch | close] [--repo <main checkout>]"
 ---
 
 # /noesis-chief — the Chief of Staff, version 1
@@ -26,6 +26,8 @@ conflicts, the leases, the decisions, the thresholds and Up next.
 | Read the Jot board (`mcp__noesis__backlog_get`), the sessions (`coord_sessions`, `claude agents --json`) and the policy (`coord_policy`) | Edit product code, or any file in a ticket's worktree |
 | Run the scanner and the rules script (both read-only), and post the scan with `coord_report` | Merge, push, publish to npm, or apply SQL to production |
 | Send rule messages with `coord_message`, without asking | Stop a process or a session (`stop-session` is an owner gate) |
+| Ask a finished session "Can I close the session?" once (`ask-close`, step 3), and close the sure-orphan loop tabs (`close-tabs`) | Ask a session whose ticket is open or that has no ticket, ask one twice, or close any other tab |
+| Close the finished sessions the owner chose in `/noesis-chief close`, with their processes and port slot (Closing finished sessions) | Close a session without the owner's yes in that question, or close your own session |
 | Hand out MCP versions and ports (`coord_allocate_mcp_version`, `coord_port`) | Answer an owner gate (the server refuses it with `OWNER_GATE`) |
 | Record judgment calls, picks and owner-gate cards with `coord_decide` (`as_chief: true`) | Carry out an answered card: the session that owns the ticket does it |
 | Answer a ticket session's question or plan approval on your route (`coord_answer_request`, step 3b) | Answer one for the owner alone, send a plan back, type an answer, or answer a tool permission prompt |
@@ -39,6 +41,7 @@ file, wait for the test-db lease, rebase after a ship, run `/mcp`), and why.
 $ARGUMENTS
 
 - (none): one pass, then stop.
+- `close`: close the finished sessions the owner picks (see Closing finished sessions), then stop.
 - `watch`: a pass now, then wait for the next wake. The scan watcher (`coord-watch.mjs`) wakes you when the scan changes. Without it, `ScheduleWakeup` every 30 minutes while any ticket is active. Stop when no ticket is active.
 - `--repo <path>`: the main checkout. The default is `~/temp_cGit/md-manager` on this Mac. The scripts below are in its `md-manager-mcp-server/scripts/` folder, the same package the `noesis` MCP runs from.
 
@@ -102,12 +105,18 @@ Also call it once with `status: "created"`. Keep those tickets for step 5 only, 
 
 ```bash
 S=<repo>/md-manager-mcp-server/scripts
+node $S/coord-close.mjs check --all --save --repo <repo> > ~/.claude/coord/close.txt
 node $S/coord-scan.mjs --board ~/.claude/coord/board.json --repo <repo> --json > ~/.claude/coord/scan.json
 node $S/coord-scan.mjs --board ~/.claude/coord/board.json --repo <repo> > ~/.claude/coord/scan.txt
 ```
 
 Each run takes a few seconds to 2 minutes. It writes nothing into any worktree, index, ref or
 object (`GIT_OPTIONAL_LOCKS=0` on every git call).
+
+The close check comes first (C20, TCK-1930). It gives each local session a verdict (can it close?)
+and saves it to `~/.claude/coord/close-check.json`. The scan turns that file into one C20 row per
+session and one for the loop tabs no session owns, so the Chief view's "Can close?" column shows it.
+The scan watcher reads the same file, so its scans post the same rows.
 
 Then call `coord_report` with `scan_file` set to the absolute path of `scan.json` (expand `~`: the tool does not). A report is the whole picture:
 each pair in it is opened or refreshed, and each open pair it no longer holds is resolved.
@@ -130,12 +139,20 @@ action in `actions.json`, then add its `key` to `done.json`, so the next pass do
 - `decide` without a card: a judgment call. Call `coord_decide` with `category`, `rubric`, `choice`, `reason`, `evidence` and `as_chief: true`, and `ticket` when it is not null. The server answers `proceed` (auto mode, within the owner's highest level) or `review` (observe mode: it goes to the owner's review list and does not wait). The error `CARD_REQUIRED` means the server decided that the call waits for the owner: the category's mode is off, or the call's level is above the highest level the owner lets you decide alone. Write a card (step 4) and call again with it. Nothing is stored before that.
 - `decide` with a card: an owner gate. Check the card first (step 4), then call `coord_decide` with the card. It waits on the Chief view until the owner answers.
 - `note`: write it in the report once.
+- `ask-close` (C20): ask that session "Can I close the session?". Choose the way first, because the first run writes `askedAt` and refuses any second run ("already asked").
+  - When the action's `name` is a name `ListAgents` shows, run `node $S/coord-close.mjs ask --session <to_session> --by-message --repo <repo> --json`. When it says `asked: true`, send its `line` with `SendMessage` to that name: a message wakes an idle session. When `SendMessage` then fails, write that in the report: the owner asks that session by hand.
+  - Otherwise run the same command without `--by-message`. It types the line into the session's iTerm2 tab, with the guards of `/exit`.
+  - Add the key to `done.json` only when it says `asked: true`. Otherwise write its `why` in the report and leave the key out, so the next pass can try again (for example after a session was busy for a moment). `askedAt` still keeps a session from being asked twice.
+- `close-tabs` (C20): the `decide` just before it records the cleanup for the owner's review. Then run `node $S/coord-tabs.mjs close --ids <ids, comma-separated> --repo <repo> --json`. It reads each tab again and closes it only when it is still a sure orphan. Write the closed tabs and the kept ones, with why, in the report.
 
-**The test-db lease (C9).** Until `/cc-loop` itself runs full suites under the lease (TCK-1897),
-send every session one message a day, as the first message of the day's first pass: "Chief of
-Staff: run a full backend suite, and a commit whose hook runs one, only inside `node
-~/.claude/tools/coord-lease.mjs run test-db -- <command>`, so that two suites never share
-noesis_test at the same time." Add the key `C9|lease|<date>` to `done.json`.
+**The test-db lease (C9).** Since TCK-1897, an md-manager worktree on a base that includes it has
+its own test database (`noesis_test_<label>`). `/cc-loop` uses the lease only where the database is
+shared. A base includes TCK-1897 when its `src/backend/test/dbUrl.ts` exports `testDbNameFor`.
+So send this message only to a session in the main checkout, or whose worktree lacks that
+export.
+Send it once a day, as the first message of the day's first pass: "Chief of Staff: run a full backend suite, and a commit whose hook runs one, only inside `node
+~/.claude/tools/coord-lease.mjs run test-db -- <command>`, so that two suites never
+share noesis_test at the same time." Add the key `C9|lease|<date>` to `done.json`.
 
 A message for a session on another machine still goes through `coord_message`: its inbox reaches
 it there. Never send a message other than the actions' messages and the C9 message.
@@ -239,14 +256,48 @@ Sentences). Put what needs the owner first. A section with nothing in it is left
 2. **Waiting for you now.** The C17 sessions that are at a question or a permission prompt, with the ticket and how long they have waited, and the questions and plans of step 3b that you left for the owner.
 3. **What I did.** One line per message sent, per version handed out, per question or plan answered and per pull of the main checkout, with the rule.
 4. **For your review.** How many judgment calls wait in the review list.
-5. **Ship order.** The tickets at Ready to merge in the order you recommend, who holds the ship lease (`coord_leases`), and which ship waits for which.
-6. **Up next.** The pick, its reason, and whether it starts now in parallel or after a named ticket ships.
-7. **Conflicts.** Paste `scan.txt` as it is, in a fenced block. Do not retype or summarise its lines.
+5. **Ready to close.** The sessions that `node $S/coord-close.mjs candidates --repo <repo>` lists (a yes, or only what close fixes itself, which it names), with their ticket, and "run `/noesis-chief close`". Then the "maybe" ones (no ticket) and the "after you close" items of `close.txt`. Then the Chrome tabs: the ones closed this pass, and the loop tabs left open, with their labels.
+6. **Ship order.** The tickets at Ready to merge in the order you recommend, who holds the ship lease (`coord_leases`), and which ship waits for which.
+7. **Up next.** The pick, its reason, and whether it starts now in parallel or after a named ticket ships.
+8. **Conflicts.** Paste `scan.txt` as it is, in a fenced block. Do not retype or summarise its lines.
 
 Save the report as `~/.claude/coord/report-<date>.md` too.
 
 In server mode, do not ask the owner the cards in the terminal. The owner answers them on the
 Chief view, and the server sends each answer to the inbox of every session the card concerns.
+
+At the end of an attended one-pass run (no `watch`), when `candidates` (Ready to close) lists a session, go on
+with Closing finished sessions. It asks the owner once. In watch mode, never ask in the terminal: a question
+would stop your wakes. Name `/noesis-chief close` in the report instead.
+
+## Closing finished sessions (`/noesis-chief close`)
+
+The owner used to ask each finished session "Can I close the session?" and close each terminal by
+hand (incident 25). Here the Chief does it, with one yes from the owner.
+
+1. Run `node $S/coord-close.mjs candidates --repo <repo> --json`. It lists the sessions that can close
+   now, in groups of at most 4: those whose check says yes, and those whose only reasons are what close
+   fixes itself (a leftover server, its port slot, its tabs; `closeFixes` names them). It never lists
+   your own session, a background agent, or a session whose loop still runs. When none is ready, say
+   so, list the "maybe" ones and why, and stop.
+2. Ask the owner once with AskUserQuestion, header `Close`: "Close all <N> finished sessions?" with the
+   options "Close all <N>" and "Let me choose". For "Let me choose", ask one multiSelect question per
+   group of at most 4, one option per session (its name, ticket and folder). A question needs two
+   options, so a group of one session gets "Close <name>" and "Keep it open". One AskUserQuestion holds
+   at most 4 questions: more than 16 sessions take a second call.
+3. For each chosen session, run `node $S/coord-close.mjs close --session <id> --repo <repo> --json`.
+   It checks again and stops if the answer is now no. It stops the session's processes, releases its
+   port slot, and closes its sure-orphan tabs. It types `/exit` once, only into an idle session alone
+   in its tab whose prompt line is empty. It closes that iTerm2 session when only shells run in it,
+   and reports the session as gone.
+4. Report each session: closed, with the folder and `claude --resume <id>` from the result, or not
+   closed, with its `why` and the steps it did.
+
+`close` stops while the owner's pause is in force. It reads the pause from your own inbox, so it sees
+"Pause all" and a pause sent to you, not a pause sent only to the session being closed. A session
+whose prompt line shows text is refused: Claude Code's own dim suggestion after a turn looks the same as
+typed text in iTerm2. Only the empty prompt's `Try "…"` hint counts as empty. Then the owner clears that
+line, or closes the tab.
 
 ## Watch mode
 
