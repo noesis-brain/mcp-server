@@ -43,7 +43,7 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { spawnSync } from 'node:child_process';
+import { spawnSync, execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -577,7 +577,7 @@ export async function checkSession(agent, F, deps) {
       if (isHelper(p, agent.pid, helpers)) continue;
       found.push({ pid, pgid: p.pgid, command: short(p.command, 100), ports: (F.ports && F.ports.get(pid)) || [], mine: Boolean(mine) });
     }
-    for (const p of found) add('process', `${p.mine ? 'its own process' : 'a process'} runs from ${folderOf(wt.path)}: pid ${p.pid} ${p.command}${p.ports.length ? ` (port ${p.ports.join(', ')})` : ''}`, 'chief', { pid: p.pid, pgid: p.pgid, ports: p.ports });
+    for (const p of found) add('process', `${p.mine ? 'its own process' : 'a process'} runs from ${folderOf(wt.path)}: pid ${p.pid} ${p.command}${p.ports.length ? ` (port ${p.ports.join(', ')})` : ''}`, 'chief', { pid: p.pid, pgid: p.pgid, ports: p.ports, command: p.command });
   }
 
   // Its Chrome tabs: a loop tab of its ticket, or a tab its own Chrome tools opened.
@@ -588,7 +588,7 @@ export async function checkSession(agent, F, deps) {
 
   // Its port slot and leases.
   if (F.portSlots) {
-    for (const s of F.portSlots.filter((s) => (key && s.ticket === key) || s.holder === sid)) add('port', `it holds port slot ${s.slot} (${s.host}, ports ${s.backend_port} and ${s.frontend_port})`, 'chief', { slot: s.slot });
+    for (const s of F.portSlots.filter((s) => (key && s.ticket === key) || s.holder === sid)) add('port', `it holds port slot ${s.slot} (${s.host}, ports ${s.backend_port} and ${s.frontend_port})`, 'chief', { slot: s.slot, holder: s.holder || null, ticket: s.ticket || null });
   }
   if (F.leases) {
     for (const l of F.leases.filter((l) => l.holder === sid && !l.expired)) add('lease', `it holds the ${l.resource} lease`, 'session');
@@ -631,7 +631,7 @@ export async function checkSession(agent, F, deps) {
   const verdict = reasons.length ? 'no' : key ? 'yes' : 'maybe';
   if (verdict === 'maybe') followUps.unshift({ code: 'no-ticket', text: hasAnswer && !stale ? `it has no ticket; the session itself said yes at ${answer.at}` : 'it has no ticket, so only the session itself can confirm' });
   return {
-    sessionId: sid, name: agent.name || null, pid: agent.pid || null, folder: folderOf(agent.cwd), worktree: wt ? wt.path : null, state,
+    sessionId: sid, name: agent.name || null, pid: agent.pid || null, cwd: agent.cwd || null, folder: folderOf(agent.cwd), worktree: wt ? wt.path : null, state,
     ticket: key ? { key, status, by: ev.by.map(([k]) => k) } : null,
     verdict, reasons, followUps,
     answer: hasAnswer ? { verdict: answer.verdict, at: answer.at, left: answer.left || [], stale: Boolean(stale) } : null,
@@ -699,6 +699,288 @@ export function render(result) {
   }
   if ((result.followUps || []).length) out.push('', 'After you close (machine-wide, not caused by one session):', ...result.followUps.map((f) => `  ${f.text}`));
   return out.join('\n');
+}
+
+// ── ask and close (INC-3) ────────────────────────────────────────────────────
+//
+// `ask` types "Can I close the session?" into an idle session whose ticket is closed, once. `close`
+// ends a session the owner chose: it stops the session's processes, releases its port slot, closes
+// its sure-orphan tabs, types /exit, and closes its iTerm session. Each step checks again first,
+// and any doubt stops the step without a keystroke. Typing is done through iTerm2's own scripting,
+// found by the session's tty and named by the iTerm session's unique id, never by a window index.
+
+export const ASK_PHRASE = 'Can I close the session?';
+const SELF = fileURLToPath(import.meta.url);
+/** A path as one shell word: plain paths stay as they are, any other is single-quoted. */
+export const shq = (x) => (/^[\w@%+=:,./-]+$/.test(x) ? x : `'${String(x).replace(/'/g, "'\\''")}'`);
+
+export const askLine = (repo) => `${ASK_PHRASE} (Chief of Staff: run your close check with \`node ${shq(SELF)} check --pid $PPID${repo ? ` --repo ${shq(repo)}` : ''}\`, fix what is yours, then record your answer with \`node ${shq(SELF)} record --pid $PPID --verdict yes|no --left "<what is left>"\`.)`;
+
+const escA = (s) => String(s).replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+const US = String.fromCharCode(31);
+const RS2 = String.fromCharCode(30);
+/** The iTerm2 sessions on one tty: [{uid, inTab}] (inTab = how many sessions its tab holds). */
+export const itermSessionsScript = (tty) => `tell application "iTerm2"
+  set out to ""
+  repeat with w in windows
+    repeat with t in tabs of w
+      set n to count of sessions of t
+      repeat with s in sessions of t
+        if (tty of s) is "${escA(tty)}" then set out to out & (unique id of s) & (character id 31) & n & (character id 30)
+      end repeat
+    end repeat
+  end repeat
+  return out
+end tell`;
+const bySessionUid = (uid, body, none) => `tell application "iTerm2"
+  repeat with w in windows
+    repeat with t in tabs of w
+      repeat with s in sessions of t
+        if ((unique id of s) as text) is "${escA(uid)}" then
+${body}
+        end if
+      end repeat
+    end repeat
+  end repeat
+  return "${none}"
+end tell`;
+export const paneScript = (uid) => bySessionUid(uid, '          return (text of s)', '');
+/** Types one line without a newline, waits, then sends a bare Enter. With a shorter gap, Claude Code takes the Enter as part of
+ *  the paste and leaves the prompt unsent (measured 2026-11-15 with a 0.6 s gap; TCK-1897's iterm-lib uses 1.5 s). */
+export const typeLineScript = (uid, line) => bySessionUid(uid, `          write s text "${escA(line)}" newline no
+          delay 1.5
+          write s text ""
+          return "typed"`, 'gone');
+export const closeItermScript = (uid) => bySessionUid(uid, `          if (count of sessions of t) is not 1 then return "shared"
+          close s
+          return "closed"`, 'gone');
+
+export function parseItermSessions(out) {
+  return String(out || '').split(RS2).map((r) => r.replace(/^\n+/, '')).filter(Boolean).map((r) => { const [uid, n] = r.split(US); return { uid: String(uid || '').trim(), inTab: Number(n) }; }).filter((x) => x.uid);
+}
+
+/** The text in Claude Code's prompt line: between the last two lines made only of ─, without ❯. null when no prompt box is seen. */
+export function composerText(pane) {
+  const ls = String(pane || '').split('\n');
+  const rules = ls.map((l, i) => (/^\s*─{8,}\s*$/.test(l) ? i : -1)).filter((i) => i >= 0);
+  if (rules.length < 2) return null;
+  const [a, b] = rules.slice(-2);
+  const text = ls.slice(a + 1, b).join('\n').replace(/^\s*❯\s?/, '').trim();
+  // An empty prompt shows a dim suggestion, which the pane text cannot tell apart: Try "write a test for <filepath>" (measured 2026-11-15).
+  return /^Try "[^"\n]*"$/.test(text) ? '' : text;
+}
+
+/** Background work in the status bar below the prompt box: "· 1 shell" (a running background shell).
+ *  "← N agent" is counted too, but a brand-new session shows "← 1 agent", so it is not the session's own work. */
+export function backgroundWork(pane) {
+  const ls = String(pane || '').split('\n');
+  const rules = ls.map((l, i) => (/^\s*─{8,}\s*$/.test(l) ? i : -1)).filter((i) => i >= 0);
+  const bar = ls.slice(rules.length ? rules[rules.length - 1] + 1 : 0).join(' ');
+  const n = (re) => Number((re.exec(bar) || [])[1]) || 0;
+  return { shells: n(/(\d+)\s+shells?\b/), agents: n(/←\s*(\d+)\s+agents?\b/) };
+}
+
+/** Merge fields into a session's close file (askedAt, an answer). */
+function writeClose(sessionId, patch) {
+  const file = path.join(closeDir(), `${sessionId}.json`);
+  fs.mkdirSync(closeDir(), { recursive: true });
+  const data = { ...(readJson(file) || {}), sessionId, ...patch };
+  const tmp = `${file}.${process.pid}.tmp`;
+  fs.writeFileSync(tmp, JSON.stringify(data, null, 2));
+  fs.renameSync(tmp, file);
+  return data;
+}
+
+/** Whether the session's transcript shows the ask as a user turn after `since`. */
+export function askArrived(text, since) {
+  for (const line of String(text || '').split('\n')) {
+    if (!line.includes(ASK_PHRASE)) continue;
+    let r; try { r = JSON.parse(line); } catch { continue; }
+    if (r.type === 'user' && (Date.parse(r.timestamp || '') || 0) >= since - 2000 && textOf(r.message?.content).includes(ASK_PHRASE)) return true;
+  }
+  return false;
+}
+
+const NOT_DONE = ['facts-failed', 'busy', 'waiting', 'wakeup', 'loop-running'];
+
+/** Why the Chief may not ask this session, or null. */
+export function askRefusal(s, selfPid) {
+  if (!s) return 'no such interactive session';
+  if (selfPid && s.pid === selfPid) return "it is the Chief's own session";
+  if (s.state !== 'idle') return `it is not idle (${s.state || 'unknown'})`;
+  if (!s.ticket) return 'it has no ticket';
+  if (!CLOSED_STATUSES.includes(s.ticket.status)) return `its ticket ${s.ticket.key} is not closed (${s.ticket.status || 'unknown'})`;
+  if (s.answer) return 'it has already answered';
+  if (s.askedAt) return `it was already asked at ${s.askedAt}`;
+  const r = s.reasons.find((x) => NOT_DONE.includes(x.code));
+  return r ? `it is not done: ${r.text}` : null;
+}
+
+/** The reasons close itself fixes: it stops the processes, releases the port slot and closes the sure-orphan tabs. Every other reason blocks. */
+export const FIXED_BY_CLOSE = ['process', 'port', 'tabs'];
+
+/** Why the Chief may not close this session, or null. Only a reason close fixes itself (FIXED_BY_CLOSE, fixer chief) lets it go on. */
+export function closeRefusal(s, selfPid) {
+  if (!s) return 'no such interactive session';
+  if (selfPid && s.pid === selfPid) return "it is the Chief's own session";
+  if (s.state !== 'idle') return `it is not idle (${s.state || 'unknown'})`;
+  const blocking = s.reasons.filter((x) => !(FIXED_BY_CLOSE.includes(x.code) && x.fixer === 'chief'));
+  return blocking.length ? `its check says no: ${blocking.map((x) => x.text).join('; ')}` : null;
+}
+
+/** Just before a keystroke: the session is still idle, alone on its tty in iTerm, its prompt line empty, nothing in the background. */
+function readyToType(s, deps, { alone }) {
+  const st = deps.sessionStatus(s.pid);
+  if (st !== 'idle') return { why: `its status is now ${st || 'unknown'}` };
+  const tty = deps.ttyOf(s.pid);
+  if (!tty) return { why: 'it has no terminal' };
+  const its = deps.iterm.sessionsOfTty(tty);
+  if (its === null) return { why: 'iTerm2 could not be read' };
+  if (its.length !== 1) return { why: `${its.length} iTerm sessions are on its terminal ${tty}` };
+  if (alone && its[0].inTab !== 1) return { why: 'it shares its iTerm tab with another pane' };
+  const pane = deps.iterm.pane(its[0].uid);
+  const text = composerText(pane);
+  if (text === null) return { why: 'its prompt line cannot be read' };
+  // A dim prompt suggestion looks the same as typed text in the pane, so any text refuses (measured 2026-11-15).
+  if (text !== '') return { why: `its prompt line shows text ("${short(text, 40)}"): typed, or Claude Code's own suggestion; clear that line in its tab, or close the tab yourself` };
+  const bg = backgroundWork(pane);
+  if (bg.shells) return { why: `it has ${bg.shells} background shell${bg.shells > 1 ? 's' : ''} running` };
+  return { tty, uid: its[0].uid };
+}
+
+/** Ask one session "Can I close the session?", once. */
+export async function ask(args, deps) {
+  const r = await check({ ...args, all: false }, deps);
+  if (r.error) return { asked: false, why: r.error };
+  const s = r.sessions[0];
+  const self = args.selfPid || selfSessionPid(deps.ps());
+  const why = askRefusal(s, self);
+  if (why) return { asked: false, why, sessionId: s && s.sessionId };
+  // --by-message: the Chief sends the line itself with SendMessage, which wakes an idle session
+  // (measured 2026-11-15 on a scratch session: the message arrived as a user turn and was answered).
+  if (args.byMessage) {
+    if (deps.sessionStatus(s.pid) !== 'idle') return { asked: false, why: 'its status is no longer idle', sessionId: s.sessionId };
+    writeClose(s.sessionId, { askedAt: new Date(deps.now()).toISOString(), askedBy: 'message' });
+    return { asked: true, by: 'message', sessionId: s.sessionId, name: s.name, line: askLine(r.main) };
+  }
+  const ready = readyToType(s, deps, { alone: false });
+  if (ready.why) return { asked: false, why: ready.why, sessionId: s.sessionId };
+  const typedAt = deps.now();
+  writeClose(s.sessionId, { askedAt: new Date(typedAt).toISOString() }); // before the keystroke: never twice
+  const typed = deps.iterm.type(ready.uid, askLine(r.main));
+  if (typed !== 'typed') return { asked: false, why: `iTerm2 did not type (${typed})`, sessionId: s.sessionId };
+  const confirmed = await deps.waitFor(() => { const tf = transcriptFile(s.sessionId, deps.configDir()); return tf ? askArrived(tail(tf, 2 * 1024 * 1024), typedAt) : false; }, 60_000);
+  return { asked: true, confirmed, sessionId: s.sessionId, name: s.name };
+}
+
+/** Close one session the owner chose. Each step reports what it did; a refusal changes nothing after it. */
+export async function closeSession(args, deps) {
+  const steps = [];
+  const stop = (why) => ({ closed: false, why, steps });
+  const self = args.selfPid || selfSessionPid(deps.ps());
+  // The owner's pause is in the inbox of this (the Chief's) session: the server reads it per session.
+  const paused = await deps.paused(self ? sessionOfPid(self, deps) : null);
+  if (paused !== false) return stop(paused === null ? "the owner's pause cannot be read" : 'the owner has paused every session');
+  const r = await check({ ...args, all: false }, deps);
+  if (r.error) return stop(r.error);
+  const s = r.sessions[0];
+  const why = closeRefusal(s, self);
+  if (why) return stop(why);
+  // Every refusal that does not depend on the cleanup comes first, so a refused close changes nothing.
+  const first = readyToType(s, deps, { alone: true });
+  if (first.why) return stop(first.why);
+  // Its processes: checked again just before the signal (pid, folder, command), a group signalled when its leader is one of them.
+  const procs = s.reasons.filter((x) => x.code === 'process');
+  if (procs.length) {
+    const stopScript = s.worktree ? path.join(s.worktree, 'loop-stack', 'stop.sh') : null;
+    if (stopScript && fs.existsSync(stopScript)) { const run = deps.run('bash', [stopScript], { cwd: s.worktree, timeout: 30_000 }); steps.push(`ran ${stopScript}: exit ${run.status}`); }
+    const ps = deps.ps();
+    const cwds = deps.cwds();
+    if (!ps || !cwds) return stop('the processes cannot be read again');
+    const real = (p) => { try { return fs.realpathSync(p); } catch { return p; } };
+    const root = s.worktree ? real(s.worktree) : null;
+    const still = procs.filter((x) => ps.has(x.pid));
+    const ids = new Set(still.map((x) => x.pid));
+    // Check every process first (folder and command), so a doubt stops the close before any signal.
+    for (const x of still) {
+      const p = ps.get(x.pid);
+      const d = cwds.get(x.pid) ? real(cwds.get(x.pid)) : null;
+      if (!root || !d || !(d === root || d.startsWith(root + path.sep))) return stop(`pid ${x.pid} no longer runs from ${folderOf(s.worktree)}`);
+      if (!p.command.startsWith(String(x.command || '').replace(/…$/, ''))) return stop(`pid ${x.pid} now runs another command`);
+    }
+    const signalled = new Set();
+    for (const x of still) {
+      const p = ps.get(x.pid);
+      const target = ids.has(p.pgid) && p.pgid !== x.pid ? -p.pgid : p.pgid === x.pid ? -x.pid : x.pid;
+      if (signalled.has(target)) continue;
+      signalled.add(target);
+      try { deps.kill(target, 'SIGTERM'); steps.push(`sent SIGTERM to ${target < 0 ? `group ${-target}` : `pid ${target}`}`); } catch (e) { return stop(`could not stop pid ${x.pid}: ${e.message}`); }
+    }
+    const gone = await deps.waitFor(() => still.every((x) => !deps.alive(x.pid)), 5000);
+    if (!gone) return stop(`still running after SIGTERM: ${still.filter((x) => deps.alive(x.pid)).map((x) => x.pid).join(', ')}`);
+  }
+  // Its port slot and its sure-orphan tabs.
+  for (const x of s.reasons.filter((y) => y.code === 'port')) {
+    const ok = await deps.post('/api/mcp/coordination/allocations/port/release', { holder: x.holder, ...(x.ticket ? { ticket: x.ticket } : {}) });
+    steps.push(ok ? `released port slot ${x.slot}` : `could not release port slot ${x.slot}`);
+  }
+  const tabIds = s.reasons.filter((y) => y.code === 'tabs' && y.tabIds).flatMap((y) => y.tabIds);
+  if (tabIds.length) {
+    const t = await deps.closeTabs(tabIds);
+    steps.push(`tabs: closed ${t.closed.map((x) => x.id).join(', ') || 'none'}${t.refused.length ? `; kept ${t.refused.map((x) => `${x.id} (${x.why})`).join(', ')}` : ''}${t.error ? `; ${t.error}` : ''}`);
+  }
+  // /exit, once, and only when it is still idle, alone in its tab, with an empty prompt line.
+  const ready = readyToType(s, deps, { alone: true });
+  if (ready.why) return stop(ready.why);
+  const typed = deps.iterm.type(ready.uid, '/exit');
+  if (typed !== 'typed') return stop(`iTerm2 did not type /exit (${typed})`);
+  steps.push('typed /exit');
+  const ended = await deps.waitFor(() => !deps.alive(s.pid), 30_000);
+  if (!ended) return stop('its Claude Code process did not end within 30 s (no second keystroke was sent)');
+  // Its iTerm session: closed only when only shells run in the foreground on its terminal.
+  const fg = deps.foreground(ready.tty);
+  if (fg === null || fg.some((c) => !SHELL_RE.test(c))) steps.push(`left its iTerm tab open: ${fg === null ? 'its terminal cannot be read' : `it runs ${fg.filter((c) => !SHELL_RE.test(c)).join(', ')}`}`);
+  else steps.push(`iTerm tab: ${deps.iterm.close(ready.uid)}`);
+  const hb = await deps.post('/api/mcp/coordination/sessions/heartbeat', { session_id: s.sessionId, state: 'gone', machine: os.hostname().slice(0, 100), ...(s.worktree || s.cwd ? { cwd: String(s.worktree || s.cwd).slice(0, 500) } : {}), ...(s.ticket ? { ticket: s.ticket.key } : {}), note: 'closed by the Chief of Staff (coord-close.mjs close)' });
+  steps.push(hb ? 'reported it as gone' : 'could not report it as gone');
+  return { closed: true, sessionId: s.sessionId, name: s.name, folder: s.cwd || s.folder, resume: `claude --resume ${s.sessionId}`, steps };
+}
+
+const osaRun = (script) => execFileSync('osascript', ['-e', script], { encoding: 'utf8', timeout: 20_000, stdio: ['ignore', 'pipe', 'ignore'] });
+
+/** The real side of ask and close (the selftest replaces each). */
+export function actDeps(args, base = realDeps(args)) {
+  return {
+    ...base,
+    sessionStatus: (pid) => { const j = readJson(path.join(configDir(), 'sessions', `${Number(pid)}.json`)); return j ? j.status || null : null; },
+    ttyOf: (pid) => { const r = spawnSync('ps', ['-o', 'tty=', '-p', String(pid)], { encoding: 'utf8', timeout: 5000 }); const t = (r.stdout || '').trim(); return r.status === 0 && t && t !== '??' ? `/dev/${t}` : null; },
+    foreground: (tty) => { const r = spawnSync('ps', ['-t', tty.replace('/dev/', ''), '-o', 'stat=,command='], { encoding: 'utf8', timeout: 5000 }); return r.status === 0 ? lines(r.stdout).filter((l) => /^\S*\+/.test(l)).map((l) => l.replace(/^\S+\s+/, '')) : null; },
+    iterm: {
+      sessionsOfTty: (tty) => { try { return parseItermSessions(osaRun(itermSessionsScript(tty))); } catch { return null; } },
+      pane: (uid) => { try { return osaRun(paneScript(uid)); } catch { return ''; } },
+      type: (uid, line) => { try { return osaRun(typeLineScript(uid, line)).trim(); } catch (e) { return `error: ${short(e.message, 60)}`; } },
+      close: (uid) => { try { return osaRun(closeItermScript(uid)).trim(); } catch (e) { return `error: ${short(e.message, 60)}`; } },
+    },
+    kill: (target, sig) => process.kill(target, sig),
+    alive: (pid) => { try { process.kill(pid, 0); return true; } catch (e) { return e.code === 'EPERM'; } },
+    run: (cmd, a, o) => spawnSync(cmd, a, { encoding: 'utf8', ...o }),
+    waitFor: async (fn, ms) => { const end = Date.now() + ms; for (;;) { if (await fn()) return true; if (Date.now() >= end) return false; await new Promise((r) => setTimeout(r, 500)); } },
+    paused: async (sessionId) => {
+      if (!sessionId) return null;
+      const r = await base.get(`/api/mcp/coordination/inbox?session=${encodeURIComponent(sessionId)}&limit=1`);
+      return r && r.pause ? Boolean(r.pause.paused) : null;
+    },
+    post: async (p, body) => {
+      try {
+        const { loadConfig } = await import('./noesis-ticket-session.mjs');
+        const cfg = loadConfig(process.cwd());
+        if (!cfg) return false;
+        const res = await fetch(cfg.baseUrl + p, { method: 'POST', headers: { Authorization: `Bearer ${cfg.token}`, 'Content-Type': 'application/json' }, body: JSON.stringify(body), signal: AbortSignal.timeout(15_000) });
+        return res.ok;
+      } catch { return false; }
+    },
+    closeTabs: async (ids) => { const m = await import('./coord-tabs.mjs'); return m.close({ ...args, ids }, base); },
+  };
 }
 
 // ── --prove-read-only ────────────────────────────────────────────────────────
@@ -1066,6 +1348,106 @@ async function selftest() {
     eq('TCK-10 in a [tck-session] line and in a loop state file is TCK-10, not TCK-1', [keyOf(11), keyOf(12)], ['TCK-10', 'TCK-10']);
     eq('a ticket at Deploying is open, not closed', rx.sessions.find((x) => x.sessionId === sid(13)).reasons[0].text, 'TCK-4 is at deploying');
 
+    // ── ask and close (INC-3), with a fake iTerm, processes and API ──
+    const rule = '─'.repeat(40);
+    const paneOf = (composer, bar = '  ⏵⏵ bypass permissions on (shift+tab to cycle)') => ['✻ Cooked for 1m', rule, `❯ ${composer}`, rule, '  🎯 x · y', bar].join('\n');
+    eq('composerText: the empty prompt, its dim suggestion, typed text, and no prompt box', [composerText(paneOf('')), composerText(paneOf('Try "write a test for <filepath>"')), composerText(paneOf('half typed')), composerText(paneOf('Try "x" and more')), composerText('no box here')], ['', '', 'half typed', 'Try "x" and more', null]);
+    eq('backgroundWork: shells and agents in the status bar', [backgroundWork(paneOf('', '  ⏵⏵ bypass permissions on · 1 shell · ← 2 agents')), backgroundWork(paneOf(''))], [{ shells: 1, agents: 2 }, { shells: 0, agents: 0 }]);
+    eq('composerText reads the last prompt box, not an earlier rule in the output', composerText(['old output', rule, 'a table row', rule, '✻ done', rule, '❯ ', rule, '  bar'].join('\n')), '');
+    eq('backgroundWork reads only the status bar below the prompt box', backgroundWork(['it said: · 3 shells running', rule, '❯ ', rule, '  ⏵⏵ bypass permissions on'].join('\n')), { shells: 0, agents: 0 });
+    eq('the typing script sends the line without a newline, waits 1.5 s, then a bare Enter', [/write s text "x" newline no\n\s*delay 1\.5\n\s*write s text ""/.test(typeLineScript('U', 'x'))], [true]);
+    eq('parseItermSessions', parseItermSessions(`ABC-1${US}1${RS2}DEF-2${US}2${RS2}`), [{ uid: 'ABC-1', inTab: 1 }, { uid: 'DEF-2', inTab: 2 }]);
+    const acts = [];
+    const actFake = (over = {}) => ({
+      ...deps({ agents: () => [...agents, ...extra], cwds: () => cwds }),
+      sessionStatus: () => 'idle',
+      ttyOf: () => '/dev/ttys999',
+      foreground: () => ['-zsh'],
+      iterm: { sessionsOfTty: () => [{ uid: 'UID-1', inTab: 1 }], pane: () => paneOf(''), type: (uid, line) => { acts.push(['type', uid, line]); return 'typed'; }, close: (uid) => { acts.push(['close', uid]); return 'closed'; } },
+      kill: (t, sig) => { acts.push(['kill', t, sig]); },
+      alive: (pid) => !acts.some((a) => (a[0] === 'kill' && (a[1] === pid || a[1] === -pid || (ps.get(pid) && a[1] === -ps.get(pid).pgid))) || (a[0] === 'type' && a[2] === '/exit' && pid === 101)),
+      run: () => ({ status: 0 }),
+      waitFor: async (fn) => Boolean(await fn()),
+      paused: async () => false,
+      post: async (p2, body) => { acts.push(['post', p2, body]); return true; },
+      closeTabs: async (ids) => { acts.push(['tabs', ids]); return { closed: ids.map((id) => ({ id })), refused: [] }; },
+      ...over,
+    });
+    const typed = () => acts.filter((a) => a[0] === 'type');
+    // s11 (TCK-10 shipped, idle, no answer): the ask is typed once, askedAt is written first.
+    acts.length = 0;
+    const a1 = await ask({ configRepo: null, repo, session: sid(11), selfPid: 1 }, actFake());
+    eq('ask: an idle session with a closed ticket and no answer is asked, once', [a1.asked, typed().length, typed()[0] && typed()[0][2].startsWith(ASK_PHRASE), typed()[0] && typed()[0][2].includes(` --repo ${mainCheckout(repo)}`), Boolean((readJson(path.join(closeDir(), `${sid(11)}.json`)) || {}).askedAt)], [true, 1, true, true, true]);
+    const a2 = await ask({ configRepo: null, repo, session: sid(11), selfPid: 1 }, actFake());
+    fs.rmSync(path.join(closeDir(), `${sid(11)}.json`), { force: true });
+    const a3 = await ask({ configRepo: null, repo, session: sid(11), selfPid: 1 }, actFake({ iterm: { ...actFake().iterm, type: () => 'gone' } }));
+    eq('ask: when iTerm2 cannot type, it is not asked, and askedAt still stands (it is never asked twice)', [a3.asked, Boolean((readJson(path.join(closeDir(), `${sid(11)}.json`)) || {}).askedAt)], [false, true]);
+    eq('ask: never twice (askedAt)', [a2.asked, /already asked/.test(a2.why), typed().length], [false, true, 1]);
+    fs.rmSync(path.join(closeDir(), `${sid(11)}.json`));
+    acts.length = 0;
+    const am = await ask({ configRepo: null, repo, session: sid(11), selfPid: 1, byMessage: true }, actFake());
+    const am2 = await ask({ configRepo: null, repo, session: sid(11), selfPid: 1, byMessage: true }, actFake());
+    eq('ask --by-message: no keystroke, askedAt written, the line and the name returned; never twice', [am.asked, am.by, am.name, am.line.startsWith(ASK_PHRASE) && am.line.includes(' --repo '), typed().length, (readJson(path.join(closeDir(), `${sid(11)}.json`)) || {}).askedBy, am2.asked], [true, 'message', 's11', true, 0, 'message', false]);
+    fs.rmSync(path.join(closeDir(), `${sid(11)}.json`));
+    { const r = await ask({ configRepo: null, repo, session: sid(11), selfPid: 1, byMessage: true }, actFake({ sessionStatus: () => 'busy' })); eq('ask --by-message refuses a session that turned busy, and writes nothing', [r.asked, fs.existsSync(path.join(closeDir(), `${sid(11)}.json`))], [false, false]); }
+    const refuseClose0 = async (name, n, re) => { acts.length = 0; const r = await closeSession({ configRepo: null, repo, session: sid(n), selfPid: 1 }, actFake()); eq(`close refuses ${name}, and changes nothing`, [r.closed, re.test(r.why || ''), acts.length], [false, true, 0]); };
+    const refuseAsk = async (name, n, fake, re) => { acts.length = 0; const r = await ask({ configRepo: null, repo, session: sid(n), selfPid: 1 }, fake); eq(`ask refuses ${name}, and types nothing`, [r.asked, re.test(r.why || ''), typed().length], [false, true, 0]); };
+    fs.rmSync(path.join(closeDir(), `${sid(11)}.json`), { force: true });
+    await refuseAsk('a session whose prompt line has text', 11, actFake({ iterm: { ...actFake().iterm, pane: () => paneOf('my own words') } }), /prompt line shows text/);
+    await refuseAsk('a session whose prompt line cannot be read', 11, actFake({ iterm: { ...actFake().iterm, pane: () => 'no box' } }), /cannot be read/);
+    await refuseAsk('a session with two iTerm sessions on its tty', 11, actFake({ iterm: { ...actFake().iterm, sessionsOfTty: () => [{ uid: 'A', inTab: 1 }, { uid: 'B', inTab: 1 }] } }), /2 iTerm sessions/);
+    await refuseAsk('a session with a background shell running', 11, actFake({ iterm: { ...actFake().iterm, pane: () => paneOf('', '  · 1 shell') } }), /background shell/);
+    { acts.length = 0; const r = await ask({ configRepo: null, repo, session: sid(11), selfPid: 1 }, actFake({ iterm: { ...actFake().iterm, pane: () => paneOf('Try "write a test for <filepath>"', '  ⏵⏵ bypass permissions on · ← 1 agent') } })); eq('ask: the prompt\'s dim suggestion and the "← 1 agent" of a new session do not block', [r.asked, typed().length], [true, 1]); fs.rmSync(path.join(closeDir(), `${sid(11)}.json`)); }
+    await refuseAsk('a session that turned busy just before', 11, actFake({ sessionStatus: () => 'busy' }), /status is now busy/);
+    eq('a refused ask writes no askedAt', fs.existsSync(path.join(closeDir(), `${sid(11)}.json`)), false);
+    // The only thing s11 lacks is its answer: close refuses it (the Chief asks first).
+    await refuseClose0('a session whose only reason is that it has not answered', 11, /has not answered/);
+    write(path.join(closeDir(), `${sid(11)}.json`), JSON.stringify({ sessionId: sid(11), verdict: 'yes', at: iso(NOW) }));
+    await refuseAsk('a session that has already answered (the owner asked it)', 11, actFake(), /already answered/);
+    fs.rmSync(path.join(closeDir(), `${sid(11)}.json`));
+    write(loop12, '# x\n**Loop-state: RUNNING**\nTicket: TCK-10 bound at kickoff\n');
+    await refuseAsk('an idle session whose loop still runs', 12, actFake(), /not done: its loop is still RUNNING/);
+    write(loop12, '# x\n**Loop-state: COMPLETE**\nTicket: TCK-10 bound at kickoff\n');
+    await refuseAsk('a busy session', 5, actFake(), /not idle/);
+    await refuseAsk('a session with an open ticket', 3, actFake(), /not closed/);
+    await refuseAsk('a session with no ticket', 4, actFake(), /no ticket/);
+    { acts.length = 0; const r = await ask({ configRepo: null, repo, session: sid(11), selfPid: 111 }, actFake()); eq("ask refuses the Chief's own session (by pid)", [r.asked, typed().length], [false, 0]); }
+    { acts.length = 0; const r = await ask({ configRepo: null, repo, session: sid(11), selfPid: 1 }, actFake({ ps: () => null })); eq('ask refuses a session whose facts cannot be read (facts-failed)', [r.asked, /not done: the check could not read the processes/.test(r.why || ''), typed().length], [false, true, 0]); }
+    // close s1 (TCK-1 shipped, a fresh yes): its processes are stopped (groups when the leader is one of them), /exit typed once, the iTerm tab closed, gone reported.
+    acts.length = 0;
+    const c1 = await closeSession({ configRepo: null, repo, session: sid(1), selfPid: 1 }, actFake());
+    eq('close: a ready session is closed', [c1.closed, c1.resume], [true, `claude --resume ${sid(1)}`]);
+    eq('close: its processes get SIGTERM, a group only when its leader is one of them, never the session\'s own group', acts.filter((a) => a[0] === 'kill').map((a) => a[1]), [203, -300, -302, -303]);
+    eq('close: /exit is typed once, the iTerm session closed by its uid, gone reported with its full folder', [typed().map((a) => a[2]), acts.filter((a) => a[0] === 'close').map((a) => a[1]), acts.filter((a) => a[0] === 'post').map((a) => [a[1], a[2].state, a[2].session_id, a[2].cwd])], [['/exit'], ['UID-1'], [['/api/mcp/coordination/sessions/heartbeat', 'gone', sid(1), w1]]]);
+    const refuseClose = async (name, n, fake, re) => { acts.length = 0; const r = await closeSession({ configRepo: null, repo, session: sid(n), selfPid: 1 }, fake); eq(`close refuses ${name}, and changes nothing`, [r.closed, re.test(r.why || ''), acts.filter((a) => a[0] !== 'post' || true).length], [false, true, 0]); };
+    await refuseClose('while the owner\'s pause is in force', 1, actFake({ paused: async () => true }), /paused/);
+    await refuseClose("when the owner's pause cannot be read", 1, actFake({ paused: async () => null }), /cannot be read/);
+    { const got = []; acts.length = 0; await closeSession({ configRepo: null, repo, session: sid(1), selfPid: 104 }, actFake({ paused: async (id) => { got.push(id); return true; } })); eq("close reads the pause from the inbox of the Chief's own session", [got, acts.length], [[sid(4)], 0]); }
+    await refuseClose('a session that shares its tab with another pane', 1, actFake({ iterm: { ...actFake().iterm, sessionsOfTty: () => [{ uid: 'UID-1', inTab: 2 }] } }), /shares its iTerm tab/);
+    await refuseClose('a session with text in its prompt line', 1, actFake({ iterm: { ...actFake().iterm, pane: () => paneOf('wait') } }), /prompt line shows text/);
+    await refuseClose('a busy session', 5, actFake(), /not idle/);
+    await refuseClose('a waiting session', 6, actFake(), /not idle/);
+    await refuseClose('a session whose check says no (an open ticket)', 3, actFake(), /check says no/);
+    await refuseClose('a session that has not answered', 2, actFake(), /check says no/);
+    { acts.length = 0; const r = await closeSession({ configRepo: null, repo, session: sid(1), selfPid: 101 }, actFake()); eq("close refuses the Chief's own session", [r.closed, acts.length], [false, 0]); }
+    { let n = 0; acts.length = 0; const r = await closeSession({ configRepo: null, repo, session: sid(1), selfPid: 1 }, actFake({ sessionStatus: () => (++n === 1 ? 'idle' : 'busy') })); eq('close: the status is read again just before /exit: a session that turned busy gets no /exit', [r.closed, /status is now busy/.test(r.why || ''), typed().length], [false, true, 0]); }
+    { acts.length = 0; const r = await closeSession({ configRepo: null, repo, session: sid(1), selfPid: 1 }, actFake({ ps: () => null })); eq('close: a fact the check cannot read (facts-failed) blocks it', [r.closed, /could not read the processes/.test(r.why || ''), acts.length], [false, true, 0]); }
+    { acts.length = 0; const r = await closeSession({ configRepo: null, repo, session: sid(1), selfPid: 1 }, actFake({ get: async (p) => (p.endsWith('status=shipped') ? null : baseGet(p)) })); eq('close: an unreadable ticket status (fixer chief, but not one close fixes) blocks it', [r.closed, /could not read TCK-1/.test(r.why || ''), acts.length], [false, true, 0]); }
+    { record({ sessionId: sid(3), verdict: 'yes', now: NOW }); acts.length = 0; const r = await closeSession({ configRepo: null, repo, session: sid(3), selfPid: 1 }, actFake()); eq('close: an open ticket blocks it even with a recorded yes', [r.closed, /Ready to merge/.test(r.why || ''), acts.length], [false, true, 0]); fs.rmSync(path.join(closeDir(), `${sid(3)}.json`)); }
+    { acts.length = 0; const slotGet = async (p) => (p === '/api/mcp/coordination/allocations' ? { allocations: [], ports: [{ slot: 9, backend_port: 5709, frontend_port: 3709, host: 'tck-1.localhost', ticket: 'TCK-1', holder: 'h-1' }] } : baseGet(p)); const r = await closeSession({ configRepo: null, repo, session: sid(1), selfPid: 1 }, actFake({ get: slotGet, tabs: async () => ({ tabs: [{ id: 77, ticket: 'TCK-1', label: 'done', openedBy: null }], nonLocalBySession: {} }) })); eq('close: its port slot is released and its tabs go to the tab closer', [r.closed, acts.filter((a) => a[0] === 'post' && /port\/release/.test(a[1])).map((a) => a[2]), acts.filter((a) => a[0] === 'tabs').map((a) => a[1])], [true, [{ holder: 'h-1', ticket: 'TCK-1' }], [[77]]]); }
+    { const seen = []; const d = actDeps({}, { ...realDeps({}), get: async (p) => { seen.push(p); return { pause: { paused: false } }; } }); eq('the real pause read asks the server for this session\'s inbox, and no session id reads as unknown', [await d.paused('abc-123'), await d.paused(null), seen], [false, null, ['/api/mcp/coordination/inbox?session=abc-123&limit=1']]); }
+    eq('the iTerm scripts: by unique id, by tty, the tab count, and the shared-tab guard before close', [/if \(\(unique id of s\) as text\) is "U-1" then/.test(paneScript('U-1')), /if \(\(unique id of s\) as text\) is "U-1" then/.test(typeLineScript('U-1', 'x')), /if \(tty of s\) is "\/dev\/ttys1" then/.test(itermSessionsScript('/dev/ttys1')), /set n to count of sessions of t/.test(itermSessionsScript('/dev/ttys1')), /if \(count of sessions of t\) is not 1 then return "shared"\n\s*close s/.test(closeItermScript('U-1'))], [true, true, true, true, true]);
+    eq('the ask line names the main checkout for the session\'s own check', askLine('/main/repo').includes('check --pid $PPID --repo /main/repo'), true);
+    eq("the ask line quotes a path with a space or a quote as one shell word", [askLine('/a b/c').includes("--repo '/a b/c'"), shq("/it's"), shq('/plain/path-1.x')], [true, "'/it'\\''s'", '/plain/path-1.x']);
+    eq('close itself fixes exactly these three reasons; every other reason blocks', FIXED_BY_CLOSE, ['process', 'port', 'tabs']);
+    { acts.length = 0; const r = await closeSession({ configRepo: null, repo, session: sid(1), selfPid: 1 }, actFake({ tabs: async () => ({ tabs: [], nonLocalBySession: { [sid(1)]: 1 } }) })); eq('close: a tabs reason the session must fix (its own non-local tab) blocks it: only fixer chief goes on', [r.closed, /other Chrome tab/.test(r.why || ''), acts.length], [false, true, 0]); }
+    { acts.length = 0; const r = await closeSession({ configRepo: null, repo, session: sid(1), selfPid: 1 }, actFake({ alive: (pid) => pid === 101 })); eq('close: a session that does not exit gets no second keystroke', [r.closed, /did not end/.test(r.why), typed().length], [false, true, 1]); }
+    { acts.length = 0; const r = await closeSession({ configRepo: null, repo, session: sid(1), selfPid: 1 }, actFake({ foreground: () => ['-zsh', 'vim notes.txt'] })); eq('close: its iTerm tab stays open when something other than a shell runs there', [r.closed, acts.some((a) => a[0] === 'close'), r.steps.some((x) => /left its iTerm tab open/.test(x))], [true, false, true]); }
+    { acts.length = 0; const r = await closeSession({ configRepo: null, repo, session: sid(1), selfPid: 1 }, actFake({ alive: () => true })); eq('close: a process that survives SIGTERM stops the close before /exit', [r.closed, /still running/.test(r.why), typed().length], [false, true, 0]); }
+    { const moved = new Map([...cwds]); moved.set(303, `${root}/elsewhere`); let reads = 0; acts.length = 0; const r = await closeSession({ configRepo: null, repo, session: sid(1), selfPid: 1 }, actFake({ cwds: () => (++reads === 1 ? cwds : moved) })); eq('close: a process that moved out of the worktree between the two reads stops the close before any signal', [r.closed, /no longer runs from/.test(r.why || ''), acts.length], [false, true, 0]); }
+    { const moved = new Map([...cwds]); moved.set(303, `${w1}-old`); let reads = 0; acts.length = 0; const r = await closeSession({ configRepo: null, repo, session: sid(1), selfPid: 1 }, actFake({ cwds: () => (++reads === 1 ? cwds : moved) })); eq('close: a process that moved to a sibling folder with the same name start (<worktree>-old) also stops the close', [r.closed, /no longer runs from/.test(r.why || ''), acts.length], [false, true, 0]); }
+    { const changed = new Map([...ps]); changed.set(302, { ...ps.get(302), command: 'node /other/thing.js' }); let reads = 0; acts.length = 0; const r = await closeSession({ configRepo: null, repo, session: sid(1), selfPid: 1 }, actFake({ ps: () => (++reads === 1 ? ps : changed) })); eq('close: a process whose command changed stops the close before any signal', [r.closed, /another command/.test(r.why || ''), acts.length], [false, true, 0]); }
+
     // Own MCP work: a ticket whose commits changed the MCP source and the hook, with the version not on npm.
     write(path.join(sub, 'src', 'a.ts'), 'export const a = 2;\n'); write(path.join(sub, 'scripts', HOOK_SCRIPT), '// hook v3\n');
     write(path.join(sub, 'skill-templates', 'noesis-ticket.md'), 'ticket v2\n');
@@ -1276,6 +1658,7 @@ function parseArgs(argv) {
     if (a === '--json') args.json = true;
     else if (a === '--all') args.all = true;
     else if (a === '--prove-read-only') args.proveReadOnly = true;
+    else if (a === '--by-message') args.byMessage = true;
     else if (a === '--session') args.session = val();
     else if (a === '--pid') args.pid = Number(val());
     else if (a === '--self-pid') args.selfPid = Number(val());
@@ -1291,7 +1674,7 @@ function parseArgs(argv) {
   return args;
 }
 
-const USAGE = 'usage: coord-close.mjs check [--session <id> | --pid <pid> | --all] [--closed <file>] [--repo <main checkout>] [--agents <file>] [--json] [--prove-read-only] | record (--pid <pid> | --session <id>) --verdict yes|no [--left <text>]... | candidates [--self-pid <pid>] [--json] [--prove-read-only] | --selftest';
+const USAGE = 'usage: coord-close.mjs ask --session <id> [--by-message] [--closed <file>] [--json] | close --session <id> [--closed <file>] [--json] | check [--session <id> | --pid <pid> | --all] [--closed <file>] [--repo <main checkout>] [--agents <file>] [--json] [--prove-read-only] | record (--pid <pid> | --session <id>) --verdict yes|no [--left <text>]... | candidates [--self-pid <pid>] [--json] [--prove-read-only] | --selftest';
 
 /** The Claude Code process this script runs under (the nearest `claude` among its parents), or null. */
 export function selfSessionPid(ps, from = process.pid) {
@@ -1331,6 +1714,15 @@ async function main(argv) {
       if (args.proveReadOnly) c.readOnly = { effects };
       console.log(args.json ? JSON.stringify(c, null, 2) : [`Ready to close: ${c.ready.length}`, ...c.ready.map((s) => `  ${s.name || s.sessionId.slice(0, 8)} ${s.ticket || ''} (${s.folder})`), `Maybe (no ticket): ${c.maybe.length}`, ...c.maybe.map((s) => `  ${s.name || s.sessionId.slice(0, 8)} (${s.folder})`)].join('\n') + proof());
       return effects.length ? 3 : 0;
+    }
+    if (args.cmd === 'ask' || args.cmd === 'close') {
+      if (!args.session) { console.error(`${args.cmd} needs --session <id>`); return 2; }
+      const d = actDeps(args, deps);
+      const r = args.cmd === 'ask' ? await ask(args, d) : await closeSession(args, d);
+      console.log(args.json ? JSON.stringify(r, null, 2) : args.cmd === 'ask'
+        ? (r.asked ? (r.by === 'message' ? `ready: send this to ${r.name} with SendMessage:\n${r.line}` : `asked ${r.name || r.sessionId}${r.confirmed ? ' (it arrived as a prompt)' : ' (not confirmed in its transcript within 60 s)'}`) : `not asked: ${r.why}`)
+        : [r.closed ? `closed ${r.name || r.sessionId} (${r.folder}); to reopen it: ${r.resume}` : `not closed: ${r.why}`, ...r.steps.map((x) => `  ${x}`)].join('\n'));
+      return args.cmd === 'ask' ? (r.asked ? 0 : 1) : r.closed ? 0 : 1;
     }
     if (args.cmd === 'record') {
       const sid = args.session || (args.pid ? sessionOfPid(args.pid, deps) : null);
