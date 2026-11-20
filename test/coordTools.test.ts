@@ -479,13 +479,13 @@ describe('coordination tools → client', () => {
     expect(parse('coord_report', { conflicts: Array.from({ length: 201 }, () => ({})) })).toBe(false);
   });
 
-  it('the lists match the server\'s: 13 categories, 5 statuses, 4 resources', () => {
+  it('the lists match the server\'s: 14 categories, 5 statuses, 4 resources', () => {
     const options = (tool: string, field: string) => (schemas.get(tool)![field] as unknown as { unwrap?: () => { options: string[] }; options?: string[] });
     const opts = (tool: string, field: string) => {
       const f = options(tool, field);
       return [...(f.options ?? f.unwrap!().options)].sort();
     };
-    expect(opts('coord_decide', 'category')).toEqual(['cleanup', 'mcp-publish', 'merge-tickets', 'other', 'pick', 'plan', 'prod-schema', 'question', 'rebase', 'scope', 'ship', 'ship-order', 'stop-session']);
+    expect(opts('coord_decide', 'category')).toEqual(['cleanup', 'mcp-publish', 'merge-tickets', 'other', 'pick', 'plan', 'prod-schema', 'question', 'rebase', 'scope', 'ship', 'ship-order', 'start', 'stop-session']);
     expect(opts('coord_decisions', 'category')).toEqual(opts('coord_decide', 'category'));
     expect(opts('coord_decisions', 'status')).toEqual(['answered', 'auto', 'pending', 'reverted', 'review']);
     expect(opts('coord_lease', 'resource')).toEqual(['mcp-publish', 'prod-schema', 'ship', 'test-db']);
