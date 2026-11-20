@@ -1457,6 +1457,21 @@ export class NoesisClient {
     return this.requestWithCode('PUT', '/api/mcp/live-voice/recording', { on });
   }
 
+  /** The user's own words, oldest conversation first, in pages (TCK-1949, GET /api/mcp/live-voice/speech). */
+  async getLiveSpeech(
+    opts: { after?: number; id?: number; afterSeq?: number; since?: string; until?: string; limit?: number } = {},
+  ): Promise<LiveSpeechPage> {
+    const q = new URLSearchParams();
+    if (opts.after !== undefined) q.set('after', String(opts.after));
+    if (opts.id !== undefined) q.set('id', String(opts.id));
+    if (opts.afterSeq !== undefined) q.set('after_seq', String(opts.afterSeq));
+    if (opts.since !== undefined) q.set('since', opts.since);
+    if (opts.until !== undefined) q.set('until', opts.until);
+    if (opts.limit !== undefined) q.set('limit', String(opts.limit));
+    const qs = q.toString();
+    return this.requestWithCode<LiveSpeechPage>('GET', `/api/mcp/live-voice/speech${qs ? `?${qs}` : ''}`);
+  }
+
   // ============================================
   // SMART LINKS (TCK-1883)
   // ============================================
@@ -1852,6 +1867,25 @@ export interface LiveChatPage {
   conversation: LiveChatEntry;
   turns: LiveChatTurn[];
   next_after_seq: number | null;
+}
+
+/** One thing the user said (TCK-1949): their turns that belong together, joined. */
+export interface LiveUtterance {
+  seq_from: number;
+  seq_to: number;
+  at: string;
+  source: 'spoken' | 'typed' | 'wake' | string;
+  text: string;
+  /** The end of Live's last words before the user spoke; null when Live had not spoken yet. */
+  live_before: string | null;
+}
+
+export interface LiveSpeechPage {
+  conversations: Array<LiveChatEntry & { utterances: LiveUtterance[]; cut: boolean }>;
+  next_after: number | null;
+  next_in_conversation: { id: number; after_seq: number } | null;
+  in_progress_left_out: number;
+  held_back_from: number | null;
 }
 
 export interface SmartLinkTypeInput {
