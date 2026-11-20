@@ -308,6 +308,7 @@ Read the user's recorded Live conversations to find what went wrong, then keep t
 - `live_chat_mark_read` — mark conversations read (pass each one's `seen` mark, so turns saved while you read stay unread) or unread
 - `live_chat_delete` — delete one conversation's turns, only when the user asks; its usage row stays
 - `live_chat_recording` — read or set the "Keep a record of my Live conversations" switch
+- `live_chat_speech` — download only the user's own words, oldest conversation first, joined across pauses in speech, with Live's last words before each (for example to correct their English); `after` the newest conversation you already have, or `since`/`until` a day or a time. It marks nothing read
 
 ### Chat + history
 
