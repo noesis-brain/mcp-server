@@ -26,7 +26,7 @@ import type { NoesisClient } from '../api/NoesisClient.js';
 import { currentSessionRef } from './claudeSessions.js';
 
 const CATEGORY_ENUM = z.enum([
-  'ship-order', 'rebase', 'scope', 'cleanup', 'pick', 'other', 'question', 'plan',
+  'ship-order', 'rebase', 'scope', 'cleanup', 'pick', 'start', 'other', 'question', 'plan',
   'ship', 'prod-schema', 'mcp-publish', 'merge-tickets', 'stop-session',
 ]);
 const STATUS_ENUM = z.enum(['auto', 'review', 'pending', 'answered', 'reverted']);

@@ -251,7 +251,7 @@ export function isHelper(p, sessionPid, mcpCommands) {
 }
 
 /** A GET to the Noesis API with the ticket hook's config. null when there is no token or the call fails. */
-async function apiGet(p) {
+export async function apiGet(p) {
   try {
     const { loadConfig } = await import('./noesis-ticket-session.mjs');
     const cfg = loadConfig(process.cwd());
@@ -800,7 +800,7 @@ export const askLine = (repo) => `${ASK_PHRASE} (Chief of Staff: run your close 
 /** Every reason left is one that close fixes itself (its processes, its port slot, its tabs, fixer chief). */
 export const onlyCloseFixes = (s) => Array.isArray(s.reasons) && s.reasons.length > 0 && s.reasons.every((x) => FIXED_BY_CLOSE.includes(x.code) && x.fixer === 'chief');
 
-const escA = (s) => String(s).replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+export const escA = (s) => String(s).replace(/\\/g, '\\\\').replace(/"/g, '\\"');
 const US = String.fromCharCode(31);
 const RS2 = String.fromCharCode(30);
 /** The iTerm2 sessions on one tty: [{uid, inTab}] (inTab = how many sessions its tab holds). */
@@ -843,10 +843,14 @@ export function parseItermSessions(out) {
   return String(out || '').split(RS2).map((r) => r.replace(/^\n+/, '')).filter(Boolean).map((r) => { const [uid, n] = r.split(US); return { uid: String(uid || '').trim(), inTab: Number(n) }; }).filter((x) => x.uid);
 }
 
+/** A rule of Claude Code's prompt box: a line of ─, or of ─ with the session's name near its end ("──── tck-12 ─"),
+ *  which Claude Code draws for a session started with -n (measured on 2.1.309, TCK-1974). */
+export const PROMPT_RULE_RE = /^\s*─{8,}(?: \S.*? ─+)?\s*$/;
+
 /** The text in Claude Code's prompt line: between the last two lines made only of ─, without ❯. null when no prompt box is seen. */
 export function composerText(pane) {
   const ls = String(pane || '').split('\n');
-  const rules = ls.map((l, i) => (/^\s*─{8,}\s*$/.test(l) ? i : -1)).filter((i) => i >= 0);
+  const rules = ls.map((l, i) => (PROMPT_RULE_RE.test(l) ? i : -1)).filter((i) => i >= 0);
   if (rules.length < 2) return null;
   const [a, b] = rules.slice(-2);
   const text = ls.slice(a + 1, b).join('\n').replace(/^\s*❯\s?/, '').trim();
@@ -858,7 +862,7 @@ export function composerText(pane) {
  *  "← N agent" is counted too, but a brand-new session shows "← 1 agent", so it is not the session's own work. */
 export function backgroundWork(pane) {
   const ls = String(pane || '').split('\n');
-  const rules = ls.map((l, i) => (/^\s*─{8,}\s*$/.test(l) ? i : -1)).filter((i) => i >= 0);
+  const rules = ls.map((l, i) => (PROMPT_RULE_RE.test(l) ? i : -1)).filter((i) => i >= 0);
   const bar = ls.slice(rules.length ? rules[rules.length - 1] + 1 : 0).join(' ');
   const n = (re) => Number((re.exec(bar) || [])[1]) || 0;
   return { shells: n(/(\d+)\s+shells?\b/), agents: n(/←\s*(\d+)\s+agents?\b/) };
@@ -1150,7 +1154,7 @@ const ORIGINAL_WRITE_SYNC = fs.writeSync;
 // ── selftest ─────────────────────────────────────────────────────────────────
 
 /** The source text of one top-level function or const in a module's text, or null. */
-function sourceOf(text, name) {
+export function sourceOf(text, name) {
   const fn = new RegExp(`^(?:export )?function ${name}\\(`, 'm').exec(text);
   const cn = new RegExp(`^(?:export )?const ${name} = `, 'm').exec(text);
   const m = fn || cn;
@@ -1438,6 +1442,10 @@ async function selftest() {
     eq('composerText: the empty prompt, its dim suggestion, typed text, and no prompt box', [composerText(paneOf('')), composerText(paneOf('Try "write a test for <filepath>"')), composerText(paneOf('half typed')), composerText(paneOf('Try "x" and more')), composerText('no box here')], ['', '', 'half typed', 'Try "x" and more', null]);
     eq('backgroundWork: shells and agents in the status bar', [backgroundWork(paneOf('', '  ⏵⏵ bypass permissions on · 1 shell · ← 2 agents')), backgroundWork(paneOf(''))], [{ shells: 1, agents: 2 }, { shells: 0, agents: 0 }]);
     eq('composerText reads the last prompt box, not an earlier rule in the output', composerText(['old output', rule, 'a table row', rule, '✻ done', rule, '❯ ', rule, '  bar'].join('\n')), '');
+    eq('composerText and backgroundWork find the prompt box of a named session (-n draws the name in its top rule, TCK-1974)', [composerText(['out', `${'─'.repeat(30)} tck-12 ─`, '❯ ', rule, '  · 1 shell'].join('\n')), backgroundWork([`${'─'.repeat(30)} tck-12 ─`, '❯ ', rule, '  · 1 shell'].join('\n')).shells, composerText(['out', `${'─'.repeat(30)} tck-12 ─`, '❯ half typed', rule].join('\n'))], ['', 1, 'half typed']);
+    // Lines below the prompt box that only look like a rule (no closing ─, text before the ─, a name with no space) are not
+    // rules: if they were, the last two "rules" would move and the typed text would read as empty.
+    eq('a named rule needs ─ at both ends and a space before the name; anything else is not a rule', [`${'─'.repeat(12)} note: done`, `x ${'─'.repeat(30)} tck-1 ─`, `${'─'.repeat(30)}tck-1─`].map((l) => composerText([rule, '❯ typed', rule, l].join('\n'))), ['typed', 'typed', 'typed']);
     eq('backgroundWork reads only the status bar below the prompt box', backgroundWork(['it said: · 3 shells running', rule, '❯ ', rule, '  ⏵⏵ bypass permissions on'].join('\n')), { shells: 0, agents: 0 });
     eq('the typing script sends the line without a newline, waits 1.5 s, then a bare Enter', [/write s text "x" newline no\n\s*delay 1\.5\n\s*write s text ""/.test(typeLineScript('U', 'x'))], [true]);
     eq('parseItermSessions', parseItermSessions(`ABC-1${US}1${RS2}DEF-2${US}2${RS2}`), [{ uid: 'ABC-1', inTab: 1 }, { uid: 'DEF-2', inTab: 2 }]);
