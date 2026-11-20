@@ -888,6 +888,11 @@ async function selftest() {
     sh(repo, 'remote', 'set-url', 'origin', remote);
     s = await start(sargs('TCK-16', { max: 1 }), sd);
     eq('start: a refused check opens no tab and makes no worktree', [s.started, opened.length, fs.existsSync(path.join(root, 'repo-tck-16'))], [false, openedBefore, false]);
+    eq('start: the refusal carries its check, so the Chief can keep a ticket at the limit in the queue', [s.check && s.check.reasons.map((x) => x.code)], [['limit']]);
+    pause = { pause: { paused: true } };
+    s = await start(sargs('TCK-16'), sd);
+    eq('start: the owner\'s pause refuses a start: no tab, no worktree, and the check says paused', [s.started, s.check && s.check.reasons.map((x) => x.code), opened.length, fs.existsSync(path.join(root, 'repo-tck-16'))], [false, ['paused'], openedBefore, false]);
+    pause = { pause: { paused: false } };
     s = await start(sargs('TCK-17', { selfPid: undefined }), sd);
     eq('start: without the Chief\'s terminal no tab is opened', [s.started, /terminal was not found/.test(s.why), opened.length], [false, true, openedBefore]);
     eq('start: a bad --prompt is refused before anything', [(await start(sargs('TCK-17', { prompt: 'a\nb' }), sd)).started, opened.length], [false, openedBefore]);
@@ -965,6 +970,13 @@ async function selftest() {
     s = await start(sargs('TCK-24'), sd);
     eq('start: the flags in start.json reach the launch line', [s.started, opened[opened.length - 1].line], [true, `cd ${w24} && claude --model 'opus[1m]' -n tck-24 '/cc-loop TCK-24'`]);
     fs.rmSync(path.join(cfg, 'coord', 'start.json'));
+    // After Down, the pane shows "Yes" chosen, but for another folder: still no Enter.
+    keys.length = 0;
+    lists = [...lists, { key: 'TCK-26', work_status: 'created', bound_session_id: null }];
+    panes = [dialog(path.join(root, 'repo-tck-26'), false), dialog('/somewhere/else', true)];
+    s = await start(sargs('TCK-26'), sd);
+    eq('start: "Yes" chosen in a dialog for another folder gets no Enter, even after Down', [s.started, keys, /another folder/.test(s.why)], [false, ['down'], true]);
+    panes = [promptBox(25)];
     const clockBefore23 = clock;
     s = await start(sargs('TCK-23'), { ...sd, iterm: { ...sd.iterm, open: () => '' } });
     eq('start: when iTerm2 opens no tab, it stops at once and writes no record', [s.started, /did not open the tab/.test(s.why), fs.existsSync(path.join(sdir, 'TCK-23.json')), clock - clockBefore23], [false, true, false, 0]);

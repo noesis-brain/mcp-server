@@ -269,7 +269,7 @@ with no argument starts nothing: it only names the queue in the report.
      and go on to the next ticket.
    - **Card.** Call `coord_decisions` with `category: "start"` and the `ticket`, and look only at the cards created
      after the ticket's `at` in the queue: an older card belongs to an older request. A card that still waits for the
-     owner means: skip the ticket in this pass. A card the owner answered "Start it now" means: skip Check and Record,
+     owner means: skip the ticket in this pass. A card the owner answered "Start it now" means: do Check, skip Record,
      and go to Start. A card answered "Not now" means: take the ticket out of the queue.
    - **Check.** Run `node $S/coord-start.mjs check --ticket <key> --repo <repo> --self-pid $PPID --json`. A `limit` or
      `paused` reason ends this step: the tickets after it wait. A `closed`, `started`, `bound`, `not-found` or
@@ -286,10 +286,11 @@ with no argument starts nothing: it only names the queue in the report.
      start card is the one card you carry out yourself, because no session owns its ticket yet. Any other error means:
      do not start, and name it under Needs you.
    - **Start.** Run `node $S/coord-start.mjs start --ticket <key> --repo <repo> --self-pid $PPID --json` in the
-     foreground. It checks again, makes the worktree, opens the iTerm2 tab `tck-<n>` and waits up to 90 seconds for the
-     session. With `started: true`, take the ticket out of the queue, and write one line under What I did. With
-     `busy: true`, another start runs: try that ticket again on the next pass. Any other answer takes the ticket out of
-     the queue, and its `why` goes under Needs you. When the answer has a `record`, a tab opened: the owner looks at the
+     foreground, with a Bash timeout of 300000 ms. It checks again, makes the worktree, opens the iTerm2 tab `tck-<n>`
+     and waits up to 90 seconds for the session. With `started: true`, take the ticket out of the queue, and write one
+     line under What I did. With `busy: true`, another start runs: try that ticket again on the next pass. When the
+     answer's `check` has a `limit` or `paused` reason, keep the ticket in the queue and end this step. Any other answer
+     takes the ticket out of the queue, and its `why` goes under Needs you. When the answer has a `record`, a tab opened: the owner looks at the
      tab `tck-<n>`. A ticket is never started twice: `check` refuses it (`started-before`) until the owner removes its
      record.
 4. A session you started runs `/cc-loop TCK-<n>`: it binds its ticket, and its kickoff questions and its plan reach you in
@@ -367,7 +368,8 @@ tab next to your own tab.
    - When nothing matches, start nothing, and say which words matched no ticket.
 2. **Leave out** a Shipped, Merged or Dropped ticket and a ticket a session holds. Name each one in the report.
 3. **Order them** the way step 5 ranks waiting tickets: the written `pick` rules first, then the default order. The
-   pass of item 5 records that order as the pick in its step 5, unless picks are off.
+   pass of item 5 records that order as the pick in its step 5, also when a pick exists: the owner's request comes
+   first. Skip it when picks are off.
 4. **Write the queue** to `~/.claude/coord/start-queue.json`:
    `{"tickets": [{"key": "TCK-…", "at": "<ISO time>", "request": "<the owner's words>"}]}`. A later request adds
    its tickets at the end, each with its own time, and a ticket is never in the queue twice. When the owner asks you
