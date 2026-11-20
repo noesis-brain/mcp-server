@@ -20,10 +20,12 @@ describe('coord-start.mjs', () => {
   });
 
   it('prints its usage for an unknown command, an unknown flag or a bad value, and runs nothing', () => {
-    for (const args of [['nope'], [], ['check', '--nope'], ['check', '--ticket'], ['check', '--max', '0'], ['check', '--max', '21'], ['check', '--max', '2.5'], ['check', '--self-pid', '-1'], ['prepare', '--prove-read-only', '--ticket', 'TCK-1']]) {
+    for (const args of [['nope'], [], ['check', '--nope'], ['check', '--ticket'], ['check', '--max', '0'], ['check', '--max', '21'], ['check', '--max', '2.5'], ['check', '--self-pid', '-1'],
+      ['prepare', '--prove-read-only', '--ticket', 'TCK-1'], ['start', '--prove-read-only', '--ticket', 'TCK-1'], ['check', '--ticket', 'TCK-1', '--prompt', 'x'],
+      ['start', '--ticket', 'TCK-1', '--prompt', 'a\nb'], ['start', '--ticket', 'TCK-1', '--prompt', ''], ['start', '--ticket', 'TCK-1', '--prompt', 'x'.repeat(301)], ['toString']]) {
       const r = run(...args);
       expect(r.status, args.join(' ')).toBe(2);
-      expect(r.stderr, args.join(' ')).toMatch(/usage:|needs|works with check only/);
+      expect(r.stderr, args.join(' ')).toMatch(/usage:|needs|works with check and list only|works with start only/);
     }
   });
 });
