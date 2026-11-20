@@ -251,7 +251,7 @@ export function isHelper(p, sessionPid, mcpCommands) {
 }
 
 /** A GET to the Noesis API with the ticket hook's config. null when there is no token or the call fails. */
-async function apiGet(p) {
+export async function apiGet(p) {
   try {
     const { loadConfig } = await import('./noesis-ticket-session.mjs');
     const cfg = loadConfig(process.cwd());
@@ -1150,7 +1150,7 @@ const ORIGINAL_WRITE_SYNC = fs.writeSync;
 // ── selftest ─────────────────────────────────────────────────────────────────
 
 /** The source text of one top-level function or const in a module's text, or null. */
-function sourceOf(text, name) {
+export function sourceOf(text, name) {
   const fn = new RegExp(`^(?:export )?function ${name}\\(`, 'm').exec(text);
   const cn = new RegExp(`^(?:export )?const ${name} = `, 'm').exec(text);
   const m = fn || cn;
