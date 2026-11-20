@@ -732,7 +732,7 @@ describe('the /noesis-chief skill ships in this package (TCK-1890)', () => {
       "| Edit product code, or any file in a ticket's worktree |",
       '| Merge, push, publish to npm, or apply SQL to production |',
       '| Stop a process or a session (`stop-session` is an owner gate) |',
-      '| Carry out an answered card: the session that owns the ticket does it |',
+      '| Carry out an answered card: the session that owns the ticket does it. A start card is the one exception: no session owns its ticket yet |',
     ]) expect(template).toContain(row);
     for (const phrase of [
       'Do steps 1, 2 and 3, but skip `coord_report` and carry out no action.',
@@ -760,6 +760,57 @@ describe('the /noesis-chief skill ships in this package (TCK-1890)', () => {
       "Then one batched question for the proposed messages, the C9 message of step 3 included (\"Send all of them\", \"Send none\", \"Let me pick\").",
       "Then call `coord_report` with `scan_file` set to the absolute path of `scan.json` (expand `~`: the tool does not).",
     ]) expect(template).toContain(sentence);
+  });
+
+  it('starts only the tickets the owner hands it, through coord-start.mjs, within the limit (TCK-1974)', async () => {
+    // Step 5b and the Starting section are pinned whole: an added, removed or changed sentence there must be deliberate,
+    // so it changes test/fixtures/chief-start-sections.md too.
+    const section = (from: string, to: string) => template.slice(template.indexOf(from), template.indexOf(to, template.indexOf(from)));
+    const pinned = fs.readFileSync(path.join(__dirname, 'fixtures', 'chief-start-sections.md'), 'utf8');
+    expect(section('### 5b. Start the queued tickets (TCK-1974)', '### 6. Report') + section('## Starting ticket sessions (`/noesis-chief start`)', '## Watch mode')).toBe(pinned);
+    // The five steps for each queued ticket, in their order: no start before the card, the check and the record.
+    const step5b = section('### 5b. Start the queued tickets (TCK-1974)', '### 6. Report');
+    const order = ['- **Overlap.**', '- **Card.**', '- **Check.**', '- **Record.**', '- **Start.**'].map((h) => step5b.indexOf(h));
+    expect(order.every((at, i) => at > 0 && (i === 0 || at > order[i - 1])), String(order)).toBe(true);
+    const at = (h: string) => template.indexOf(h);
+    expect(at('### 5. Up next: record a pick')).toBeLessThan(at('### 5b. Start the queued tickets (TCK-1974)'));
+    expect(at('### 5b. Start the queued tickets (TCK-1974)')).toBeLessThan(at('### 6. Report'));
+    expect(at('## Starting ticket sessions (`/noesis-chief start`)')).toBeLessThan(at('## Watch mode'));
+    // The lines outside those sections that the starts changed.
+    for (const sentence of [
+      "| Start a Claude Code session for a ticket the owner handed you, with `coord-start.mjs`, when its check says yes and `coord_decide` answers `proceed` or `review`, or on the owner's yes to a start card (Starting ticket sessions) | Start a ticket the owner did not hand you (your own pick included), start one when the check says no, or restart a session that is gone |",
+      '| Carry out an answered card: the session that owns the ticket does it. A start card is the one exception: no session owns its ticket yet |',
+      'A pick is a suggestion: you start only the tickets the owner hands you (step 5b).',
+      '- `start <ticket keys or words>`: put the tickets the owner hands you in the start queue, run one pass, which starts the ones that can start now, then go on in watch mode (see Starting ticket sessions).',
+      'Without it, `ScheduleWakeup` every 30 minutes while any ticket is active or the start queue holds tickets. Stop when no ticket is active and the start queue is empty.',
+      "- Start no session (step 5b needs the server's `start` category): list the start queue in the report instead. The queue does not keep watch mode on.",
+      'After the pass, if any ticket is active or the start queue holds tickets, start the scan watcher once:',
+      '2. When the start queue holds tickets, or `coord-start.mjs list` has a row whose ticket is still open, run step 5b too: a ship or a free slot may let the next ticket start.',
+      '3. **What I did.** One line per message sent, per version handed out, per question or plan answered, per session started and per pull of the main checkout, with the rule.',
+      '4. **Started sessions.** Each row of `coord-start.mjs list`: the ticket, its session, its state and what needs the owner.',
+    ]) expect(template, sentence).toContain(sentence);
+    expect(template).not.toContain('A pick is a suggestion: you never start a ticket.');
+    // Whole lines, so that text added to them is caught too: the plain pass, the version note and the 30-minute wake.
+    const lines = template.split('\n');
+    for (const line of [
+      '- (none): one pass, then stop.',
+      '- Since TCK-1974, the Chief starts a session for each ticket the owner hands it (`/noesis-chief start`). Before, a pick was only a suggestion.',
+      '`ScheduleWakeup` with 1800 seconds and the prompt `/noesis-chief watch`: that wake comes when',
+      'nothing changes, or when the watcher is not running. On a wake:',
+      "argument-hint: \"[watch | close | start <ticket keys or words>] [--repo <main checkout>]\"",
+      "4. **Started sessions.** Each row of `coord-start.mjs list`: the ticket, its session, its state and what needs the owner. Then each ticket still in the start queue, with what it waits for. It waits for a free slot, a named ticket's ship, the owner's card, or a reason the owner must fix.",
+      "4. Report only the new and the resolved findings, any new card, the questions and plans you answered or left, and any pull. Also report each session you started, and each one that needs the owner.",
+    ]) expect(lines, line).toContain(line);
+    // The trigger words in the description name the starts.
+    expect(lines[1]).toContain("It also starts and watches a Claude Code session for each ticket the owner hands it (TCK-1974). Use it when the user says '/noesis-chief start TCK-1968 TCK-1969', 'start these tickets' or 'start sessions for TCK-…'. Use it too when the user names tickets in words, such as 'fix the recently found bugs'.");
+    // What the text says about the script is what the script does.
+    const start = await import('../scripts/coord-start.mjs');
+    expect([start.DEFAULTS.maxSessions, [...start.DEFAULTS.claudeArgs], start.BIND_WAIT_MIN, start.START_WAIT_MS]).toEqual([4, ['--dangerously-skip-permissions', '--chrome'], 10, 90_000]);
+    expect(pinned).toContain(`{"maxSessions": ${start.DEFAULTS.maxSessions}, "claudeArgs":\n[${start.DEFAULTS.claudeArgs.map((a: string) => `"${a}"`).join(', ')}]}`);
+    expect(pinned).toContain(`a session that has not bound its ticket after ${start.BIND_WAIT_MIN} minutes`);
+    expect(pinned).toContain(`waits up to ${start.START_WAIT_MS / 1000} seconds`);
+    const script = fs.readFileSync(path.join(__dirname, '..', 'scripts', 'coord-start.mjs'), 'utf8');
+    for (const code of ["add('started-before'", 'busy: true', 'needsYou', "'--self-pid'", "add('limit'", "add('paused'", "add('closed'", "add('started'", "add('bound'", "'not-found'", "code: 'dirty'", "code: 'folder-taken'", "code: 'wrong-branch'", "add('config'"]) expect(script, code).toContain(code);
   });
 
   it('noesis-mcp setup installs it into ~/.claude/commands unchanged', async () => {

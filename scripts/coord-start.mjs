@@ -38,9 +38,11 @@
 // presses Enter on "No, exit". It finds the new session by its folder in ~/.claude/sessions/ and
 // writes ~/.claude/coord/started/TCK-<n>.json. --prompt replaces the /cc-loop line, for checks with a
 // harmless prompt. A started session that has not bound its ticket yet holds a slot, so two starts in a
-// row never pass the limit. Starts run one at a time: an exclusive lock file (started/.start.lock) covers
-// the check, the worktree, the tab and the record, so two starts at once never pass the limit or start
-// one ticket twice. A second start meanwhile is refused ("busy"), and the Chief tries it on the next pass.
+// row never pass the limit. A ticket is started only once: check refuses a ticket that has a start record
+// ("started-before"), so a gone session is never restarted and a failed start is not tried again while its
+// tab may still wait. The owner removes the record to allow another start. Starts run one at a time: an
+// exclusive lock file (started/.start.lock) covers the check, the worktree, the tab and the record, so two
+// starts at once never pass the limit or start one ticket twice. A second start meanwhile is refused ("busy"), and the Chief tries it on the next pass.
 // The dialog's folder must be the worktree itself (shown whole, or with the home folder as ~), never a
 // folder that merely contains its path.
 //
@@ -80,7 +82,7 @@ const SESSION_ONLY = ['limit', 'paused', 'pause-unknown', 'agents-unknown'];
 export const startedDir = () => path.join(configDir(), 'coord', 'started');
 export const startLockFile = () => path.join(startedDir(), '.start.lock');
 /** How long start waits for the new session, and how long a started session may take to bind its ticket. */
-const START_WAIT_MS = 90_000;
+export const START_WAIT_MS = 90_000;
 const TRUST_MOVE_MS = 8_000;
 const LOCK_STALE_MS = START_WAIT_MS + 5 * 60_000;
 export const BIND_WAIT_MIN = 10;
@@ -258,14 +260,17 @@ export async function check(args, deps) {
   if (paused === null) add('pause-unknown', selfSid ? 'the owner\'s pause could not be read' : 'the Chief\'s own session was not found, so its pause could not be read');
   else if (paused) add('paused', 'the owner paused the sessions ("Pause all")');
 
+  // A ticket is started once. A gone session is never started again, and neither is a start that found no session:
+  // its tab may still wait at a dialog. The owner removes the record to allow another start.
+  const before = readStarted().find((rec) => rec.ticket === key);
+  if (before) add('started-before', `a session was started for ${key} at ${before.startedAt}, and the Chief never starts a ticket twice: remove ${path.join(startedDir(), `${key}.json`)} to allow another start`);
+
   const agents = deps.agents();
   let inUse = null;
   if (!Array.isArray(agents)) add('agents-unknown', '`claude agents --json` could not be read');
   else if (board) {
     const bound = sessionsInUse(agents, board.rows, selfSid, deps.alive);
-    const pending = pendingStarts(readStarted(), bound, board.rows, deps.alive, deps.now());
-    inUse = [...bound, ...pending];
-    if (pending.some((s) => s.ticket === key)) add('pending', `a session for ${key} was started and has not bound it yet`);
+    inUse = [...bound, ...pendingStarts(readStarted(), bound, board.rows, deps.alive, deps.now())];
     if (inUse.length >= max) add('limit', `${inUse.length} ticket sessions run, and the limit is ${max}`);
   }
 
@@ -887,9 +892,11 @@ async function selftest() {
     eq('start: without the Chief\'s terminal no tab is opened', [s.started, /terminal was not found/.test(s.why), opened.length], [false, true, openedBefore]);
     eq('start: a bad --prompt is refused before anything', [(await start(sargs('TCK-17', { prompt: 'a\nb' }), sd)).started, opened.length], [false, openedBefore]);
 
-    // Pending starts hold a slot, and the same ticket is not started twice.
+    // Pending starts hold a slot, and the same ticket is never started twice.
     r = await check(sargs('TCK-11'), sd);
-    eq('check: a ticket whose started session has not bound it yet is pending', codes(r).includes('pending'), true);
+    eq('check: a ticket whose started session has not bound it yet is not started again', [codes(r), r.reasons[0].text.includes(path.join(cfg, 'coord', 'started', 'TCK-11.json'))], [['started-before'], true]);
+    eq('check: a start that found no session is not tried again (its tab may still wait at a dialog)', codes(await check(sargs('TCK-15'), sd)), ['started-before']);
+    eq('prepare: and a started ticket gets no second worktree step', (await prepare(sargs('TCK-15'), sd)).prepared, false);
     r = await check(sargs('TCK-17'), sd);
     eq('check: started sessions not bound yet hold slots: sA + TCK-11 + TCK-12, and the 4 records with no session (under 10 min)', r.slots.used, 7);
     clock += 11 * 60_000;
@@ -904,6 +911,7 @@ async function selftest() {
     agents = [{ pid: 101, sessionId: 'sA-000000', kind: 'interactive' }, { pid: 777, sessionId: 'new-sess-11', kind: 'interactive' }];
     r = await check(sargs('TCK-17'), sd);
     eq('check: once bound, a started session counts once; a gone one not at all', [r.slots.used, r.slots.sessions.map((x) => `${x.ticket}${x.pending ? ' pending' : ''}`)], [2, ['TCK-3', 'TCK-11']]);
+    eq('check: the ticket of a gone session is never started again (no automatic restart)', codes(await check(sargs('TCK-12'), sd)), ['started-before']);
 
     // list.
     let l = await list({}, sd);
