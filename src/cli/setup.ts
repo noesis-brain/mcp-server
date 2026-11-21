@@ -482,6 +482,8 @@ const TICKET_TOOLS_ALLOW = [
   'mcp__noesis__backlog_ship',
   'mcp__noesis__backlog_merge',
   'mcp__noesis__backlog_set_gut',
+  // 2.22.0 (TCK-1950): reading the Jot spaces; the space write tools keep their prompt.
+  'mcp__noesis__backlog_spaces',
 ];
 
 /** The exact command we register: the copied script, absolute, forward slashes (`--hold` for the hold entry). */

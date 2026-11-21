@@ -279,6 +279,16 @@ The server exposes 19 MCP tools, grouped by domain:
 
 The `/noesis-ticket` skill drives them: start a ticket, `link` the session you are already in, set the status, refine, reset, or list. It also holds the procedure for new work in a bound session. A Shipped, Merged or Dropped ticket never moves (`TICKET_CLOSED`), and closing a ticket releases its binding.
 
+### Jot spaces (2.22.0)
+
+Every Jot ticket is in one space of its owner: a default space plus custom ones, such as Seagull or a personal to-do list. A tool names a space by its id, its name (case does not matter) or `default`.
+
+- `backlog_spaces` — list your spaces with their ticket counts
+- `backlog_upsert_space` — create a space, or change its name, description, icon or colour
+- `backlog_delete_space` — delete a space; its tickets move to the default space
+- `backlog_move_tickets` — move tickets by key, or every ticket of one space, to another space
+- `backlog_get` takes `space` to list one space (without it, every space is listed), and `backlog_upsert_issue` takes `space` to create a ticket in a space
+
 ### Catalogs + relations
 
 - `list_catalogs` — list user-defined catalog tags

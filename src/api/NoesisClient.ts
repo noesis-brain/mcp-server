@@ -1578,13 +1578,37 @@ export class NoesisClient {
 
   // ── Backlog v2 (loop surface /api/mcp/backlog) — thin passthroughs; semantics live server-side ──
 
-  async backlogList(params: { stage?: string; status?: string; q?: string } = {}): Promise<any> {
+  async backlogList(params: { stage?: string; status?: string; q?: string; space?: string } = {}): Promise<any> {
     const qs = new URLSearchParams();
     if (params.stage) qs.set('stage', params.stage);
     if (params.status) qs.set('status', params.status);
     if (params.q) qs.set('q', params.q);
+    if (params.space) qs.set('space', params.space);
     const suffix = qs.toString() ? `?${qs.toString()}` : '';
     return this.request('GET', `/api/mcp/backlog/issues${suffix}`);
+  }
+
+  // ── Jot spaces (2.22.0, TCK-1950). A space is named by its id, its name or "default". The error
+  // code (SPACE_NAME_TAKEN, DEFAULT_SPACE_DELETE, SPACE_NOT_FOUND) stays in the message. ──
+
+  async backlogSpaces(): Promise<any> {
+    return this.requestWithCode('GET', '/api/mcp/backlog/spaces');
+  }
+
+  async backlogCreateSpace(body: Record<string, unknown>): Promise<any> {
+    return this.requestWithCode('POST', '/api/mcp/backlog/spaces', body);
+  }
+
+  async backlogUpdateSpace(space: string, body: Record<string, unknown>): Promise<any> {
+    return this.requestWithCode('PATCH', `/api/mcp/backlog/spaces/${encodeURIComponent(space)}`, body);
+  }
+
+  async backlogDeleteSpace(space: string): Promise<any> {
+    return this.requestWithCode('DELETE', `/api/mcp/backlog/spaces/${encodeURIComponent(space)}`);
+  }
+
+  async backlogMoveTickets(body: Record<string, unknown>): Promise<any> {
+    return this.requestWithCode('POST', '/api/mcp/backlog/move', body);
   }
 
   async backlogGet(key: string): Promise<any> {
