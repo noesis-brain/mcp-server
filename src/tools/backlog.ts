@@ -14,6 +14,11 @@
  * 2.6.0: a Shipped or Dropped ticket never moves (TICKET_CLOSED), and closing a ticket
  * releases its binding.
  * 2.10.0: backlog_merge marks a ticket Merged into another ticket, a third closed status.
+ * 2.22.0: Jot spaces (TCK-1950). Every ticket is in one space of its owner: a default space plus
+ * custom ones. backlog_spaces / backlog_upsert_space / backlog_delete_space manage them,
+ * backlog_move_tickets moves tickets, backlog_get lists one space, and backlog_upsert_issue
+ * creates a ticket in a space. A space is named by its id, its name (case does not matter)
+ * or "default"; a list with no space shows every space, as before.
  */
 import { z } from 'zod';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
@@ -40,6 +45,23 @@ const WORK_STATUS_ENUM = z.enum([
 const CLAUDE_STATUS_ENUM = z.enum([
   'planning', 'ready_to_implement', 'implementing', 'iterating', 'ready_to_merge', 'deploying', 'shipped',
 ]);
+
+/** A Jot space as a tool names it (2.22.0): its id, its name (case does not matter) or "default". */
+const SPACE_REF = z
+  .union([z.string().min(1).max(60), z.number().int().positive()])
+  .describe('A Jot space: its id (a number), its name (case does not matter), or "default" for the default space. A space whose name is "Default" is found by that name first');
+
+/**
+ * A space for a URL path or query string (2.22.0). Text goes as given. A number is an id, but the server reads
+ * text as a name first (a space may be named "7"), so the id becomes that space's exact name, which is unique.
+ */
+export async function spaceRefText(client: NoesisClient, ref: string | number): Promise<string> {
+  if (typeof ref === 'string') return ref;
+  const data = (await client.backlogSpaces()) as { spaces?: Array<{ id: number; name: string }> };
+  const found = (data.spaces ?? []).find((s) => s.id === ref);
+  if (!found) throw new Error(`No Jot space with id ${ref} [SPACE_NOT_FOUND]`);
+  return found.name;
+}
 
 /** The status ladder, said the same way in every tool description and in the skill. */
 export const STATUS_LADDER =
@@ -113,12 +135,13 @@ function errText(e: unknown): { content: Array<{ type: 'text'; text: string }>; 
 export function registerBacklogTools(server: McpServer, client: NoesisClient): void {
   server.tool(
     'backlog_get',
-    'Read the Backlog: without a key, list issues (+ per-stage counts and open_question_count, optionally filtered by stage or a text query); with a key (TCK-<n>), the full issue including its components, the tickets linked to it (links: key, title, headline, work_status), increments, open owner questions, and the bounded message thread (questions + answers linked via answered_by_message_id — what RESOLVE reads). A ticket\'s pictures (screenshots the owner pasted or attached) follow the JSON as images, each after a line saying where it appears; look at them, they are part of the request.',
+    'Read the Backlog: without a key, list issues (+ per-stage counts and open_question_count, optionally filtered by stage, status, Jot space or a text query; each issue carries space_id and space, the name of its Jot space; with no space filter every space is listed); with a key (TCK-<n>), the full issue including its components, the tickets linked to it (links: key, title, headline, work_status), increments, open owner questions, and the bounded message thread (questions + answers linked via answered_by_message_id — what RESOLVE reads). A ticket\'s pictures (screenshots the owner pasted or attached) follow the JSON as images, each after a line saying where it appears; look at them, they are part of the request.',
     {
       key: z.string().optional().describe('Issue key like TCK-7 (omit to list)'),
       stage: STAGE_ENUM.optional().describe('List filter: only this stage'),
       status: WORK_STATUS_ENUM.optional().describe('List filter: only this work status (the Jot page status)'),
       query: z.string().optional().describe('List filter: title/body text search'),
+      space: SPACE_REF.optional().describe('List filter: only this Jot space (its id, its name, or "default"); omit for every space'),
       images: z.boolean().optional().describe("With a key: false returns the ticket's text only, without downloading its pictures (default true)"),
     },
     async (args) => {
@@ -127,7 +150,12 @@ export function registerBacklogTools(server: McpServer, client: NoesisClient): v
           const issue = await client.backlogGet(args.key);
           return args.images === false ? jsonText(issue) : await ticketContentWithPictures(issue, client);
         }
-        const data = await client.backlogList({ stage: args.stage, status: args.status, q: args.query });
+        const data = await client.backlogList({
+          stage: args.stage,
+          status: args.status,
+          q: args.query,
+          space: args.space === undefined ? undefined : await spaceRefText(client, args.space),
+        });
         return jsonText(data);
       } catch (e) {
         return errText(e);
@@ -137,7 +165,7 @@ export function registerBacklogTools(server: McpServer, client: NoesisClient): v
 
   server.tool(
     'backlog_upsert_issue',
-    'Create a Backlog issue (no key; groom may create in jot/refined/materialized) or update an existing one (with key; content fields only before approval, bookkeeping fields until terminal).',
+    'Create a Backlog issue (no key; groom may create in jot/refined/materialized; `space` puts it in a Jot space, else it goes to the default space) or update an existing one (with key; content fields only before approval, bookkeeping fields until terminal; to move a ticket to another space use backlog_move_tickets).',
     {
       key: z.string().optional().describe('Existing issue key to update; omit to create'),
       title: z.string().optional(),
@@ -149,10 +177,14 @@ export function registerBacklogTools(server: McpServer, client: NoesisClient): v
       branch: z.string().optional(),
       worktree: z.string().optional(),
       pr_number: z.number().int().optional(),
+      space: SPACE_REF.optional().describe('Create-only: the Jot space of the new ticket (omit for the default space)'),
     },
     async (args) => {
       try {
         if (args.key) {
+          if (args.space !== undefined) {
+            return errText(new Error('space is create-only: move a ticket with backlog_move_tickets'));
+          }
           const { key, stage: _ignored, ...patch } = args;
           const body = Object.fromEntries(Object.entries(patch).filter(([, v]) => v !== undefined));
           return jsonText(await client.backlogPatch(key, body));
@@ -160,6 +192,89 @@ export function registerBacklogTools(server: McpServer, client: NoesisClient): v
         if (!args.title) return errText(new Error('title is required to create an issue'));
         const body = Object.fromEntries(Object.entries(args).filter(([, v]) => v !== undefined));
         return jsonText(await client.backlogCreate(body));
+      } catch (e) {
+        return errText(e);
+      }
+    }
+  );
+
+  server.tool(
+    'backlog_spaces',
+    'List your Jot spaces (2.22.0): the default space first, then the others in their display order, each with its id, name, description, icon, colour, is_default, ticket_count and open_count (tickets not shipped, merged or dropped). Every ticket is in exactly one space; a ticket created without a space is in the default space.',
+    {},
+    async () => {
+      try {
+        return jsonText(await client.backlogSpaces());
+      } catch (e) {
+        return errText(e);
+      }
+    }
+  );
+
+  server.tool(
+    'backlog_upsert_space',
+    'Create a Jot space (no `space`; `name` required) or update one (`space` names it): its name, description (at most 2000 characters; a good place to say what the space is for), icon (an emoji) and colour (a CSS colour like #E03E3E). Names are unique, ignoring case (409 SPACE_NAME_TAKEN). The default space can be renamed. Only the fields you pass change; an empty description or null clears it.',
+    {
+      space: SPACE_REF.optional().describe('The space to update (its id, its name, or "default"); omit to create a space'),
+      name: z.string().min(1).max(60).optional().describe('The space name, at most 60 characters'),
+      // Counted in characters after the trim, as the server stores it (an emoji is one character).
+      description: z
+        .string()
+        .refine((v) => Array.from(v.trim()).length <= 2000, { message: 'description must be at most 2000 characters' })
+        .nullable()
+        .optional()
+        .describe('What the space is for, at most 2000 characters; null or "" clears it'),
+      icon: z.string().max(64).nullable().optional().describe('An emoji; null clears it'),
+      color: z.string().max(32).nullable().optional().describe('A CSS colour like #E03E3E; null clears it'),
+    },
+    async (args) => {
+      try {
+        const { space, ...fields } = args;
+        const body = Object.fromEntries(Object.entries(fields).filter(([, v]) => v !== undefined));
+        if (space === undefined) {
+          if (!args.name) return errText(new Error('name is required to create a space'));
+          return jsonText(await client.backlogCreateSpace(body));
+        }
+        if (Object.keys(body).length === 0) return errText(new Error('nothing to update: pass name, description, icon or color'));
+        return jsonText(await client.backlogUpdateSpace(await spaceRefText(client, space), body));
+      } catch (e) {
+        return errText(e);
+      }
+    }
+  );
+
+  server.tool(
+    'backlog_delete_space',
+    'Delete a Jot space. Its tickets move to the default space; no ticket is deleted. The default space cannot be deleted (400 DEFAULT_SPACE_DELETE). Returns moved_tickets.',
+    {
+      space: SPACE_REF.describe('The space to delete (its id or its name)'),
+    },
+    async (args) => {
+      try {
+        return jsonText(await client.backlogDeleteSpace(await spaceRefText(client, args.space)));
+      } catch (e) {
+        return errText(e);
+      }
+    }
+  );
+
+  server.tool(
+    'backlog_move_tickets',
+    'Move tickets to another Jot space: either the tickets in `keys`, or every ticket of `from_space`. A move works in every work status and changes nothing but the space (not the key, the status or the edited time). Every key must be yours, or nothing moves (404). Returns moved (tickets already in that space are not counted).',
+    {
+      space: SPACE_REF.describe('The target space (its id, its name, or "default")'),
+      keys: z.array(z.string()).min(1).max(500).optional().describe('Ticket keys like TCK-7 (at most 500)'),
+      from_space: SPACE_REF.optional().describe('Move every ticket of this space instead of a list of keys'),
+    },
+    async (args) => {
+      try {
+        if ((args.keys === undefined) === (args.from_space === undefined)) {
+          return errText(new Error('pass exactly one of keys or from_space'));
+        }
+        const body: Record<string, unknown> = { space: args.space };
+        if (args.keys) body.keys = args.keys;
+        if (args.from_space !== undefined) body.from_space = args.from_space;
+        return jsonText(await client.backlogMoveTickets(body));
       } catch (e) {
         return errText(e);
       }
