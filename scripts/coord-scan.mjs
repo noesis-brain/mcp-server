@@ -3,7 +3,8 @@
 // The conditions and their rules are in references/chief-conflict-catalogue.md.
 //
 //   node coord-scan.mjs --board <tickets.json> [--repo <main checkout>] [--agents <agents.json>]
-//                       [--npm-latest <version>] [--plans <plans.json>] [--close-check <file>] [--json]
+//                       [--npm-latest <version>] [--plans <plans.json>] [--close-check <file>]
+//                       [--decisions <answered.json>] [--json]
 //   node coord-scan.mjs --selftest
 //
 // --board is the Jot board as `backlog_get` returns it ({"issues": [...]} or a plain array). The
@@ -20,6 +21,12 @@
 // `unreadable` when the check could not read Chrome's tabs. Only that local file is read, so the Chief's pass and the watcher's scan post
 // the same rows. A check older than CLOSE_CHECK_MAX_MIN gives no rows. Only loop tabs are listed;
 // every other tab is a count, so no other tab's title or URL leaves this computer.
+//
+// --decisions names the answered decisions the Chief saved from `coord_decisions` (TCK-1983). A C17
+// row whose loop has stopped (its session idle) becomes high, with `answered`, when the owner answered
+// a card of that session or ticket after the session's ticket hook last read its inbox (`inboxAt` in
+// ~/.claude/coord-inbox/<session>.json, or $COORD_STATE_DIR): an idle session runs no hook, so only
+// the Chief's SendMessage brings it the answer. Without --decisions the rows are as before.
 //
 // It only reads: git status, diff, rev-list and worktree list, the files of each worktree, the
 // loop registry (~/.claude/loop-supervisor/<session>.json), the tail of a planning ticket's session
@@ -268,6 +275,55 @@ export function planFiles(markdown) {
 /** Whether a changed file is one a plan names: the same path, or inside a folder the plan names. */
 const namedBy = (planned, file) => planned.some((p) => (p.endsWith('/') ? file.startsWith(p) : file === p));
 
+// ── C17: a stopped loop whose card the owner answered (TCK-1983) ────────────
+
+/** The answered decisions the Chief saved (`{"decisions": [...]}` or a list); null when no file is named or it does not parse. */
+export function readDecisions(file) {
+  if (typeof file !== 'string') return null;
+  try {
+    const j = JSON.parse(fs.readFileSync(file, 'utf8'));
+    return Array.isArray(j) ? j : j && Array.isArray(j.decisions) ? j.decisions : null;
+  } catch { return null; }
+}
+
+/** When a session's ticket hook last read its inbox, in ms: `inboxAt` in the hook's own file (coordFile in noesis-ticket-session.mjs); 0 when it never did. */
+export function inboxReadAt(sid, dir = process.env.COORD_STATE_DIR || path.join(os.homedir(), '.claude', 'coord-inbox')) {
+  try {
+    const st = JSON.parse(fs.readFileSync(path.join(dir, `${String(sid).replace(/[^A-Za-z0-9_-]/g, '')}.json`), 'utf8'));
+    return st && Number.isFinite(st.inboxAt) ? st.inboxAt : 0;
+  } catch { return 0; }
+}
+
+const ANSWER_RE = /^[A-D]$/;
+
+/**
+ * The newest answered card of a stopped session that it has not read: recorded by that session or for its ticket,
+ * and answered after its ticket hook last read its inbox. A decision in the file counts when it has an answer
+ * letter and a time, and no status other than answered. null when there is none.
+ */
+export function unreadAnswer(t, decisions, readAt) {
+  let best = null;
+  for (const d of Array.isArray(decisions) ? decisions : []) {
+    if (!d || typeof d !== 'object' || !Number.isSafeInteger(d.id) || d.id < 1) continue;
+    if (d.status !== undefined && d.status !== 'answered') continue;
+    if (d.session_id !== t.sessionId && d.ticket !== t.key) continue;
+    const at = Date.parse(d.answered_at);
+    if (typeof d.answer !== 'string' || !ANSWER_RE.test(d.answer) || !Number.isFinite(at) || at <= readAt) continue;
+    if (!best || at > best.at) best = { d, at };
+  }
+  if (!best) return null;
+  const { d, at } = best;
+  const card = d.card && typeof d.card === 'object' ? d.card : {};
+  const option = Array.isArray(card.options) ? card.options['ABCD'.indexOf(d.answer)] : null;
+  return {
+    id: d.id,
+    answer: d.answer,
+    label: clean(d.label ?? (option && option.label) ?? '', 120) || null,
+    question: clean(d.question ?? card.question ?? '', 160) || null,
+    answered_at: new Date(at).toISOString(),
+  };
+}
+
 // ── C20: can a session close? ────────────────────────────────────────────────
 
 // The server refuses a whole report when one string holds a control or invisible character
@@ -357,7 +413,7 @@ export function closeRows(saved, now = Date.now()) {
   return rows;
 }
 
-export function scan({ repo, board, agents, npm, plans = {}, withProcesses = true, listen = listeners, closeCheck = null, now = Date.now() }) {
+export function scan({ repo, board, agents, npm, plans = {}, withProcesses = true, listen = listeners, closeCheck = null, decisions = null, inboxRead = inboxReadAt, now = Date.now() }) {
   const main = mainCheckout(repo);
   if (!main) throw new Error(`not a git repository: ${repo}`);
   const mainRef = git(main, ['rev-parse', '--abbrev-ref', 'HEAD']).out || 'main';
@@ -512,6 +568,14 @@ export function scan({ repo, board, agents, npm, plans = {}, withProcesses = tru
   for (const t of tickets) {
     if (!t.sessionId || !t.sessionState || t.sessionState === 'busy') continue;
     const stopped = BUILDING.includes(t.status) && (t.sessionState === 'idle' || t.sessionState === 'not running');
+    // TCK-1983: the owner answered this stopped loop's card, and it has not read its inbox since. Only an idle
+    // session that `claude agents` lists can be woken; one that is not running keeps the plain row.
+    const answered = decisions && stopped && t.sessionState === 'idle' ? unreadAnswer(t, decisions, inboxRead(t.sessionId)) : null;
+    if (answered) {
+      const agent = agentsBySid.get(t.sessionId);
+      add('C17', 'high', t.key, t.sessionId.slice(0, 8), `its session is idle while the ticket is ${t.status}, and the owner answered its card #${answered.id} (${answered.answer}) after it last read its inbox: wake it`, { state: t.sessionState, stopped, answered, name: agent && agent.name ? clean(agent.name, 60) : null });
+      continue;
+    }
     const detail = stopped ? `its session is ${t.sessionState} while the ticket is ${t.status}: its loop has stopped and needs "continue"` : `its session is ${t.sessionState}${t.waitingFor ? ` (${t.waitingFor})` : ''}`;
     add('C17', stopped || t.sessionState === 'not running' ? 'medium' : 'low', t.key, t.sessionId.slice(0, 8), detail, { state: t.sessionState, stopped });
   }
@@ -671,6 +735,86 @@ function selftest() {
     eq('C17: a waiting session on an implementing ticket is low; an idle one is a stopped loop (medium)', [r.conflicts.find((c) => c.kind === 'C17').severity, (() => { const r2 = scan({ repo: w2, board, agents: [{ ...agents[0], status: 'idle', waitingFor: undefined }, agents[1]], npm: '2.12.0', withProcesses: false }); const c = r2.conflicts.find((x) => x.kind === 'C17'); return [c.severity, /loop has stopped/.test(c.detail)]; })()], ['low', ['medium', true]]);
     eq('C16: TCK-2 and TCK-3 conflict with main in src/x.ts (high); TCK-4 is only behind', r.conflicts.filter((c) => c.kind === 'C16').map((c) => [c.a, c.severity, c.evidence.mainConflicts]), [['TCK-2', 'high', ['src/x.ts']], ['TCK-3', 'high', ['src/x.ts']], ['TCK-4', 'low', []]]);
     eq('C17: a waiting session is reported', r.conflicts.filter((c) => c.kind === 'C17').map((c) => c.detail), ['its session is waiting (input needed)']);
+    // C17 with --decisions (TCK-1983): the owner answered a stopped loop's card after it last read its inbox.
+    {
+      const idle = [{ sessionId: 'sid-4', cwd: path.join(w1, 'src'), status: 'idle', name: 'tck-4' }, agents[1]];
+      const at = '2026-11-23T17:02:44.856Z';
+      const readBefore = Date.parse('2026-11-23T13:17:00Z');
+      const dec = (over = {}) => ({ id: 194, ticket: 'TCK-4', session_id: 'sid-4', answer: 'A', answered_at: at, question: 'How should the loop continue?', label: 'Resume with INC-4c', ...over });
+      // The reader answers only for the session's own id: a scan that asks for another id (the ticket key, the short id)
+      // sees "never read" and would wake a session that has already read its answer.
+      const run = (decisions, readAt = readBefore, ag = idle, b = board) => scan({ repo: w2, board: b, agents: ag, npm: '2.12.0', withProcesses: false, decisions, inboxRead: (sid) => (sid === 'sid-4' ? readAt : 0) });
+      const row = (res) => res.conflicts.find((x) => x.kind === 'C17' && x.a === 'TCK-4') || null;
+      const c17 = (...a) => { const c = row(run(...a)); return c ? [c.severity, c.evidence.answered ? c.evidence.answered.id : null] : null; };
+      const hit = row(run([dec()]));
+      eq('C17 answered: high, with the card, the answer, the option, the time and the session name', [hit.severity, hit.b, hit.evidence, /answered its card #194 \(A\).*wake it/.test(hit.detail)],
+        ['high', 'sid-4', { state: 'idle', stopped: true, answered: { id: 194, answer: 'A', label: 'Resume with INC-4c', question: 'How should the loop continue?', answered_at: at }, name: 'tck-4' }, true]);
+      eq('C17 answered: read after the answer, or at the same millisecond, is no unread answer', [c17([dec()], Date.parse(at) + 1), c17([dec()], Date.parse(at))], [['medium', null], ['medium', null]]);
+      eq('C17 answered: a decision of another session and another ticket does not count, also when one of the two is missing; either one matching does',
+        [c17([dec({ session_id: 'sid-9', ticket: 'TCK-9' })]), c17([dec({ session_id: 'sid-9', ticket: null })]), c17([dec({ session_id: null, ticket: 'TCK-9' })]), c17([dec({ session_id: null, ticket: null })]), c17([dec({ session_id: null })]), c17([dec({ ticket: 'TCK-99' })])],
+        [['medium', null], ['medium', null], ['medium', null], ['medium', null], ['high', 194], ['high', 194]]);
+      eq('C17 answered: a status other than answered, no letter, a bad letter or a bad time does not count',
+        [dec({ status: 'pending' }), dec({ status: 'reverted' }), dec({ answer: null }), dec({ answer: 'E' }), dec({ answered_at: 'yesterday' }), dec({ answered_at: null }), dec({ id: 0 }), dec({ id: '194' })].map((d) => c17([d])), Array(8).fill(['medium', null]));
+      eq('C17 answered: a busy session has no row; a waiting one, one not running, or one on a planning ticket gets none',
+        [c17([dec()], readBefore, [{ ...idle[0], status: 'busy' }, agents[1]]), c17([dec()], readBefore, [{ ...idle[0], status: 'waiting' }, agents[1]]), c17([dec()], readBefore, [agents[1]]),
+          c17([dec()], readBefore, idle, { issues: board.issues.map((t) => (t.key === 'TCK-4' ? { ...t, work_status: 'planning' } : t)) })], [null, ['low', null], ['medium', null], ['low', null]]);
+      eq('C17 answered: the newest answer wins; the label and question come from the card when the file has none',
+        [c17([dec(), dec({ id: 195, answered_at: '2026-11-23T18:00:00Z' })]), row(run([{ id: 7, ticket: 'TCK-4', status: 'answered', answer: 'B', answered_at: at, card: { question: 'Q?', options: [{ label: 'one' }, { label: 'two' }] } }])).evidence.answered],
+        [['high', 195], { id: 7, answer: 'B', label: 'two', question: 'Q?', answered_at: at }]);
+      const answeredAt = (when) => (row(run([dec({ answered_at: when })])).evidence.answered || {}).answered_at;
+      eq('C17 answered: the answer time is given back in one ISO form', answeredAt('2026-11-23T17:02:44Z'), '2026-11-23T17:02:44.000Z');
+      // The form the server really sends (Postgres text, measured on the TCK-1983 FIN chain): it counts, and comes back as ISO.
+      eq('C17 answered: the server\'s Postgres time form counts and comes back as ISO', [c17([dec({ answered_at: '2026-11-23 17:02:44.856181+00' })]), answeredAt('2026-11-23 17:02:44.856181+00')],
+        [['high', 194], '2026-11-23T17:02:44.856Z']);
+      const plainRow = JSON.stringify(row(run(null)));
+      eq('C17 answered: without --decisions, or with none that match, the row is as before', [plainRow === JSON.stringify(row(scan({ repo: w2, board, agents: idle, npm: '2.12.0', withProcesses: false }))), JSON.stringify(row(run([]))) === plainRow, JSON.stringify(row(run([dec({ session_id: 'x', ticket: 'TCK-9' })]))) === plainRow, row(run(null)).severity], [true, true, true, 'medium']);
+      const inboxDir = fs.mkdtempSync(path.join(root, 'inbox-'));
+      fs.writeFileSync(path.join(inboxDir, 'sid-4.json'), JSON.stringify({ inboxAt: 1234, cursors: {} }));
+      fs.writeFileSync(path.join(inboxDir, 'bad.json'), '{not json');
+      fs.writeFileSync(path.join(inboxDir, 'abc.json'), JSON.stringify({ inboxAt: 99 }));
+      eq("inboxReadAt: the hook's inboxAt; 0 when missing, unreadable or not a number; the id is cut as the hook cuts it",
+        [inboxReadAt('sid-4', inboxDir), inboxReadAt('sid-5', inboxDir), inboxReadAt('bad', inboxDir), inboxReadAt('a/b.c', inboxDir), (() => { fs.writeFileSync(path.join(inboxDir, 'nan.json'), JSON.stringify({ inboxAt: 'soon' })); return inboxReadAt('nan', inboxDir); })()], [1234, 0, 0, 99, 0]);
+      const saved = process.env.COORD_STATE_DIR;
+      process.env.COORD_STATE_DIR = inboxDir;
+      try { eq('inboxReadAt: COORD_STATE_DIR is the folder, as for the hook', inboxReadAt('sid-4'), 1234); } finally { if (saved === undefined) delete process.env.COORD_STATE_DIR; else process.env.COORD_STATE_DIR = saved; }
+      // scan() itself reads the session's own state file: an inbox read after the answer means no wake; before it, a wake.
+      // A session id longer than the 8 characters a row shows, as real ids are: the files of the short id and of the
+      // ticket key say "never read", so reading either one would wake a session that has read its answer.
+      const ownDir = fs.mkdtempSync(path.join(root, 'own-inbox-'));
+      const longSid = 'sid-4-0000-1111';
+      const longBoard = { issues: board.issues.map((t) => (t.key === 'TCK-4' ? { ...t, bound_session_id: longSid } : t)) };
+      const longAgents = [{ ...idle[0], sessionId: longSid }, agents[1]];
+      const scanWith = (readAt) => {
+        fs.writeFileSync(path.join(ownDir, `${longSid}.json`), JSON.stringify({ inboxAt: readAt }));
+        fs.writeFileSync(path.join(ownDir, `${longSid.slice(0, 8)}.json`), JSON.stringify({ inboxAt: 0 }));
+        fs.writeFileSync(path.join(ownDir, 'TCK-4.json'), JSON.stringify({ inboxAt: 0 }));
+        const before = process.env.COORD_STATE_DIR;
+        process.env.COORD_STATE_DIR = ownDir;
+        try {
+          const c = row(scan({ repo: w2, board: longBoard, agents: longAgents, npm: '2.12.0', withProcesses: false, decisions: [dec({ session_id: longSid })] }));
+          return [c.severity, c.evidence.answered ? c.evidence.answered.id : null];
+        } finally { if (before === undefined) delete process.env.COORD_STATE_DIR; else process.env.COORD_STATE_DIR = before; }
+      };
+      eq("scan: the default reader reads the session's own file: read after the answer is no wake, read before it is a wake",
+        [scanWith(Date.parse(at) + 60_000), scanWith(Date.parse(at) - 60_000)], [['medium', null], ['high', 194]]);
+      // Without COORD_STATE_DIR the folder is the hook's default, ~/.claude/coord-inbox (os.homedir() follows HOME).
+      const savedHome = process.env.HOME;
+      const home = fs.mkdtempSync(path.join(root, 'home-'));
+      fs.mkdirSync(path.join(home, '.claude', 'coord-inbox'), { recursive: true });
+      fs.writeFileSync(path.join(home, '.claude', 'coord-inbox', 'sid-4.json'), JSON.stringify({ inboxAt: 4321 }));
+      delete process.env.COORD_STATE_DIR;
+      process.env.HOME = home;
+      try { eq('inboxReadAt: the default folder is ~/.claude/coord-inbox, as for the hook', [inboxReadAt('sid-4'), os.homedir() === home], [4321, true]); } finally {
+        process.env.HOME = savedHome;
+        if (saved !== undefined) process.env.COORD_STATE_DIR = saved;
+      }
+      const decFile = path.join(root, 'decisions.json');
+      fs.writeFileSync(decFile, JSON.stringify({ decisions: [dec()] }));
+      const listFile = path.join(root, 'decisions-list.json');
+      fs.writeFileSync(listFile, JSON.stringify([dec()]));
+      eq('readDecisions: {decisions} or a list; null with no file name, a missing file or bad JSON',
+        [readDecisions(decFile).length, readDecisions(listFile).length, readDecisions(undefined), readDecisions(true), readDecisions(path.join(root, 'none.json')), readDecisions(path.join(inboxDir, 'bad.json'))], [1, 1, null, null, null, null]);
+    }
     eq('loop working memory is not a product file', r.tickets[2].files.includes('TCK-3-LOOP-STATE.md') || r.tickets[2].files.some((f) => f.startsWith('loop-stack/')), false);
     eq('staged and untracked phase files are seen', [r.tickets[1].phases, r.tickets[2].phases], [['scripts/phase76-two.sql'], ['scripts/phase76-three.sql']]);
     eq('read-only: no worktree changed', [w1, w2, w3, w7, repo].map((d) => git(d, ['status', '--porcelain=v1', '-uall']).out), before);
@@ -1012,7 +1156,7 @@ function parseArgs(argv) {
     const a = argv[i];
     if (!a.startsWith('--')) continue;
     const next = argv[i + 1];
-    if (next !== undefined && !next.startsWith('--') && ['repo', 'board', 'agents', 'npm-latest', 'plans', 'close-check'].includes(a.slice(2))) { out[a.slice(2)] = next; i++; } else out[a.slice(2)] = true;
+    if (next !== undefined && !next.startsWith('--') && ['repo', 'board', 'agents', 'npm-latest', 'plans', 'close-check', 'decisions'].includes(a.slice(2))) { out[a.slice(2)] = next; i++; } else out[a.slice(2)] = true;
   }
   return out;
 }
@@ -1021,10 +1165,10 @@ if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.me
   const args = parseArgs(process.argv.slice(2));
   if (args.selftest) process.exit(selftest());
   if (!args.board || !fs.existsSync(args.board)) {
-    console.error('usage: coord-scan.mjs --board <tickets.json> [--repo <main checkout>] [--agents <agents.json>] [--npm-latest <version>] [--plans <{"TCK-n": "plan.md"}>] [--close-check <file>] [--json] | --selftest');
+    console.error('usage: coord-scan.mjs --board <tickets.json> [--repo <main checkout>] [--agents <agents.json>] [--npm-latest <version>] [--plans <{"TCK-n": "plan.md"}>] [--close-check <file>] [--decisions <answered.json>] [--json] | --selftest');
     process.exit(2);
   }
   const plans = args.plans ? JSON.parse(fs.readFileSync(args.plans, 'utf8')) : {};
-  const result = scan({ repo: path.resolve(args.repo || process.cwd()), board: JSON.parse(fs.readFileSync(args.board, 'utf8')), agents: loadAgents(args.agents), npm: npmLatest(args['npm-latest']), plans, closeCheck: readCloseCheck(args['close-check']) });
+  const result = scan({ repo: path.resolve(args.repo || process.cwd()), board: JSON.parse(fs.readFileSync(args.board, 'utf8')), agents: loadAgents(args.agents), npm: npmLatest(args['npm-latest']), plans, closeCheck: readCloseCheck(args['close-check']), decisions: readDecisions(args.decisions) });
   console.log(args.json ? JSON.stringify(result, null, 2) : report(result));
 }

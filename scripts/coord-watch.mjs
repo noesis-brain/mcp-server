@@ -21,6 +21,8 @@
 // - TCK-1926: on every tick it also reads the questions and plan approvals that ticket sessions hold. A new one on
 //   the Chief's route wakes the Chief, as a changed scan does; one for the owner alone does not. The first read only
 //   sets the baseline, because the Chief has just made its own pass.
+// - TCK-1983: on every tick it also reads the decisions the owner answered. A new one wakes the Chief, so its pass can
+//   wake a stopped loop whose card was answered (an idle session reads no inbox). The first read only sets the baseline.
 //
 // It runs in its own iTerm2 tab, because macOS lets only a terminal-attached process drive iTerm2
 // (measured for the loop watchdog, 2026-08-22). --start opens that tab and goes back to the tab you
@@ -167,13 +169,45 @@ export const requestsReader = (call) => async () => {
   return r ? r.requests : undefined;
 };
 
-/** One 10-second tick: a scan on every `every`-th tick and a read of the requests, then a wake when one is pending and the owner has not paused. */
+/**
+ * The cards the owner answered (TCK-1983): `state.answered` holds the answered ids of the last read. A new id makes the
+ * wake pending. A failed read changes nothing; the first read only sets the baseline.
+ */
+export async function checkAnswered(deps, state) {
+  if (!deps.answeredDecisions) return null;
+  let list;
+  try {
+    list = await deps.answeredDecisions();
+  } catch {
+    return null;
+  }
+  if (!Array.isArray(list)) return null;
+  const ids = list.filter((d) => d && d.status === 'answered' && Number.isInteger(d.id)).map((d) => d.id);
+  const known = state.answered;
+  state.answered = ids;
+  if (!Array.isArray(known)) return null;
+  const fresh = ids.filter((id) => !known.includes(id));
+  if (!fresh.length) return null;
+  state.pending = true;
+  return { fresh };
+}
+
+/** The 50 newest-created answered decisions, as the server lists them; anything but a list (a reply without `decisions`) changes nothing. */
+export const ANSWERED_PATH = '/api/mcp/coordination/decisions?status=answered&limit=50';
+export const decisionsReader = (call) => async () => {
+  const r = await call('GET', ANSWERED_PATH);
+  return r ? r.decisions : undefined;
+};
+
+/** One 10-second tick: a scan on every `every`-th tick, a read of the requests and of the answered cards, then a wake when one is pending and the owner has not paused. */
 export async function tick(deps, state, pid, every) {
   const out = {};
   if (state.ticks % every === 0) out.scan = await step(deps, state);
   state.ticks++;
   const asked = await checkRequests(deps, state);
   if (asked) out.requests = asked;
+  const answered = await checkAnswered(deps, state);
+  if (answered) out.answered = answered;
   if (state.pending) {
     // While paused, the change stays pending and the Chief is woken after "Continue all".
     const w = deps.alive(pid) && (await pausedNow(deps, pid)) ? { woke: 0, reason: 'the owner paused the sessions' } : wakeChief(pid, WAKE_LINE, deps);
@@ -363,6 +397,8 @@ async function realDeps(args, cfg) {
     },
     // TCK-1926: the open questions and plans; the watcher keeps only those on the Chief's route.
     openRequests: requestsReader(call),
+    // TCK-1983: the answered cards; a new one wakes the Chief, whose pass wakes the stopped loop it concerns.
+    answeredDecisions: decisionsReader(call),
     alive,
     statusOf: agentsStatus,
     ttyOf,
@@ -445,6 +481,7 @@ async function main(argv) {
     else if (s && s.baseline) console.log(`${stamp()} baseline: ${s.size} line(s)`);
     else if (s && s.changed) console.log(`${stamp()} changed: +${s.added.length} -${s.gone.length}; posted ${s.posted}`);
     if (r.requests) console.log(`${stamp()} ${r.requests.fresh.length} new question(s) or plan(s) for the Chief`);
+    if (r.answered) console.log(`${stamp()} ${r.answered.fresh.length} card(s) answered by the owner`);
     if (r.wake && r.wake.gone) return console.log(`${stamp()} the Chief (pid ${args.chiefPid}) has ended; stopping`);
     if (r.wake && r.wake.woke > 0) console.log(`${stamp()} woke the Chief`);
     else if (r.wake && r.wake.reason && s && s.changed) console.log(`${stamp()} wake waits: ${r.wake.reason}`);
@@ -593,6 +630,51 @@ async function selftest() {
   // The needle is built from two parts, so this line itself never matches it: only realDeps' line can.
   eq('requests: the real watcher uses this reader', fs.readFileSync(fileURLToPath(import.meta.url), 'utf8').includes(['    openRequests', ': requestsReader(call),'].join('')), true);
   eq('requests: no reader (an older server): no requests key', await tick({ ...asking, openRequests: undefined }, { last: [], pending: false, ticks: 1 }, 42, 1000), {});
+  // The cards the owner answered (TCK-1983): a new one wakes the Chief, whose pass wakes the stopped loop it concerns.
+  calls.length = 0;
+  let answeredList = [{ id: 194, status: 'answered' }];
+  const hearing = { ...asking, openRequests: async () => [], answeredDecisions: async () => answeredList };
+  const as = { last: [], pending: false, ticks: 1 };
+  eq('answered: the first read is the baseline, no wake', [await tick(hearing, as, 42, 1000), as.answered, as.pending, only('type')], [{}, [194], false, []]);
+  answeredList = [{ id: 201, status: 'answered' }, { id: 194, status: 'answered' }, { id: 202, status: 'pending' }, { id: 'x', status: 'answered' }, null];
+  eq('answered: a new answered id wakes the Chief once; a pending one, a bad id or a hole does not count', [await tick(hearing, as, 42, 1000), as.pending, as.answered, only('type')], [{ answered: { fresh: [201] }, wake: { woke: 1 } }, false, [201, 194], ['type /dev/ttys012 /noesis-chief watch']]);
+  eq('answered: the same ids again: no second wake', await tick(hearing, as, 42, 1000), {});
+  // The server lists them newest-created first, and a stopped loop's card is usually older than cards answered since:
+  // a new id lower than the known ones, and not first in the list, wakes the Chief too.
+  answeredList = [{ id: 201, status: 'answered' }, { id: 194, status: 'answered' }, { id: 190, status: 'answered' }];
+  eq('answered: an older card answered later (a lower id, last in the list) wakes the Chief once', [await tick(hearing, as, 42, 1000), as.answered, await tick(hearing, as, 42, 1000)],
+    [{ answered: { fresh: [190] }, wake: { woke: 1 } }, [201, 194, 190], {}]);
+  answeredList = [{ id: 201, status: 'answered' }, { id: 194, status: 'answered' }];
+  eq('answered: the ids of each read are the known ones, like the requests: an id that left the list and comes back wakes again',
+    [await tick(hearing, as, 42, 1000), as.answered, (answeredList = [{ id: 201, status: 'answered' }, { id: 194, status: 'answered' }, { id: 190, status: 'answered' }], await tick(hearing, as, 42, 1000))],
+    [{}, [201, 194], { answered: { fresh: [190] }, wake: { woke: 1 } }]);
+  // An account with no answered card yet: the empty first read is the baseline, and the first answer wakes the Chief.
+  const none = { last: [], pending: false, ticks: 1 };
+  answeredList = [];
+  eq('answered: an empty first read is the baseline; the first answer then wakes once', [await tick(hearing, none, 42, 1000), none.answered, (answeredList = [{ id: 5, status: 'answered' }], await tick(hearing, none, 42, 1000)), none.answered],
+    [{}, [], { answered: { fresh: [5] }, wake: { woke: 1 } }, [5]]);
+  // A new request and a new answer in the same tick: one wake, and both are reported.
+  const both = { last: [], pending: false, ticks: 1, requests: [], answered: [5] };
+  answeredList = [{ id: 6, status: 'answered' }, { id: 5, status: 'answered' }];
+  eq('answered: a new request and a new answer in one tick: both reported, one wake', await tick({ ...hearing, openRequests: async () => [{ id: 31, route: 'chief', status: 'open' }] }, both, 42, 1000),
+    { requests: { fresh: [31] }, answered: { fresh: [6] }, wake: { woke: 1 } });
+  eq('answered: a failed read or a reply that is not a list changes nothing',
+    [await tick({ ...hearing, answeredDecisions: async () => { throw new Error('HTTP 503'); } }, as, 42, 1000), await tick({ ...hearing, answeredDecisions: async () => ({}) }, as, 42, 1000), as.answered],
+    [{}, {}, [201, 194, 190]]);
+  answeredList = [{ id: 203, status: 'answered' }, { id: 201, status: 'answered' }];
+  eq('answered: while paused, a new answer waits for "Continue all", then wakes once', [await tick({ ...hearing, paused: async () => true }, as, 42, 1000), as.pending, await tick(hearing, as, 42, 1000), as.pending],
+    [{ answered: { fresh: [203] }, wake: { woke: 0, reason: 'the owner paused the sessions' } }, true, { wake: { woke: 1 } }, false]);
+  const lateAns = { last: [], pending: false, ticks: 1 };
+  calls.length = 0;
+  eq('answered: a failed first read, then a good one: the good one is the baseline, nothing typed',
+    [await tick({ ...hearing, answeredDecisions: async () => { throw new Error('HTTP 503'); } }, lateAns, 42, 1000), lateAns.answered, await tick(hearing, lateAns, 42, 1000), lateAns.answered, only('type')],
+    [{}, undefined, {}, [203, 201], []]);
+  const asked3 = [];
+  const dreader = decisionsReader(async (method, p) => (asked3.push(`${method} ${p}`), { decisions: [{ id: 3, status: 'answered' }] }));
+  eq('answered: the reader asks the MCP route for the answered decisions and returns its list', [await dreader(), asked3], [[{ id: 3, status: 'answered' }], ['GET /api/mcp/coordination/decisions?status=answered&limit=50']]);
+  eq('answered: a reply without the list is no list', await decisionsReader(async () => ({}))(), undefined);
+  eq('answered: the real watcher uses this reader', fs.readFileSync(fileURLToPath(import.meta.url), 'utf8').includes(['    answeredDecisions', ': decisionsReader(call),'].join('')), true);
+  eq('answered: no reader (an older script): no answered key', await tick({ ...asking, openRequests: async () => [] }, { last: [], pending: false, ticks: 1, requests: [] }, 42, 1000), {});
   calls.length = 0;
   eq('session id: the row with this pid, else null',
     [sessionIdIn([{ pid: 7, sessionId: 'a' }, { pid: 42, sessionId: 'b' }], 42), sessionIdIn([{ pid: 42 }], 42), sessionIdIn([{ pid: 42, sessionId: '' }], 42), sessionIdIn('x', 42), sessionIdIn([{ pid: 9, sessionId: 'c' }], 42)],
