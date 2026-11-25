@@ -16,6 +16,9 @@
 //     session that can close; and for the sure-orphan loop tabs, one cleanup judgment and a
 //     `close-tabs` (coord-tabs.mjs close --ids). C20 rows never count toward the ship lane.
 //
+//   - C17 with `answered` (TCK-1983): a `wake` for a stopped loop whose card the owner answered after
+//     it last read its inbox; the Chief sends its line with SendMessage, once per answered card.
+//
 // Every action has a key (kind, the pair, the action), so the Chief acts once per conflict, not on
 // every scan: it passes the keys it already acted on as `done`.
 //
@@ -41,6 +44,15 @@ const CLEANUP = { reversible: false, shared: true, userVisible: true, touches: [
 const TAB_CLEANUP = { reversible: true, shared: false, userVisible: true, touches: [], confidence: 'high', evidence: 'measured' };
 
 const ticketNumber = (k) => Number(String(k).slice(4));
+const ANSWER_RE = /^[A-D]$/;
+
+/** The line the Chief sends a stopped loop whose card the owner answered (TCK-1983): the card, the answer, and what to do. */
+export function wakeLine(ans) {
+  const one = (v, n) => { const t = Array.from(String(v ?? '').replace(/\s+/g, ' ').trim()); return t.length > n ? `${t.slice(0, n - 1).join('')}…` : t.join(''); };
+  const q = ans.question ? ` ("${one(ans.question, 160)}")` : '';
+  const label = ans.label ? `, ${one(ans.label, 120)}` : '';
+  return `Chief of Staff: the owner answered your card #${ans.id}${q}: ${ans.answer}${label}. Read it with coord_decision_get (id ${ans.id}), then continue the work it unblocks.`;
+}
 
 /** A pair's two tickets in number order. The scanner orders them, but a stored or hand-made row may not. */
 function byNumber(c) {
@@ -66,6 +78,7 @@ function sessionOf(scan, key) {
  *   note       {text}   (a rule that needs no step: logged once in the report)
  *   ask-close  {to_session, name, ticket}   (C20: ask that session "Can I close the session?" once)
  *   close-tabs {ids, tickets}   (C20: close these sure-orphan loop tabs, after the cleanup decide)
+ *   wake       {to_session, name, ticket, decision, line}   (C17: SendMessage the line to a stopped loop whose card was answered)
  * Conflicts whose key is in `done` give no action.
  */
 export function rulesFor(scan, done = []) {
@@ -231,9 +244,16 @@ export function rulesFor(scan, done = []) {
       case 'C3':
         push(c, 'note', { type: 'note', text: `${c.a} and ${c.b} share low-risk files; the later one re-merges them at rebase.` });
         break;
-      case 'C17':
-        push(c, 'note', { type: 'note', text: `${c.a}: ${c.detail}` });
+      case 'C17': {
+        // TCK-1983: the owner answered this stopped loop's card after it last read its inbox. SendMessage wakes an idle
+        // session; the key holds the decision, so each answer wakes it once.
+        const e = c.evidence || {};
+        const ans = e.answered;
+        const to = e.state === 'idle' && ans && Number.isSafeInteger(ans.id) && ans.id > 0 && ANSWER_RE.test(String(ans.answer)) ? sessionOf(scan, c.a) : null;
+        if (to) push(c, `wake:${ans.id}`, { type: 'wake', to_session: to, name: e.name || null, ticket: isTicket(c.a) ? c.a : null, decision: ans.id, line: wakeLine(ans) });
+        else push(c, 'note', { type: 'note', text: `${c.a}: ${c.detail}` });
         break;
+      }
       case 'C20': {
         const e = c.evidence || {};
         if (c.a === 'chrome-tabs') {
@@ -338,6 +358,23 @@ function selftest() {
   eq('rules: no card for a rule or a judgment', acts.filter((a) => a.type !== 'decide' && a.card).length + by('decide').filter((d) => d.category !== 'merge-tickets' && d.card).length, 0);
   eq('rules: notes for C3, C17 and a low C7', by('note').map((n) => n.key.split('|')[0]), ['C7', 'C3', 'C17']);
   eq('rules: every key is unique', new Set(acts.map((a) => a.key)).size, acts.length);
+  // C17 with an answered card (TCK-1983): the TCK-1970 halt of 2026-11-23, card #194 answered A at 01:02 Taipei.
+  const sid1970 = '22b15838-abdf-4e31-8edf-88ddebfd7c67';
+  const answered = { id: 194, answer: 'A', label: 'Resume with INC-4c', question: 'The TCK-1970 loop halted after two [B] on its --no-verify guard. How should it continue?', answered_at: '2026-11-23T17:02:44.856Z' };
+  const wakeScan = (ev = {}, tickets = [{ key: 'TCK-1970', sessionId: sid1970 }]) => ({
+    tickets,
+    conflicts: [{ kind: 'C17', severity: 'high', a: 'TCK-1970', b: '22b15838', detail: 'the owner answered its card #194 (A): wake it', evidence: { state: 'idle', stopped: true, name: 'tck-1970', answered, ...ev } }],
+  });
+  const woke = rulesFor(wakeScan());
+  eq('wake: one action for the stopped loop, keyed by the card', woke.map((a) => [a.key, a.type, a.to_session, a.name, a.ticket, a.decision]), [['C17|TCK-1970|22b15838|wake:194', 'wake', sid1970, 'tck-1970', 'TCK-1970', 194]]);
+  eq('wake: the line names the card, the letter, the option and coord_decision_get', woke[0].line,
+    'Chief of Staff: the owner answered your card #194 ("The TCK-1970 loop halted after two [B] on its --no-verify guard. How should it continue?"): A, Resume with INC-4c. Read it with coord_decision_get (id 194), then continue the work it unblocks.');
+  eq('wake: a done key suppresses it; a later answer to another card has a key of its own',
+    [rulesFor(wakeScan(), [woke[0].key]), rulesFor(wakeScan({ answered: { ...answered, id: 195, answer: 'B' } }), [woke[0].key]).map((a) => a.key)], [[], ['C17|TCK-1970|22b15838|wake:195']]);
+  eq('wake: a session that is not idle, a ticket with no session, or no answer stays a note',
+    [rulesFor(wakeScan({ state: 'not running' })), rulesFor(wakeScan({ state: 'waiting' })), rulesFor(wakeScan({ state: 'busy' })), rulesFor(wakeScan({}, [{ key: 'TCK-1970', sessionId: null }])), rulesFor(wakeScan({ answered: undefined }))].map((r) => r.map((a) => a.type)), [['note'], ['note'], ['note'], ['note'], ['note']]);
+  eq('wake: a bad id or answer letter stays a note', [{ id: 0 }, { id: 1.5 }, { id: '194' }, { answer: 'E' }, { answer: 'a' }, { answer: null }].map((x) => rulesFor(wakeScan({ answered: { ...answered, ...x } }))[0].type), ['note', 'note', 'note', 'note', 'note', 'note']);
+  eq('wake: no name is null; the line stays one line and short', (() => { const a = rulesFor(wakeScan({ name: undefined, answered: { ...answered, question: `a\nb\r\n${'q'.repeat(400)}`, label: `l\n${'x'.repeat(300)}` } }))[0]; return [a.name, /[\r\n]/.test(a.line), a.line.length <= 450]; })(), [null, false, true]);
   // The ship lane and what a ship carries: owner gates, each with a card.
   const shipScan = {
     tickets: [{ key: 'TCK-9', sessionId: 's9' }, { key: 'TCK-10', sessionId: 's10' }],
