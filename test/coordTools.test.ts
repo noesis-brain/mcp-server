@@ -652,6 +652,31 @@ describe('the /noesis-chief skill ships in this package (TCK-1890)', () => {
     for (const s of scripts) expect(fs.existsSync(path.join(__dirname, '..', 'scripts', s)), s).toBe(true);
   });
 
+  it('wakes a stopped loop whose card the owner answered: decisions.json, --decisions on both scans, the wake action (TCK-1983)', async () => {
+    expect(template).toContain('Then call `coord_decisions` with `status: "answered"` and `limit: 50`. Write only these fields of\neach decision to `~/.claude/coord/decisions.json`, as `{"decisions": [...]}`: `id`, `ticket`,\n`session_id`, `answer`, `answered_at`, the card\'s question as `question`, and the chosen option\'s\nlabel as `label`.');
+    // Every scan run of step 2 passes the answered decisions, and there are two of them.
+    const step2 = template.slice(template.indexOf('### 2. The scan, posted'), template.indexOf('### 3. The rules'));
+    const scanRuns = step2.split('\n').filter((l) => l.includes('coord-scan.mjs'));
+    expect(scanRuns).toHaveLength(2);
+    for (const l of scanRuns) expect(l, l).toContain('coord-scan.mjs --board ~/.claude/coord/board.json --repo <repo> --decisions ~/.claude/coord/decisions.json');
+    // The whole wake bullet, in step 3: when SendMessage fails, the owner wakes the session; the Chief never answers the card.
+    const step3 = template.slice(template.indexOf('### 3. The rules'), template.indexOf('### 3b.'));
+    expect(step3).toContain("- `wake` (C17, TCK-1983): the owner answered the card of a stopped loop after that session last read its inbox. When the action's `name` is a name `ListAgents` shows, send its `line` with `SendMessage` to that name: a message wakes an idle session. Add the key to `done.json` only when `SendMessage` succeeded. Otherwise write the session and the card in the report: the owner wakes that session by hand.\n");
+    expect(template).toContain('Every 10 seconds it also reads\nthe cards the owner answered, and a newly answered one wakes this session the same way (TCK-1983):\nyour pass then wakes the stopped loop that the card concerns (step 3, `wake`).');
+    expect(template).toContain('Also each stopped loop (a C17 row whose loop has stopped) that has a card waiting for the owner, found with `coord_decisions` and `status: "pending"`');
+    // What the text says is what the scripts do: the scan takes --decisions, and the rules turn such a row into a wake.
+    const rules = await import('../scripts/coord-rules.mjs');
+    const acts = rules.rulesFor({ tickets: [{ key: 'TCK-1', sessionId: 's1' }], conflicts: [{ kind: 'C17', severity: 'high', a: 'TCK-1', b: 's1', detail: 'd', evidence: { state: 'idle', name: 'n', answered: { id: 9, answer: 'A', label: 'L', question: 'Q?', answered_at: '2026-11-25T00:00:00.000Z' } } }] });
+    expect(acts.map((a: { type: string; key: string; to_session: string }) => [a.type, a.key, a.to_session])).toEqual([['wake', 'C17|TCK-1|s1|wake:9', 's1']]);
+    const scan = await import('../scripts/coord-scan.mjs');
+    expect([typeof scan.readDecisions, typeof scan.inboxReadAt, typeof scan.unreadAnswer]).toEqual(['function', 'function', 'function']);
+    // The tool's own text says a card waits.
+    const described = new Map<string, string>();
+    const { registerCoordTools } = await import('../src/tools/coord.js');
+    registerCoordTools({ tool: (name: string, description: string) => described.set(name, description) } as never, {} as never);
+    expect(described.get('coord_decide')).toContain('A decision sent with a card always waits for the owner (escalated), whatever the policy says');
+  });
+
   it('finds the owner-only steps first, before the server check, with the npm login named (2026-11-13)', () => {
     const first = template.indexOf('## First, while the owner is here: what only the owner can unblock');
     expect(first).toBeGreaterThan(0);

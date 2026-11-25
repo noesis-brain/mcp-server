@@ -99,7 +99,7 @@ export function registerCoordTools(server: McpServer, client: NoesisClient): voi
     'coord_decide',
     'Record a judgment call or an owner-gate decision with the Chief of Staff. Answer the rubric honestly; the server computes the risk level (L0-L3) and the outcome from the owner\'s policy, never from you. ' +
       'The answer\'s `result` says what to do next: proceed (decided, go on), review (go on; the owner reviews it later), or escalated (wait: the owner must answer the card; poll coord_decision_get). ' +
-      'A decision that waits needs a Decision Card (card), and owner gates (ship, prod-schema, mcp-publish, merge-tickets, stop-session) always wait. ' +
+      'A decision that waits needs a Decision Card (card). A decision sent with a card always waits for the owner (escalated), whatever the policy says, and owner gates (ship, prod-schema, mcp-publish, merge-tickets, stop-session) always wait. ' +
       'Errors: CARD_REQUIRED (send again with a card; details give the level), INVALID_CARD (details list each field), INVALID_RUBRIC, VALIDATION, NOT_FOUND (the ticket is not the user\'s).',
     {
       category: CATEGORY_ENUM,

@@ -104,13 +104,19 @@ Also call it once with `status: "created"`. Keep those tickets for step 5 only, 
 `title`, `refined_text`, `refined_at`, `pinned_at`, `priority`, `size`, `created_at`,
 `components` and `link_count`.
 
+Then call `coord_decisions` with `status: "answered"` and `limit: 50`. Write only these fields of
+each decision to `~/.claude/coord/decisions.json`, as `{"decisions": [...]}`: `id`, `ticket`,
+`session_id`, `answer`, `answered_at`, the card's question as `question`, and the chosen option's
+label as `label`. The scan finds with it a stopped loop whose card the owner answered (TCK-1983):
+an idle session reads no inbox, so only your message brings it the answer.
+
 ### 2. The scan, posted
 
 ```bash
 S=<repo>/md-manager-mcp-server/scripts
 node $S/coord-close.mjs check --all --save --repo <repo> > ~/.claude/coord/close.txt
-node $S/coord-scan.mjs --board ~/.claude/coord/board.json --repo <repo> --json > ~/.claude/coord/scan.json
-node $S/coord-scan.mjs --board ~/.claude/coord/board.json --repo <repo> > ~/.claude/coord/scan.txt
+node $S/coord-scan.mjs --board ~/.claude/coord/board.json --repo <repo> --decisions ~/.claude/coord/decisions.json --json > ~/.claude/coord/scan.json
+node $S/coord-scan.mjs --board ~/.claude/coord/board.json --repo <repo> --decisions ~/.claude/coord/decisions.json > ~/.claude/coord/scan.txt
 ```
 
 Each run takes a few seconds to 2 minutes. It writes nothing into any worktree, index, ref or
@@ -146,6 +152,7 @@ action in `actions.json`, then add its `key` to `done.json`, so the next pass do
   - When the action's `name` is a name `ListAgents` shows, run `node $S/coord-close.mjs ask --session <to_session> --by-message --repo <repo> --json`. When it says `asked: true`, send its `line` with `SendMessage` to that name: a message wakes an idle session. When `SendMessage` then fails, write that in the report: the owner asks that session by hand.
   - Otherwise run the same command without `--by-message`. It types the line into the session's iTerm2 tab, with the guards of `/exit`.
   - Add the key to `done.json` only when it says `asked: true`. Otherwise write its `why` in the report and leave the key out, so the next pass can try again (for example after a session was busy for a moment). `askedAt` still keeps a session from being asked twice.
+- `wake` (C17, TCK-1983): the owner answered the card of a stopped loop after that session last read its inbox. When the action's `name` is a name `ListAgents` shows, send its `line` with `SendMessage` to that name: a message wakes an idle session. Add the key to `done.json` only when `SendMessage` succeeded. Otherwise write the session and the card in the report: the owner wakes that session by hand.
 - `close-tabs` (C20): the `decide` just before it records the cleanup for the owner's review. Then run `node $S/coord-tabs.mjs close --ids <ids, comma-separated> --repo <repo> --json`. It reads each tab again and closes it only when it is still a sure orphan. Write the closed tabs and the kept ones, with why, in the report.
 
 **The test-db lease (C9).** Since TCK-1897, an md-manager worktree on a base that includes it has
@@ -302,7 +309,7 @@ Write the report in plain sentences (`~/.claude/references/note-style-guide.md` 
 Sentences). Put what needs the owner first. A section with nothing in it is left out.
 
 1. **Needs you.** The owner-only steps found first (an npm login, a key, a production SQL yes), how many cards wait, the `Decide:` line of each, and the link to the Chief view.
-2. **Waiting for you now.** The C17 sessions that are at a question or a permission prompt, with the ticket and how long they have waited, and the questions and plans of step 3b that you left for the owner.
+2. **Waiting for you now.** The C17 sessions that are at a question or a permission prompt, with the ticket and how long they have waited, and the questions and plans of step 3b that you left for the owner. Also each stopped loop (a C17 row whose loop has stopped) that has a card waiting for the owner, found with `coord_decisions` and `status: "pending"`: the ticket, the card's number and question, and how long it has waited.
 3. **What I did.** One line per message sent, per version handed out, per question or plan answered, per session started and per pull of the main checkout, with the rule.
 4. **Started sessions.** Each row of `coord-start.mjs list`: the ticket, its session, its state and what needs the owner. Then each ticket still in the start queue, with what it waits for. It waits for a free slot, a named ticket's ship, the owner's card, or a reason the owner must fix.
 5. **For your review.** How many judgment calls wait in the review list.
@@ -401,7 +408,9 @@ Every 5 minutes it scans, and every 10 seconds it reads the questions and plans 
 changes, or a new question or plan on your route arrives, it posts the scan and types
 `/noesis-chief watch` into this session, but only when this session is idle: never at a question
 or a permission prompt, and never while the owner has paused the sessions. It stops when this session ends, and it starts nothing while another
-watcher serves a live Chief. It has no model, so it costs no tokens. Also call
+watcher serves a live Chief. It has no model, so it costs no tokens. Every 10 seconds it also reads
+the cards the owner answered, and a newly answered one wakes this session the same way (TCK-1983):
+your pass then wakes the stopped loop that the card concerns (step 3, `wake`). Also call
 `ScheduleWakeup` with 1800 seconds and the prompt `/noesis-chief watch`: that wake comes when
 nothing changes, or when the watcher is not running. On a wake:
 1. Run steps 0–3c again (`done.json` keeps the rules from repeating). Step 0 comes first: a paused wake only reports `paused` and waits.
