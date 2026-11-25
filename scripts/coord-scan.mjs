@@ -761,7 +761,11 @@ function selftest() {
       eq('C17 answered: the newest answer wins; the label and question come from the card when the file has none',
         [c17([dec(), dec({ id: 195, answered_at: '2026-11-23T18:00:00Z' })]), row(run([{ id: 7, ticket: 'TCK-4', status: 'answered', answer: 'B', answered_at: at, card: { question: 'Q?', options: [{ label: 'one' }, { label: 'two' }] } }])).evidence.answered],
         [['high', 195], { id: 7, answer: 'B', label: 'two', question: 'Q?', answered_at: at }]);
-      eq('C17 answered: the answer time is given back in one ISO form', row(run([dec({ answered_at: '2026-11-23T17:02:44Z' })])).evidence.answered.answered_at, '2026-11-23T17:02:44.000Z');
+      const answeredAt = (when) => (row(run([dec({ answered_at: when })])).evidence.answered || {}).answered_at;
+      eq('C17 answered: the answer time is given back in one ISO form', answeredAt('2026-11-23T17:02:44Z'), '2026-11-23T17:02:44.000Z');
+      // The form the server really sends (Postgres text, measured on the TCK-1983 FIN chain): it counts, and comes back as ISO.
+      eq('C17 answered: the server\'s Postgres time form counts and comes back as ISO', [c17([dec({ answered_at: '2026-11-23 17:02:44.856181+00' })]), answeredAt('2026-11-23 17:02:44.856181+00')],
+        [['high', 194], '2026-11-23T17:02:44.856Z']);
       const plainRow = JSON.stringify(row(run(null)));
       eq('C17 answered: without --decisions, or with none that match, the row is as before', [plainRow === JSON.stringify(row(scan({ repo: w2, board, agents: idle, npm: '2.12.0', withProcesses: false }))), JSON.stringify(row(run([]))) === plainRow, JSON.stringify(row(run([dec({ session_id: 'x', ticket: 'TCK-9' })]))) === plainRow, row(run(null)).severity], [true, true, true, 'medium']);
       const inboxDir = fs.mkdtempSync(path.join(root, 'inbox-'));
