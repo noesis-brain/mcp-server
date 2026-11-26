@@ -135,6 +135,9 @@ export function scratchDirsOf(sid, root) {
 const realOf = (p) => { try { return fs.realpathSync(p); } catch { return p; } };
 const within = (dir, root) => dir === root || dir.startsWith(root + path.sep);
 
+// coord-hot.mjs (TCK-1984) reads the same worktrees; an export list keeps the copied text above unchanged.
+export { mainCheckout, worktrees, ticketNumberOf };
+
 function mcpVersion(dir) {
   try { return JSON.parse(fs.readFileSync(path.join(dir, MCP_DIR, 'package.json'), 'utf8')).version || null; } catch { return null; }
 }
