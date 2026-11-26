@@ -252,7 +252,8 @@ function expandWord(word, vars) {
   return unknown || /[$`]/.test(out) ? null : out;
 }
 
-/** The git commit / merge / push calls (and gh pr merge) in a command, each with its folder. */
+/** The git commit / merge / push calls (and gh pr merge) in a command, each with its folder. A
+ *  commit also carries `env`: the environment its git process gets (TCK-1973). */
 export function gitCheckpoints(command, cwd) {
   const found = [];
   if (!/\b(?:git|gh)\b/.test(String(command || ''))) return found;
@@ -260,6 +261,18 @@ export function gitCheckpoints(command, cwd) {
   // Variables the command line sets itself (`WT=/x; git -C $WT push`, `export WT=/x`), on top
   // of the environment. A folder that names an unknown variable falls back to the session cwd.
   const vars = { ...process.env };
+  // What a child process sees, as in bash: the environment, an `export`, and a plain assignment
+  // only to a variable that is already exported. A value we cannot know still counts as set.
+  const exported = { ...process.env };
+  const UNKNOWN = '\u0000unknown';
+  // Names the command assigned a value we cannot know: a later `export NAME` still exports one.
+  // A later known value wins, because `export NAME` looks in `vars` first.
+  const unknownNames = new Set();
+  const setIn = (target, a) => {
+    const eq = a.indexOf('=');
+    const v = expandWord(a.slice(eq + 1), vars);
+    target[a.slice(0, eq)] = v === null ? UNKNOWN : v;
+  };
   let here = start;
   for (const words of simpleCommands(command)) {
     let i = 0;
@@ -267,17 +280,30 @@ export function gitCheckpoints(command, cwd) {
     if (isExport || words.every((x) => ASSIGN.test(x))) {
       for (const a of words.slice(isExport ? 1 : 0)) {
         const eq = a.indexOf('=');
-        if (eq <= 0) continue;
+        if (eq <= 0) {
+          if (isExport && a in vars) exported[a] = vars[a];
+          else if (isExport && unknownNames.has(a)) exported[a] = UNKNOWN;
+          continue;
+        }
+        const name = a.slice(0, eq);
+        if (isExport || name in exported) setIn(exported, a);
         const v = expandWord(a.slice(eq + 1), vars);
-        if (v === null) delete vars[a.slice(0, eq)]; // unknown value: the variable stays unknown
-        else vars[a.slice(0, eq)] = v;
+        if (v === null) {
+          delete vars[name]; // unknown value: the variable stays unknown
+          unknownNames.add(name);
+        } else vars[name] = v;
       }
       continue;
     }
-    while (i < words.length && ASSIGN.test(words[i])) i++;
+    // `VAR=x git commit` and `env VAR=x git commit` set VAR for that one command only.
+    const cmdEnv = { ...exported };
+    while (i < words.length && ASSIGN.test(words[i])) setIn(cmdEnv, words[i++]);
     if (words[i] === 'env') {
       i++;
-      while (i < words.length && (ASSIGN.test(words[i]) || words[i].startsWith('-'))) i++;
+      while (i < words.length && (ASSIGN.test(words[i]) || words[i].startsWith('-'))) {
+        if (ASSIGN.test(words[i])) setIn(cmdEnv, words[i]);
+        i++;
+      }
     }
     while (SKIP_WORDS.has(words[i])) i++;
     const prog = words[i];
@@ -305,7 +331,7 @@ export function gitCheckpoints(command, cwd) {
     }
     const sub = words[i];
     const rest = words.slice(i + 1);
-    if (sub === 'commit') found.push({ kind: 'commit', dir });
+    if (sub === 'commit') found.push({ kind: 'commit', dir, env: cmdEnv });
     else if (sub === 'merge' && !rest.some((a) => ['--abort', '--continue', '--quit'].includes(a))) found.push({ kind: 'merge', dir });
     else if (sub === 'push' && !rest.includes('--dry-run') && !rest.includes('-n')) found.push({ kind: 'push', dir, args: rest });
   }
@@ -1176,6 +1202,33 @@ function mergesDeploy(hit) {
   return !!deploy && git(hit.dir, ['rev-parse', '--abbrev-ref', 'HEAD']) === deploy;
 }
 
+/**
+ * Whether a commit in this checkout may run its backend tests on a test database that another
+ * checkout uses too (TCK-1973). Since TCK-1897, src/backend/test/dbUrl.ts gives a linked worktree
+ * (its `.git` is a file) its own `noesis_test_<label>`. So only these share one: the main checkout,
+ * a linked worktree on a base whose dbUrl.ts has no per-worktree name (no `worktreeLabel`), and a
+ * checkout with a DATABASE_URL_TEST override, in the environment or the repository's `.env`.
+ * `env` is the environment the commit's git process gets (gitCheckpoints: the hook's own, plus
+ * what the command line exports or sets in front of the commit).
+ */
+export function mayShareTestDb(dir, env = process.env) {
+  if (env.DATABASE_URL_TEST) return true;
+  const top = git(dir, ['rev-parse', '--show-toplevel']) || dir;
+  try {
+    if (/^[ \t]*(?:export[ \t]+)?DATABASE_URL_TEST[ \t]*=[ \t]*\S/m.test(fs.readFileSync(path.join(top, '.env'), 'utf8'))) return true;
+  } catch {}
+  let linked = false;
+  try {
+    linked = fs.statSync(path.join(top, '.git')).isFile();
+  } catch {}
+  if (!linked) return true;
+  try {
+    return !/\bworktreeLabel\b/.test(fs.readFileSync(path.join(top, 'src', 'backend', 'test', 'dbUrl.ts'), 'utf8'));
+  } catch {
+    return true;
+  }
+}
+
 /** The guarded actions of one Bash call, as { rule, lease } (lease = the server lease it needs, or null). */
 function guardedActions(p, sw) {
   if (p.tool_name !== 'Bash') return [];
@@ -1188,7 +1241,9 @@ function guardedActions(p, sw) {
     else if (hit.kind === 'merge' && mergesDeploy(hit)) found.push({ rule: 'merge-without-ship-lease', lease: 'ship' });
     else if (hit.kind === 'commit') {
       const staged = git(hit.dir, ['diff', '--cached', '--name-only']) || '';
-      if (staged.split('\n').some((f) => f.startsWith('src/backend/'))) found.push({ rule: 'backend-commit-outside-test-db-lease', lease: null });
+      if (staged.split('\n').some((f) => f.startsWith('src/backend/')) && mayShareTestDb(hit.dir, hit.env || process.env)) {
+        found.push({ rule: 'backend-commit-outside-test-db-lease', lease: null });
+      }
     }
   }
   if (publishesToNpm(command)) found.push({ rule: 'npm-publish-without-mcp-publish-lease', lease: 'mcp-publish' });
@@ -1200,7 +1255,7 @@ const GUARD_TEXT = {
   'push-without-ship-lease': 'this push moves the deploy branch, and this session does not hold the ship lease. Take it first (mcp__noesis__coord_lease resource "ship", action "acquire") and keep it until the deployment is verified.',
   'merge-without-ship-lease': 'this merge goes into the deploy branch, and this session does not hold the ship lease. Take it first (mcp__noesis__coord_lease resource "ship", action "acquire").',
   'npm-publish-without-mcp-publish-lease': 'this publishes to npm, and this session does not hold the mcp-publish lease. Take it first (mcp__noesis__coord_lease resource "mcp-publish", action "acquire"); an npm publish is also an owner gate.',
-  'backend-commit-outside-test-db-lease': 'this commit has staged src/backend files, so its pre-commit hook runs the full backend suite on the shared noesis_test database, and it is not run inside `node ~/.claude/tools/coord-lease.mjs run test-db --wait 7800 -- git commit …`. Run it inside the lease, so two suites never share the database.',
+  'backend-commit-outside-test-db-lease': 'this commit has staged src/backend files in a checkout that may share its test database (the main checkout, a base without per-worktree test databases, or a DATABASE_URL_TEST override), so its pre-commit hook may run the backend suite on that shared database, and it is not run inside `node ~/.claude/tools/coord-lease.mjs run test-db --wait 120 -- git commit …`. Run it inside the lease, so two suites never share the database.',
 };
 
 /** Warn-only: one warning per guarded action this session is not covered for, and one log line each. */

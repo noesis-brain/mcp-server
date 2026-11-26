@@ -21,7 +21,9 @@ import * as http from 'node:http';
 import { spawn, spawnSync, execFileSync } from 'node:child_process';
 import type { AddressInfo } from 'node:net';
 
-const HOOK = path.resolve(__dirname, '..', 'scripts', 'noesis-ticket-session.mjs');
+// TICKET_HOOK_UNDER_TEST runs the cases against another copy of the hook (the one before a change,
+// to see a new case red, or a mutant).
+const HOOK = process.env.TICKET_HOOK_UNDER_TEST || path.resolve(__dirname, '..', 'scripts', 'noesis-ticket-session.mjs');
 const HOOK_SID = 'hook-session-after-clear-0001';
 const BOUND_SID = '3f0c1d2e-4a5b-4c6d-8e7f-a1b2c3d4e5f6';
 
@@ -1856,6 +1858,11 @@ describe('TCK-1890: the Chief of Staff — inbox, pause flag, heartbeat, warn-on
     execFileSync('git', ['-C', dir, 'add', 'src/backend/x.ts'], { stdio: 'ignore' });
     const r = await run(home, bashIn('git commit -m x'), env);
     expect(r.ctx).toMatch(/\[coord-guard\].*staged src\/backend files/);
+    // TCK-1973: the command it names waits 120 minutes (coord-lease counts minutes), and the hook
+    // only "may" run the suite: on a loop/* branch it runs the full suite only for shared test files.
+    expect(r.ctx).toMatch(/coord-lease\.mjs run test-db --wait 120 -- git commit/);
+    expect(r.ctx).not.toMatch(/7800/);
+    expect(r.ctx).toMatch(/may run the backend suite/);
     expect(guardLog(home)).toMatch(/ would-block backend-commit-outside-test-db-lease /);
     expect(requests.filter((q) => q.url === '/api/mcp/coordination/leases')).toHaveLength(0);
     for (const ok of ['node ~/.claude/tools/coord-lease.mjs run test-db --wait 7800 -- git commit -m x', 'node /x/coord-lease.mjs run test-db -- git commit -F msg']) {
@@ -1865,6 +1872,102 @@ describe('TCK-1890: the Chief of Staff — inbox, pause flag, heartbeat, warn-on
     for (const bad of ['node ~/.claude/tools/coord-lease.mjs run test-db -- true; git commit -m x', 'node coord-lease.mjs run test-db -- npm test && git commit -m x']) {
       expect((await run(home, bashIn(bad), env)).ctx, bad).toMatch(/\[coord-guard\].*staged src\/backend files/);
     }
+  });
+
+  it('guard: the test-db lease warning fires only where the test database may be shared (TCK-1973)', async () => {
+    const home = sandbox({ enabled: true, repos: [{ remote: REMOTE, deployBranch: 'main' }] });
+    seed(home, BOUND);
+    // The suite's own environment must not decide the case.
+    const env = { ...ON, COORD_INBOX: 'off', DATABASE_URL_TEST: undefined };
+    const main = gitRepo(REMOTE, 'main');
+    const g = (dir: string, ...a: string[]) => execFileSync('git', ['-C', dir, ...a], { stdio: 'ignore' });
+    const dbUrl = (dir: string, text: string) => {
+      fs.mkdirSync(path.join(dir, 'src', 'backend', 'test'), { recursive: true });
+      fs.writeFileSync(path.join(dir, 'src', 'backend', 'test', 'dbUrl.ts'), text);
+    };
+    // A base with per-worktree test databases (TCK-1897), committed so every worktree has it.
+    dbUrl(main, 'export function worktreeLabel(folderName: string): string { return folderName; }\n');
+    g(main, 'add', 'src/backend/test/dbUrl.ts');
+    g(main, 'commit', '-q', '-m', 'per-worktree test databases');
+    const worktree = (branch: string) => {
+      const dir = path.join(fs.realpathSync(os.tmpdir()), `tck-wt-${branch.replace(/\W/g, '-')}-${process.pid}-${Date.now()}`);
+      g(main, 'worktree', 'add', '-q', '-b', branch, dir);
+      repos.push(dir);
+      return dir;
+    };
+    const stageBackend = (dir: string) => {
+      fs.writeFileSync(path.join(dir, 'src', 'backend', 'x.ts'), `x ${Date.now()}`);
+      g(dir, 'add', 'src/backend/x.ts');
+    };
+    const commitIn = async (dir: string, extra: Record<string, string | undefined> = {}) =>
+      (await run(home, { hook_event_name: 'PreToolUse', tool_name: 'Bash', tool_input: { command: 'git commit -m x' }, cwd: dir }, { ...env, ...extra })).ctx;
+    const WARN = /\[coord-guard\].*staged src\/backend files/;
+
+    // A linked worktree whose base names a database per worktree: its own database, no warning.
+    const own = worktree('loop/tck-own');
+    stageBackend(own);
+    expect(await commitIn(own)).not.toMatch(/coord-guard/);
+    // The same worktree from a subfolder: the checkout's root decides, not the folder.
+    expect((await run(home, { hook_event_name: 'PreToolUse', tool_name: 'Bash', tool_input: { command: 'git commit -m x' }, cwd: path.join(own, 'src', 'backend') }, env)).ctx).not.toMatch(/coord-guard/);
+    // ...unless DATABASE_URL_TEST points it elsewhere, in the environment or in the .env file.
+    expect(await commitIn(own, { DATABASE_URL_TEST: 'postgres://h/noesis_test' })).toMatch(WARN);
+    fs.writeFileSync(path.join(own, '.env'), 'DATABASE_URL=postgres://h/neondb\nDATABASE_URL_TEST=postgres://h/noesis_test\n');
+    expect(await commitIn(own)).toMatch(WARN);
+    fs.writeFileSync(path.join(own, '.env'), 'export DATABASE_URL_TEST = postgres://h/noesis_test\n');
+    expect(await commitIn(own)).toMatch(WARN);
+    // A commented-out, empty or blank override overrides nothing.
+    fs.writeFileSync(path.join(own, '.env'), '# DATABASE_URL_TEST=postgres://h/noesis_test\nDATABASE_URL_TEST=\nDATABASE_URL_TEST=   \n');
+    expect(await commitIn(own)).not.toMatch(/coord-guard/);
+    // An indented line is still read (dotenv reads it), also from a subfolder: the root .env counts.
+    fs.writeFileSync(path.join(own, '.env'), '  DATABASE_URL_TEST=postgres://h/noesis_test\n');
+    expect(await commitIn(own)).toMatch(WARN);
+    fs.writeFileSync(path.join(own, '.env'), 'DATABASE_URL_TEST=postgres://h/noesis_test\n');
+    expect((await run(home, { hook_event_name: 'PreToolUse', tool_name: 'Bash', tool_input: { command: 'git commit -m x' }, cwd: path.join(own, 'src', 'backend') }, env)).ctx).toMatch(WARN);
+    fs.rmSync(path.join(own, '.env'));
+
+    // The commit command itself can set the override: git, and so the pre-commit suite, gets it.
+    const bash = async (cwd: string, command: string) =>
+      (await run(home, { hook_event_name: 'PreToolUse', tool_name: 'Bash', tool_input: { command }, cwd }, env)).ctx;
+    for (const set of [
+      'DATABASE_URL_TEST=postgres://h/noesis_test git commit -m x',
+      'export DATABASE_URL_TEST=postgres://h/noesis_test; git commit -m x',
+      'env DATABASE_URL_TEST=postgres://h/noesis_test git commit -m x',
+      'DATABASE_URL_TEST="$(cat url.txt)" git commit -m x',
+      'DATABASE_URL_TEST=postgres://h/noesis_test; export DATABASE_URL_TEST; git commit -m x',
+      'DATABASE_URL_TEST="$(cat url.txt)"; export DATABASE_URL_TEST; git commit -m x',
+    ]) {
+      expect(await bash(own, set), set).toMatch(WARN);
+    }
+    // A plain assignment is not exported, so git does not get it (bash semantics).
+    expect(await bash(own, 'DATABASE_URL_TEST=postgres://h/noesis_test; git commit -m x')).not.toMatch(/coord-guard/);
+    // A known value after an unknown one is what export passes on.
+    expect(await bash(own, 'DATABASE_URL_TEST="$(cat url.txt)"; DATABASE_URL_TEST=; export DATABASE_URL_TEST; git commit -m x')).not.toMatch(/coord-guard/);
+    // A plain assignment does change a variable the hook's environment already exports.
+    const bashWith = async (hookEnv: Record<string, string>, command: string) =>
+      (await run(home, { hook_event_name: 'PreToolUse', tool_name: 'Bash', tool_input: { command }, cwd: own }, { ...env, ...hookEnv })).ctx;
+    expect(await bashWith({ DATABASE_URL_TEST: '' }, 'DATABASE_URL_TEST=postgres://h/noesis_test; git commit -m x')).toMatch(WARN);
+    expect(await bashWith({ DATABASE_URL_TEST: 'postgres://h/noesis_test' }, 'DATABASE_URL_TEST=; git commit -m x')).not.toMatch(/coord-guard/);
+
+    // `git -C` decides the checkout, not the folder the command runs in.
+    stageBackend(main);
+    expect(await bash(main, `git -C ${own} commit -m x`)).not.toMatch(/coord-guard/);
+    expect(await bash(own, `git -C ${main} commit -m x`)).toMatch(WARN);
+    g(main, 'reset', '-q');
+
+    // A linked worktree on an older base, without the per-worktree name: it shares noesis_test.
+    const old = worktree('loop/tck-old');
+    dbUrl(old, 'export const TEST_DB_NAME = "noesis_test";\n');
+    stageBackend(old);
+    expect(await commitIn(old)).toMatch(WARN);
+    // A linked worktree with no dbUrl.ts at all is not known to have its own database either.
+    const none = worktree('loop/tck-none');
+    fs.rmSync(path.join(none, 'src', 'backend', 'test', 'dbUrl.ts'));
+    stageBackend(none);
+    expect(await commitIn(none)).toMatch(WARN);
+
+    // The main checkout always shares noesis_test with the suites run there.
+    stageBackend(main);
+    expect(await commitIn(main)).toMatch(WARN);
   });
 
   it('a gate denial keeps its decision and still carries the inbox lines', async () => {
