@@ -16,6 +16,10 @@
 //     session that can close; and for the sure-orphan loop tabs, one cleanup judgment and a
 //     `close-tabs` (coord-tabs.mjs close --ids). C20 rows never count toward the ship lane.
 //
+//   - C21 (TCK-1984): an orphaned process that keeps a CPU busy. A `stop-process` (coord-hot.mjs stop --pid
+//     --started, which reads every fact again first), then a `decide` that records the stop for the owner's
+//     review (category other). It is a rule: no card, and no wait.
+//
 //   - C17 with `answered` (TCK-1983): a `wake` for a stopped loop whose card the owner answered after
 //     it last read its inbox; the Chief sends its line with SendMessage, once per answered card.
 //
@@ -40,6 +44,8 @@ const SHARED_TWO_WAY = { reversible: true, shared: true, userVisible: false, tou
 const ONE_WAY = (touches) => ({ reversible: false, shared: true, userVisible: true, touches, confidence: 'high', evidence: 'measured' });
 /** A cleanup of another session's process: reversible only by restarting it, so it is user-visible. */
 const CLEANUP = { reversible: false, shared: true, userVisible: true, touches: [], confidence: 'low', evidence: 'measured' };
+/** Stopping an orphaned process that keeps a CPU busy (C21): it cannot be restarted, but it served no one. */
+export const HOT_STOP = { reversible: false, shared: false, userVisible: false, touches: [], confidence: 'high', evidence: 'measured' };
 /** Closing sure-orphan loop tabs: the owner sees it, and a tab can be opened again from its address. */
 const TAB_CLEANUP = { reversible: true, shared: false, userVisible: true, touches: [], confidence: 'high', evidence: 'measured' };
 
@@ -78,6 +84,7 @@ function sessionOf(scan, key) {
  *   note       {text}   (a rule that needs no step: logged once in the report)
  *   ask-close  {to_session, name, ticket}   (C20: ask that session "Can I close the session?" once)
  *   close-tabs {ids, tickets}   (C20: close these sure-orphan loop tabs, after the cleanup decide)
+ *   stop-process {pid, started, folder, ticket, command}   (C21: coord-hot.mjs stop, then the decide that records it)
  *   wake       {to_session, name, ticket, decision, line}   (C17: SendMessage the line to a stopped loop whose card was answered)
  * Conflicts whose key is in `done` give no action.
  */
@@ -89,8 +96,8 @@ export function rulesFor(scan, done = []) {
   const inBranches = [...new Set(held.filter((v) => typeof v === 'string' && v))]
     .sort((x, y) => x.localeCompare(y, undefined, { numeric: true }));
   // How many conflicts in this scan name a ticket: the one with fewer ships first (fewer rebases after it).
-  // C20 rows (can a session close?) are no conflict between tickets, so they never count.
-  const load = (k) => (scan.conflicts || []).filter((x) => x.kind !== 'C20' && (x.a === k || x.b === k)).length;
+  // C20 rows (can a session close?) and C21 rows (a hot orphaned process) are no conflict between tickets, so they never count.
+  const load = (k) => (scan.conflicts || []).filter((x) => x.kind !== 'C20' && x.kind !== 'C21' && (x.a === k || x.b === k)).length;
   // C1: every ticket in a waiting-to-ship pair is in one ship lane, in the recommended order: fewer
   // conflicts first, then the lower number.
   const lane = [...new Set((scan.conflicts || []).filter((x) => x.kind === 'C1' && isTicket(x.a) && isTicket(x.b)).flatMap((x) => [x.a, x.b]))]
@@ -270,6 +277,16 @@ export function rulesFor(scan, done = []) {
           if (e.askable === true) push(c, 'ask-close', { type: 'ask-close', to_session: c.a, name: e.name || null, ticket: isTicket(e.ticket) ? e.ticket : null });
           else if (e.verdict === 'yes') push(c, 'ready', { type: 'note', text: `${e.name || c.a.slice(0, 8)} (${e.ticket || 'no ticket'}) can close: run /noesis-chief close` });
         }
+        break;
+      }
+      case 'C21': {
+        // The key holds the start time, so a pid that is reused later is a new process with its own action.
+        const e = c.evidence || {};
+        if (!Number.isSafeInteger(e.pid) || e.pid <= 1 || typeof e.started !== 'string' || !e.started || c.a !== `pid-${e.pid}`) break;
+        const tag = e.started.replace(/[^A-Za-z0-9:]+/g, '-');
+        const ticket = isTicket(e.ticket) ? e.ticket : null;
+        push(c, `stop:${tag}`, { type: 'stop-process', pid: e.pid, started: e.started, folder: e.folder || null, ticket, command: e.command || null });
+        push(c, `record:${tag}`, { type: 'decide', category: 'other', rubric: HOT_STOP, ticket, choice: `Stopped orphaned pid ${e.pid} (${String(e.command || '').slice(0, 80)}): ${e.pcpu}% CPU now, ${e.avg}% over its ${e.how}`, reason: 'C21: its parent is gone (PID 1) and it kept a CPU busy for 15 minutes or more in a Claude folder; coord-hot.mjs stop read every fact again before the signal.', evidence: [...(ticket ? [ticket] : []), ...(e.folder ? [e.folder] : [])].slice(0, 10) });
         break;
       }
       default:
@@ -481,6 +498,17 @@ function selftest() {
   eq('rules C20: 300 sure orphans with 8-digit ids: the choice names 8 and stays within the 500 characters the server takes; close-tabs keeps every id', [many[0].choice.length <= 500, many[0].choice, many[1].ids.length], [true, 'Close 300 sure-orphan Chrome tabs (11586000,11586001,11586002,11586003,11586004,11586005,11586006,11586007 and 292 more)', 300]);
   eq('rules C20: a tabs row of a check that could not read the tabs gives no action', rulesFor({ conflicts: [{ ...c20[5], evidence: { unreadable: true, tabs: [], sureOrphans: [], more: 0 } }] }).length, 0);
   eq('rules C20: no sure orphan, no tab action', rulesFor({ conflicts: [{ ...c20[5], evidence: { ...c20[5].evidence, sureOrphans: [] } }] }).length, 0);
+  // C21 (TCK-1984): a stop-process, then the decide that records it; once per process (pid and start time).
+  const c21 = { kind: 'C21', severity: 'high', a: 'pid-28669', b: '', detail: 'node forks.js (pid 28669) uses 104.4% CPU', evidence: { pid: 28669, started: 'Wed Nov 25 21:53:29 2026', pcpu: 104.4, avg: 100, how: 'lifetime of 746 min', folder: '/private/tmp/claude-501/-p/sid', kind: 'scratch', ticket: null, command: 'node vitest/dist/workers/forks.js' } };
+  const r21 = rulesFor({ conflicts: [c21] });
+  eq('rules C21: a stop-process, then a decide that records it (category other, the HOT_STOP rubric), and no card', [r21.map((a) => [a.type, a.key]), r21[0].pid, r21[0].started, r21[1].category, r21[1].rubric, r21[1].card === undefined, r21[1].evidence], [[['stop-process', 'C21|pid-28669||stop:Wed-Nov-25-21:53:29-2026'], ['decide', 'C21|pid-28669||record:Wed-Nov-25-21:53:29-2026']], 28669, 'Wed Nov 25 21:53:29 2026', 'other', HOT_STOP, true, ['/private/tmp/claude-501/-p/sid']]);
+  eq('rules C21: the rubric is honest: the stop cannot be undone, but it touches no shared file, nothing users see, and nothing outside', HOT_STOP, { reversible: false, shared: false, userVisible: false, touches: [], confidence: 'high', evidence: 'measured' });
+  eq('rules C21: the decide stays inside the server limits and names the pid', [r21[1].choice.length <= 500, r21[1].choice.startsWith('Stopped orphaned pid 28669 (')], [true, true]);
+  eq('rules C21: done keys: the same process is stopped once; a reused pid (another start time) is a new action', [rulesFor({ conflicts: [c21] }, r21.map((a) => a.key)).length, rulesFor({ conflicts: [{ ...c21, evidence: { ...c21.evidence, started: 'Thu Nov 26 09:00:00 2026' } }] }, r21.map((a) => a.key)).length], [0, 2]);
+  eq('rules C21: a row with a bad pid or start time, or whose a is not pid-<pid>, gives no action', [{ pid: 1 }, { pid: 0 }, { pid: 'x' }, { started: '' }, { started: 7 }].map((o) => rulesFor({ conflicts: [{ ...c21, evidence: { ...c21.evidence, ...o } }] }).length).concat(rulesFor({ conflicts: [{ ...c21, a: 'pid-1' }] }).length), [0, 0, 0, 0, 0, 0]);
+  eq('rules C21: the pid guard itself: pid 1 with a = pid-1, and a pid given as text with a matching a, give no action', [rulesFor({ conflicts: [{ ...c21, a: 'pid-1', evidence: { ...c21.evidence, pid: 1 } }] }).length, rulesFor({ conflicts: [{ ...c21, evidence: { ...c21.evidence, pid: '28669' } }] }).length, rulesFor({ conflicts: [{ ...c21, a: 'pid-2', evidence: { ...c21.evidence, pid: 2 } }] }).length], [0, 0, 2]);
+  eq('rules C21: a worktree process names its ticket in both actions', (() => { const r = rulesFor({ conflicts: [{ ...c21, evidence: { ...c21.evidence, kind: 'worktree', ticket: 'TCK-7', folder: '/w/md-manager-tck-7' } }] }); return [r[0].ticket, r[1].ticket, r[1].evidence]; })(), ['TCK-7', 'TCK-7', ['TCK-7', '/w/md-manager-tck-7']]);
+  eq('rules C21: C21 rows never count toward the ship lane', laneCard([shipScan.conflicts[0], { ...c21, a: 'TCK-9' }]).card.options[0].label, 'Ship TCK-9 first, then TCK-10');
   eq('rules C20: C20 rows never count toward the ship lane (a stored row naming a ticket included)', laneCard([shipScan.conflicts[0], ...[1, 2, 3].map((n) => ({ kind: 'C20', severity: 'low', a: 'TCK-9', b: '', detail: `x${n}`, evidence: {} }))]).card.options[0].label, 'Ship TCK-9 first, then TCK-10');
   console.log(failed ? `${failed} FAILED` : 'all passed');
   return failed ? 1 : 0;

@@ -365,7 +365,7 @@ export function registerCoordTools(server: McpServer, client: NoesisClient): voi
     'coord_report',
     'Post the scanner\'s findings as the whole picture of the conflicts now: each reported pair is opened or refreshed, each open pair it no longer reports is resolved. ' +
       `Run the scanner first, read-only: node ${COORD_SCANNER} --board <board.json> --json > <scan.json>, then pass scan_file. Or pass conflicts directly (at most 200). ` +
-      'The answer counts open, new, still and resolved pairs. Errors: VALIDATION (a malformed conflict: kind C1-C20, severity low|medium|high, the evidence an object).',
+      'The answer counts open, new, still and resolved pairs. Errors: VALIDATION (a malformed conflict: kind C1-C21, severity low|medium|high, the evidence an object).',
     {
       scan_file: z.string().optional().describe('The absolute path of a coord-scan --json output (a relative path is read from the MCP server\'s folder)'),
       conflicts: z.array(z.record(z.string(), z.unknown())).max(200).optional(),
@@ -406,7 +406,7 @@ export function registerCoordTools(server: McpServer, client: NoesisClient): voi
 
   server.tool(
     'coord_conflicts',
-    'List the open conflicts the scanner reported, the most severe first, with the pair, the kind (C1-C20), the detail, the evidence and when it was first and last seen. all=true adds those resolved in the last week.',
+    'List the open conflicts the scanner reported, the most severe first, with the pair, the kind (C1-C21), the detail, the evidence and when it was first and last seen. all=true adds those resolved in the last week.',
     { all: z.boolean().optional() },
     async (args) => {
       try {

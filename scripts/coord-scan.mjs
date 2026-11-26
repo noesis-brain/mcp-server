@@ -28,6 +28,12 @@
 // ~/.claude/coord-inbox/<session>.json, or $COORD_STATE_DIR): an idle session runs no hook, so only
 // the Chief's SendMessage brings it the answer. Without --decisions the rows are as before.
 //
+// C21 (TCK-1984): an orphaned process (parent PID 1) that keeps 50% or more of a CPU for 15 minutes in a
+// ticket worktree or under the Claude scratch root, with no listening port: one high row per process
+// (a = pid-<pid>), from coord-hot.mjs. It runs with the process list (C10), so the Chief's pass and the
+// watcher's scan post the same rows. It saves this run's CPU samples to ~/.claude/coord/cpu-samples.json,
+// the one file the scanner writes: the 15-minute window needs a sample from an earlier run.
+//
 // It only reads: git status, diff, rev-list and worktree list, the files of each worktree, the
 // loop registry (~/.claude/loop-supervisor/<session>.json), the tail of a planning ticket's session
 // transcript and its plan file, `claude agents --json`, `lsof` and
@@ -44,6 +50,7 @@ import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
+import { look as hotLook } from './coord-hot.mjs';
 
 const ACTIVE = ['planning', 'ready_to_implement', 'implementing', 'iterating', 'ready_to_merge', 'deploying'];
 const MCP_DIR = 'md-manager-mcp-server';
@@ -413,7 +420,7 @@ export function closeRows(saved, now = Date.now()) {
   return rows;
 }
 
-export function scan({ repo, board, agents, npm, plans = {}, withProcesses = true, listen = listeners, closeCheck = null, decisions = null, inboxRead = inboxReadAt, now = Date.now() }) {
+export function scan({ repo, board, agents, npm, plans = {}, withProcesses = true, listen = listeners, hot = (main) => hotLook({ repo: main }), closeCheck = null, decisions = null, inboxRead = inboxReadAt, now = Date.now() }) {
   const main = mainCheckout(repo);
   if (!main) throw new Error(`not a git repository: ${repo}`);
   const mainRef = git(main, ['rev-parse', '--abbrev-ref', 'HEAD']).out || 'main';
@@ -617,12 +624,22 @@ export function scan({ repo, board, agents, npm, plans = {}, withProcesses = tru
   for (const p of processes) {
     if (p.orphan) add('C10', 'low', `pid-${p.pid}`, '', `${p.command} (pid ${p.pid}) listens on ${p.ports.join(', ')} in ${path.basename(p.worktree)}, where no active ticket works`, { pid: p.pid, ports: p.ports, worktree: p.worktree });
   }
+  // C21 (TCK-1984): an orphaned process that keeps a CPU busy in a ticket worktree or a scratch folder. The rule
+  // stops it (coord-hot.mjs stop reads every fact again first). A look that could not read a fact gives no row.
+  let hotLookResult = null;
+  if (withProcesses) {
+    try { hotLookResult = hot(main); } catch (e) { hotLookResult = { error: `the look failed: ${clean(e && e.message, 200)}`, hot: [] }; }
+    for (const h of (hotLookResult && Array.isArray(hotLookResult.hot) ? hotLookResult.hot : [])) {
+      add('C21', 'high', `pid-${h.pid}`, '', clean(`${h.command} (pid ${h.pid}) uses ${h.pcpu}% CPU now and ${h.avg}% over its ${h.how}, parent PID 1, in ${h.kind === 'scratch' ? 'a Claude scratch folder' : `the ${h.ticket} worktree`}`, 400), { pid: h.pid, started: clean(h.started, 40), pcpu: h.pcpu, avg: h.avg, how: clean(h.how, 40), ageMin: h.ageMin, folder: clean(h.folder, 300), kind: h.kind, ticket: h.ticket || null, command: clean(h.command, 160) });
+    }
+  }
   // C20: one row per session from the saved close check, and one for the loop tabs no session owns.
   const c20 = closeRows(closeCheck, now);
   conflicts.push(...c20);
   conflicts.sort((x, y) => SEVERITY[x.severity] - SEVERITY[y.severity] || x.kind.localeCompare(y.kind));
   const close = closeCheck ? { checkedAt: closeCheck.checkedAt || null, rows: c20.length } : null;
-  return { generatedAt: new Date().toISOString(), close, main: { path: main, ref: mainRef, phases: mainPhases.length, nextPhase: mainMax + 1, mcpVersion: mainVersion, npmLatest: npm, distStale: Boolean(dist && dist.newestSource > dist.builtAt) }, tickets, conflicts, processes };
+  const hotSummary = hotLookResult ? { checkedAt: hotLookResult.checkedAt || null, repo: hotLookResult.repo || null, error: hotLookResult.error || null, rows: (hotLookResult.hot || []).length } : null;
+  return { generatedAt: new Date().toISOString(), close, hot: hotSummary, main: { path: main, ref: mainRef, phases: mainPhases.length, nextPhase: mainMax + 1, mcpVersion: mainVersion, npmLatest: npm, distStale: Boolean(dist && dist.newestSource > dist.builtAt) }, tickets, conflicts, processes };
 }
 
 function report(r) {
@@ -638,6 +655,7 @@ function report(r) {
   if (r.close) out.push(`close check ${r.close.checkedAt || '?'}: ${r.close.rows} C20 row(s)${r.close.rows ? '' : ` (none: older than ${CLOSE_CHECK_MAX_MIN} min, or no sessions)`}`);
   out.push('', r.conflicts.length ? 'Conflicts:' : 'Conflicts: none');
   for (const c of r.conflicts) out.push(`  [${c.severity}] ${c.kind} ${c.a} <-> ${c.b}: ${c.detail}`);
+  if (r.hot) out.push('', r.hot.error ? `Hot orphans (C21): the check failed (${r.hot.error}), so none is listed` : `Hot orphans (C21): ${r.hot.rows}`);
   const orphans = r.processes.filter((p) => p.orphan);
   if (r.processes.length) out.push('', `Local servers: ${r.processes.length} (${orphans.length} in a worktree with no active ticket)`);
   for (const p of r.processes) out.push(`  pid ${p.pid} ${p.command} :${p.ports.join(',')} ${p.worktree ? path.basename(p.worktree) : p.cwd || '?'}${p.ticket ? ` (${p.ticket})` : p.orphan ? ' (no active ticket)' : ''}`);
@@ -872,9 +890,23 @@ function selftest() {
       { pid: 4343, command: 'node', ports: [5703], cwd: w1 },
       { pid: 4444, command: 'vite', ports: [3500], cwd: repo },
     ];
-    const rc = scan({ repo: w2, board: { issues: [{ key: 'TCK-1', work_status: 'implementing' }] }, agents: [], npm: '2.12.0', listen: fakeListeners });
+    const noHot = () => ({ checkedAt: 'x', hot: [] });
+    const rc = scan({ repo: w2, board: { issues: [{ key: 'TCK-1', work_status: 'implementing' }] }, agents: [], npm: '2.12.0', listen: fakeListeners, hot: noHot });
     eq('C10: a server in a worktree with no active ticket; not one in an active ticket\'s worktree or in the main checkout', rc.conflicts.filter((c) => c.kind === 'C10').map((c) => [c.a, c.b, c.evidence.ports, path.basename(c.evidence.worktree)]), [['pid-4242', '', [5701, 5702], path.basename(w3)]]);
     eq('C10: no process list, no C10', scan({ repo: w2, board: { issues: [] }, agents: [], npm: '2.12.0', withProcesses: false, listen: fakeListeners }).conflicts.filter((c) => c.kind === 'C10').length, 0);
+    // C21 (TCK-1984): one high row per hot orphan, from coord-hot.mjs's look on the main checkout.
+    const hotRow = (pid, o) => ({ pid, started: 'Wed Nov 25 21:53:29 2026', pcpu: 104.4, avg: 100, how: 'lifetime of 746 min', ageMin: 746, folder: `/private/tmp/claude-501/-p/s${pid}`, kind: 'scratch', ticket: null, command: `node vitest/dist/workers/forks.js ${pid}`, ...o });
+    let lookedAt = null;
+    const twoHot = (m) => { lookedAt = m; return { checkedAt: '2026-11-26T02:00:00.000Z', hot: [hotRow(28669), hotRow(58923, { kind: 'worktree', ticket: 'TCK-1', folder: w1 })] }; };
+    const rh = scan({ repo: w2, board: { issues: [] }, agents: [], npm: '2.12.0', listen: () => [], hot: twoHot });
+    const c21 = rh.conflicts.filter((c) => c.kind === 'C21');
+    eq('C21: one high row per hot orphan, a = pid-<pid>, looked up on the main checkout', [c21.map((c) => [c.severity, c.a, c.b]), lookedAt === repo, rh.hot], [[['high', 'pid-28669', ''], ['high', 'pid-58923', '']], true, { checkedAt: '2026-11-26T02:00:00.000Z', repo: null, error: null, rows: 2 }]);
+    eq('C21: a look that throws keeps every other row and says why', (() => { const r = scan({ repo: w2, board: { issues: [] }, agents: [], npm: '2.12.0', listen: fakeListeners, hot: () => { throw new Error('disk full'); } }); return [r.hot.error, r.conflicts.some((c) => c.kind === 'C10')]; })(), ['the look failed: disk full', true]);
+    eq('C21: the detail and the evidence name the pid, the start time, the CPU and the folder', [c21[0].detail, c21[1].detail.endsWith('in the TCK-1 worktree'), c21[0].evidence], ['node vitest/dist/workers/forks.js 28669 (pid 28669) uses 104.4% CPU now and 100% over its lifetime of 746 min, parent PID 1, in a Claude scratch folder', true, { pid: 28669, started: 'Wed Nov 25 21:53:29 2026', pcpu: 104.4, avg: 100, how: 'lifetime of 746 min', ageMin: 746, folder: '/private/tmp/claude-501/-p/s28669', kind: 'scratch', ticket: null, command: 'node vitest/dist/workers/forks.js 28669' }]);
+    eq('C21: high rows sort first', rh.conflicts[0].kind, 'C21');
+    eq('C21: a look that failed gives no row, and the scan says so', (() => { const r = scan({ repo: w2, board: { issues: [] }, agents: [], npm: '2.12.0', listen: () => [], hot: () => ({ error: 'ps failed', hot: [] }) }); return [r.conflicts.filter((c) => c.kind === 'C21').length, r.hot.error, report(r).includes('Hot orphans (C21): the check failed (ps failed)')]; })(), [0, 'ps failed', true]);
+    eq('C21: without the process list there is no look and no row', (() => { let called = false; const r = scan({ repo: w2, board: { issues: [] }, agents: [], npm: '2.12.0', withProcesses: false, hot: () => { called = true; return { hot: [hotRow(1)] }; } }); return [called, r.hot, r.conflicts.some((c) => c.kind === 'C21')]; })(), [false, null, false]);
+    eq('C21: every row stays inside the server limits (a long command and folder are cut)', (() => { const r = scan({ repo: w2, board: { issues: [] }, agents: [], npm: '2.12.0', listen: () => [], hot: () => ({ hot: [hotRow(7, { command: 'x'.repeat(5000), folder: '/'.repeat(5000) })] }) }); const c = r.conflicts.find((x) => x.kind === 'C21'); return [c.detail.length <= 400, c.evidence.command.length <= 160, c.evidence.folder.length <= 300]; })(), [true, true, true]);
     eq('read-only: the ship scans write nothing', snapAll(), snapShip);
     // C15: a ticket still being planned, whose plan names a file main changed after the plan was written.
     const snapC15 = snapAll();
@@ -1133,6 +1165,11 @@ function selftest() {
       try { return JSON.parse(r.stdout).conflicts.filter((c) => c.kind === 'C20').map((c) => c.a); } catch { return `exit ${r.status}: ${r.stderr.slice(0, 200)}`; }
     };
     eq('C20 CLI: the default ~/.claude/coord/close-check.json, or the file --close-check names', [cli(), cli('--close-check', other), cli('--close-check', path.join(root, 'missing.json'))], [[sidN(3), sidN(1), sidN(4), sidN(2), 'chrome-tabs'], [sidN(2), 'chrome-tabs'], []]);
+    // C21 through the command line (the scan the Chief and the watcher run): it looks with the real facts and saves its samples under the Claude folder.
+    { const r = spawnSync(process.execPath, [fileURLToPath(import.meta.url), '--board', boardFile, '--repo', repo, '--agents', path.join(root, 'no-agents.json'), '--npm-latest', '2.12.0', '--json'], { encoding: 'utf8', env: { ...process.env, CLAUDE_CONFIG_DIR: cfg20, COORD_HOT_SAMPLES: '' }, timeout: 120_000 });
+      let j = null; try { j = JSON.parse(r.stdout); } catch { /* reported below */ }
+      eq('C21 CLI: the scan looks for hot orphans on this machine and saves its samples to <Claude folder>/coord/cpu-samples.json', [Boolean(j && j.hot && j.hot.error === null && typeof j.hot.rows === 'number'), fs.existsSync(path.join(cfg20, 'coord', 'cpu-samples.json'))], [true, true]);
+      eq('C21 CLI: the default look is on the main checkout of --repo (so ticket worktrees count)', j && j.hot && j.hot.repo, repo); }
     const watchSrc = fs.readFileSync(path.join(path.dirname(fileURLToPath(import.meta.url)), 'coord-watch.mjs'), 'utf8');
     eq('C20: the watcher runs this scan without --close-check, so it reads the same default file as the Chief', [watchSrc.includes("[path.join(HERE, 'coord-scan.mjs'), '--board', boardFile, '--repo', args.repo, '--json']"), watchSrc.includes('close-check')], [true, false]);
   } finally {

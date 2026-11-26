@@ -165,7 +165,7 @@ export function look({ repo, configRepo, save = true, minCpu, windowS }, deps = 
   const file = deps.samplesFile();
   const r = hotOrphans({ ps, cwds, ports, folders, samples: readSamples(file), now: deps.now(), ...(minCpu ? { minCpu } : {}), ...(windowS ? { windowS } : {}) });
   if (save) saveSamples(r.samples, file);
-  return { checkedAt: new Date(deps.now()).toISOString(), hot: r.hot, folders: folders.length, ...(save ? { savedTo: file } : {}) };
+  return { checkedAt: new Date(deps.now()).toISOString(), repo: repo ? mainCheckout(repo) : null, hot: r.hot, folders: folders.length, ...(save ? { savedTo: file } : {}) };
 }
 
 /** Stop one hot process, after reading every fact again. */
@@ -295,6 +295,7 @@ async function selftest() {
   const fake = (over = {}) => ({ ps: () => ps, cwds: () => cwds, ports: () => ports, now: () => NOW, scratchRoot: () => scratch, samplesFile: () => file, kill: () => { throw new Error('no kill in look'); }, sleep: async () => {}, graceMs: 300, ...over });
   const l1 = look({ repo: wt, configRepo: cfgRepo }, fake());
   eq('look: the hot list, and the samples saved to the file', [l1.hot.map((h) => h.pid), Object.keys(readSamples(file)).length, l1.savedTo === file], [[101, 109, 110, 111], 8, true]);
+  eq('look: it names the main checkout it looked at (from a worktree too)', [l1.repo, look({ repo, configRepo: cfgRepo, save: false }, fake()).repo], [repo, repo]);
   fs.rmSync(file);
   eq('look --no-save writes nothing', [look({ repo: wt, configRepo: cfgRepo, save: false }, fake()).hot.length, fs.existsSync(file)], [4, false]);
   eq('look: a fact that cannot be read is an error, never "nothing hot"', [look({ repo: wt, configRepo: cfgRepo }, fake({ ps: () => null })).error, look({ repo: wt, configRepo: cfgRepo }, fake({ cwds: () => null })).error, look({ repo: wt, configRepo: cfgRepo }, fake({ ports: () => null })).error], ['ps failed', 'lsof (working folders) failed', 'lsof (listening ports) failed']);

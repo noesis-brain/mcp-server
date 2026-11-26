@@ -12,7 +12,7 @@ loop. You take that job, as far as an agent can, and you bring the owner only th
 that need a person.
 
 Read these two files first, every run. They are the rules:
-- `~/.claude/references/chief-conflict-catalogue.md`: the conditions C1–C20, what you do alone, and what waits for the owner.
+- `~/.claude/references/chief-conflict-catalogue.md`: the conditions C1–C21, what you do alone, and what waits for the owner.
 - `~/.claude/references/decision-card.md`: how a decision reaches the owner, and the three kinds of choice (rule, judgment call, owner gate).
 
 Version 1 keeps its record on the Noesis server (TCK-1890). The owner sees it on the Jot page, in
@@ -153,6 +153,7 @@ action in `actions.json`, then add its `key` to `done.json`, so the next pass do
   - Otherwise run the same command without `--by-message`. It types the line into the session's iTerm2 tab, with the guards of `/exit`.
   - Add the key to `done.json` only when it says `asked: true`. Otherwise write its `why` in the report and leave the key out, so the next pass can try again (for example after a session was busy for a moment). `askedAt` still keeps a session from being asked twice.
 - `wake` (C17, TCK-1983): the owner answered the card of a stopped loop after that session last read its inbox. When the action's `name` is a name `ListAgents` shows, send its `line` with `SendMessage` to that name: a message wakes an idle session. Add the key to `done.json` only when `SendMessage` succeeded. Otherwise write the session and the card in the report: the owner wakes that session by hand.
+- `stop-process` (C21, TCK-1984): an orphaned process (parent PID 1) keeps 50% or more of a CPU for 15 minutes in a ticket worktree or a Claude scratch folder. Stop it at once, without asking: run `node $S/coord-hot.mjs stop --pid <pid> --started "<started>" --repo <repo> --json`. It reads every fact again and sends SIGTERM to that pid alone, then SIGKILL after 5 s. When it says `stopped: true`, carry out the `decide` that follows it (it records the stop for the owner's review) and add both keys to `done.json`. When it refuses, write its `why` in the report, skip the `decide`, and leave both keys out. Never stop such a process by hand from a `ps` reading. If that `decide` answers `CARD_REQUIRED`, write no card (C21 has none): name the stop in the report.
 - `close-tabs` (C20): the `decide` just before it records the cleanup for the owner's review. Then run `node $S/coord-tabs.mjs close --ids <ids, comma-separated> --repo <repo> --json`. It reads each tab again and closes it only when it is still a sure orphan. Write the closed tabs and the kept ones, with why, in the report.
 
 **The test-db lease (C9).** Since TCK-1897, an md-manager worktree on a base that includes it has

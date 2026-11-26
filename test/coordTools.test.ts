@@ -652,6 +652,16 @@ describe('the /noesis-chief skill ships in this package (TCK-1890)', () => {
     for (const s of scripts) expect(fs.existsSync(path.join(__dirname, '..', 'scripts', s)), s).toBe(true);
   });
 
+  it('stops a hot orphaned process (C21, TCK-1984): the stop-process action in step 3, no card, no decide after a refusal', () => {
+    const step3 = template.slice(template.indexOf('### 3. The rules'), template.indexOf('### 3b.'));
+    const bullet = step3.split('\n').find((l) => l.startsWith('- `stop-process` (C21, TCK-1984)')) || '';
+    expect(bullet).toContain('run `node $S/coord-hot.mjs stop --pid <pid> --started "<started>" --repo <repo> --json`');
+    expect(bullet).toContain('When it says `stopped: true`, carry out the `decide` that follows it');
+    expect(bullet).toContain('When it refuses, write its `why` in the report, skip the `decide`, and leave both keys out.');
+    expect(bullet).toContain('If that `decide` answers `CARD_REQUIRED`, write no card (C21 has none)');
+    expect(template).toContain('the conditions C1–C21');
+  });
+
   it('wakes a stopped loop whose card the owner answered: decisions.json, --decisions on both scans, the wake action (TCK-1983)', async () => {
     expect(template).toContain('Then call `coord_decisions` with `status: "answered"` and `limit: 50`. Write only these fields of\neach decision to `~/.claude/coord/decisions.json`, as `{"decisions": [...]}`: `id`, `ticket`,\n`session_id`, `answer`, `answered_at`, the card\'s question as `question`, and the chosen option\'s\nlabel as `label`.');
     // Every scan run of step 2 passes the answered decisions, and there are two of them.
