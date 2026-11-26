@@ -118,6 +118,23 @@ function worktreeOf(dir, wts) {
   return wts.filter((w) => d === real(w.path) || d.startsWith(real(w.path) + path.sep)).sort((a, b) => b.path.length - a.path.length)[0] || null;
 }
 
+// A session's scratch folders (TCK-1984): Claude Code gives each session <root>/<project folder>/<session id>/,
+// where <root> is /tmp/claude-<uid> (on macOS /private/tmp/claude-<uid>). A test worker left there by a mutant
+// runner is that session's process, like one in its worktree.
+export function scratchRoot() {
+  if (process.env.COORD_SCRATCH_ROOT) return process.env.COORD_SCRATCH_ROOT;
+  if (typeof process.getuid !== 'function') return null;
+  try { return path.join(fs.realpathSync('/tmp'), `claude-${process.getuid()}`); } catch { return null; }
+}
+export function scratchDirsOf(sid, root) {
+  if (!root || !sidOk(sid)) return [];
+  let projects;
+  try { projects = fs.readdirSync(root, { withFileTypes: true }).filter((d) => d.isDirectory()).map((d) => d.name); } catch { return []; }
+  return projects.map((p) => path.join(root, p, sid)).filter((d) => { try { return fs.statSync(d).isDirectory(); } catch { return false; } });
+}
+const realOf = (p) => { try { return fs.realpathSync(p); } catch { return p; } };
+const within = (dir, root) => dir === root || dir.startsWith(root + path.sep);
+
 function mcpVersion(dir) {
   try { return JSON.parse(fs.readFileSync(path.join(dir, MCP_DIR, 'package.json'), 'utf8')).version || null; } catch { return null; }
 }
@@ -271,6 +288,7 @@ export function realDeps(args = {}) {
     get: apiGet,
     now: () => Date.now(),
     configDir,
+    scratchRoot,
     tabs: async (F, run) => {
       const m = await import('./coord-tabs.mjs');
       const tabs = run ? m.listChromeTabs(run) : m.listChromeTabs();
@@ -409,6 +427,7 @@ export async function gather(args, deps) {
     portSlots: allocations && Array.isArray(allocations.ports) ? allocations.ports : null,
     leases: leases && Array.isArray(leases.leases) ? leases.leases : null,
     configRepo, configWts: configRepo ? worktrees(configRepo) : [], hookStale, skills, now: deps.now(),
+    scratchRoot: deps.scratchRoot ? deps.scratchRoot() : scratchRoot(),
   };
   F.ticketOfDir = (dir) => { const w = worktreeOf(dir, F.wts); const n = w && path.resolve(w.path) !== path.resolve(main) ? ticketNumberOf(w) : null; return n ? `TCK-${n}` : null; };
   F.bySid = new Map();
@@ -586,26 +605,26 @@ export async function checkSession(agent, F, deps, { selfCheck = false } = {}) {
   if (wt) repoChecks(wt.path, F.mainRef, add);
   if (configWt) repoChecks(configWt.path, 'main', add);
 
-  // Processes that run from its worktree and are not the session, its parents, a shell or its own helpers.
-  if (wt && F.ps && F.cwds) {
+  // Processes that run from its worktree or its scratch folders (TCK-1984) and are not the session, its parents, a shell or its own helpers.
+  const roots = [...(wt ? [{ path: realOf(wt.path), label: folderOf(wt.path) }] : []), ...scratchDirsOf(sid, F.scratchRoot).map((d) => ({ path: realOf(d), label: `its scratch folder ${d}` }))];
+  if (roots.length && F.ps && F.cwds) {
     const up = ancestors(agent.pid, F.ps);
     const helpers = mcpServerCommands(F.cfg, agent.cwd);
     const others = new Set((F.agents || []).filter((a) => a.pid && a.pid !== agent.pid).map((a) => a.pid));
-    const real = (p) => { try { return fs.realpathSync(p); } catch { return p; } };
-    const root = real(wt.path);
     const found = [];
     for (const [pid, cwd] of F.cwds) {
-      const d = real(cwd);
-      if (!(d === root || d.startsWith(root + path.sep))) continue;
+      const d = realOf(cwd);
+      const at = roots.find((r) => within(d, r.path));
+      if (!at) continue;
       const p = F.ps.get(pid);
       if (!p || pid === agent.pid || up.has(pid) || SHELL_RE.test(p.command)) continue;
       if (selfCheck && (pid === process.pid || ancestors(process.pid, F.ps).has(pid) || isDescendant(pid, process.pid, F.ps))) continue; // this check itself
       if (others.has(pid) || [...others].some((o) => isDescendant(pid, o, F.ps))) continue; // another session's own work
       const mine = agent.pid && isDescendant(pid, agent.pid, F.ps);
       if (isHelper(p, agent.pid, helpers)) continue;
-      found.push({ pid, pgid: p.pgid, command: short(p.command, 100), ports: (F.ports && F.ports.get(pid)) || [], mine: Boolean(mine) });
+      found.push({ pid, pgid: p.pgid, command: short(p.command, 100), ports: (F.ports && F.ports.get(pid)) || [], mine: Boolean(mine), root: at });
     }
-    for (const p of found) add('process', `${p.mine ? 'its own process' : 'a process'} runs from ${folderOf(wt.path)}: pid ${p.pid} ${p.command}${p.ports.length ? ` (port ${p.ports.join(', ')})` : ''}`, 'chief', { pid: p.pid, pgid: p.pgid, ports: p.ports, command: p.command });
+    for (const p of found) add('process', `${p.mine ? 'its own process' : 'a process'} runs from ${p.root.label}: pid ${p.pid} ${p.command}${p.ports.length ? ` (port ${p.ports.join(', ')})` : ''}`, 'chief', { pid: p.pid, pgid: p.pgid, ports: p.ports, command: p.command, folder: p.root.path });
   }
 
   // Its Chrome tabs: a loop tab of its ticket, or a tab its own Chrome tools opened.
@@ -985,15 +1004,15 @@ export async function closeSession(args, deps) {
     const ps = deps.ps();
     const cwds = deps.cwds();
     if (!ps || !cwds) return stop('the processes cannot be read again');
-    const real = (p) => { try { return fs.realpathSync(p); } catch { return p; } };
-    const root = s.worktree ? real(s.worktree) : null;
     const still = procs.filter((x) => ps.has(x.pid));
     const ids = new Set(still.map((x) => x.pid));
     // Check every process first (folder and command), so a doubt stops the close before any signal.
     for (const x of still) {
       const p = ps.get(x.pid);
-      const d = cwds.get(x.pid) ? real(cwds.get(x.pid)) : null;
-      if (!root || !d || !(d === root || d.startsWith(root + path.sep))) return stop(`pid ${x.pid} no longer runs from ${folderOf(s.worktree)}`);
+      // The folder the check found it in: its worktree or one of its scratch folders (TCK-1984).
+      const root = x.folder || (s.worktree ? realOf(s.worktree) : null);
+      const d = cwds.get(x.pid) ? realOf(cwds.get(x.pid)) : null;
+      if (!root || !d || !within(d, root)) return stop(`pid ${x.pid} no longer runs from ${root ? folderOf(root) : 'its worktree'}`);
       if (!p.command.startsWith(String(x.command || '').replace(/…$/, ''))) return stop(`pid ${x.pid} now runs another command`);
     }
     const signalled = new Set();
@@ -1313,6 +1332,7 @@ async function selftest() {
       get: baseGet,
       now: () => NOW,
       configDir: () => cfg,
+      scratchRoot: () => path.join(root, 'no-scratch'),
       ...over,
     });
     // The installed hook and skills: the hook differs (TCK-1 did not change it on main, so it is a follow-up), noesis-chief differs.
@@ -1586,6 +1606,53 @@ async function selftest() {
     { const moved = new Map([...cwds]); moved.set(303, `${root}/elsewhere`); let reads = 0; acts.length = 0; const r = await closeSession({ configRepo: null, repo, session: sid(1), selfPid: 1 }, actFake({ cwds: () => (++reads === 1 ? cwds : moved) })); eq('close: a process that moved out of the worktree between the two reads stops the close before any signal', [r.closed, /no longer runs from/.test(r.why || ''), acts.length], [false, true, 0]); }
     { const moved = new Map([...cwds]); moved.set(303, `${w1}-old`); let reads = 0; acts.length = 0; const r = await closeSession({ configRepo: null, repo, session: sid(1), selfPid: 1 }, actFake({ cwds: () => (++reads === 1 ? cwds : moved) })); eq('close: a process that moved to a sibling folder with the same name start (<worktree>-old) also stops the close', [r.closed, /no longer runs from/.test(r.why || ''), acts.length], [false, true, 0]); }
     { const changed = new Map([...ps]); changed.set(302, { ...ps.get(302), command: 'node /other/thing.js' }); let reads = 0; acts.length = 0; const r = await closeSession({ configRepo: null, repo, session: sid(1), selfPid: 1 }, actFake({ ps: () => (++reads === 1 ? ps : changed) })); eq('close: a process whose command changed stops the close before any signal', [r.closed, /another command/.test(r.why || ''), acts.length], [false, true, 0]); }
+
+    // TCK-1984: a session's scratch folders (<root>/<project folder>/<session id>/) count like its worktree, also with no worktree.
+    {
+      const sroot = path.join(root, 'scratch-root');
+      const s1dir = path.join(sroot, '-Users-x-repo-tck-1', sid(1), 'scratchpad', 'chk3r2', 'mrepo', 'src', 'backend');
+      const s4dir = path.join(sroot, '-Users-x-repo', sid(4), 'scratchpad');
+      const s9dir = path.join(sroot, '-Users-x-repo', sid(9), 'scratchpad');
+      const near = path.join(sroot, '-Users-x-repo', `${sid(1)}x`);
+      for (const d of [s1dir, s4dir, s9dir, near]) fs.mkdirSync(d, { recursive: true });
+      const psS = new Map([...ps,
+        [501, { pid: 501, ppid: 1, pgid: 500, command: 'node vitest/dist/workers/forks.js' }],
+        [502, { pid: 502, ppid: 1, pgid: 502, command: 'node busy.js' }],
+        [503, { pid: 503, ppid: 1, pgid: 503, command: 'node other-session.js' }],
+        [504, { pid: 504, ppid: 1, pgid: 504, command: 'node near-name.js' }],
+        [505, { pid: 505, ppid: 1, pgid: 505, command: '-zsh' }],
+      ]);
+      const cwdsS = new Map([...cwds, [501, s1dir], [502, s4dir], [503, s9dir], [504, near], [505, s4dir]]);
+      const dS = (over = {}) => deps({ ps: () => psS, cwds: () => cwdsS, scratchRoot: () => sroot, ...over });
+      const rs = await check({ configRepo: null, repo, all: true }, dS());
+      const ofS = (n) => rs.sessions.find((x) => x.sessionId === sid(n));
+      const pidsOf = (n) => ofS(n).reasons.filter((x) => x.code === 'process').map((x) => x.pid);
+      eq('scratchDirsOf finds <root>/<any project folder>/<session id>, never a folder whose name only starts with it', [scratchDirsOf(sid(1), sroot).map((d) => path.relative(sroot, d)), scratchDirsOf(sid(4), sroot).length, scratchDirsOf(sid(2), sroot), scratchDirsOf('bad id', sroot), scratchDirsOf(sid(1), path.join(root, 'missing'))], [[path.join('-Users-x-repo-tck-1', sid(1))], 1, [], [], []]);
+      const r501 = ofS(1).reasons.find((x) => x.pid === 501);
+      eq("scratch: an orphaned worker in s1's scratch folder is a process reason for s1 (fixer chief), next to its worktree processes", [pidsOf(1).includes(501), pidsOf(1).includes(300), r501 && r501.fixer, r501 && /runs from its scratch folder .*chk3r2|runs from its scratch folder /.test(r501.text)], [true, true, 'chief', true]);
+      eq('scratch: s4 has no worktree, yet its scratch-folder process counts (and a shell there does not)', [ofS(4).worktree, pidsOf(4)], [null, [502]]);
+      eq("scratch: a process in another session's scratch folder, or in a folder that only starts with the session id, counts for no one", rs.sessions.some((x) => x.reasons.some((y) => y.pid === 503 || y.pid === 504)), false);
+      eq('scratch: without a scratch root (no getuid), only the worktree counts', (await check({ configRepo: null, repo, session: sid(4) }, dS({ scratchRoot: () => null }))).sessions[0].reasons.filter((x) => x.code === 'process').length, 0);
+      // close: the scratch process is checked again in its own folder and signalled by pid (its group leader 500 is not one of the reasons).
+      const actS = (over = {}) => actFake({ ps: () => psS, cwds: () => cwdsS, scratchRoot: () => sroot, ...over });
+      { acts.length = 0; const r = await closeSession({ configRepo: null, repo, session: sid(1), selfPid: 1 }, actS()); eq('close: a scratch-folder process is stopped by pid with the worktree ones', [r.closed, acts.some((a) => a[0] === 'kill' && a[1] === 501 && a[2] === 'SIGTERM')], [true, true]); }
+      { const moved = new Map([...cwdsS]); moved.set(501, path.join(root, 'elsewhere')); let reads = 0; acts.length = 0; const r = await closeSession({ configRepo: null, repo, session: sid(1), selfPid: 1 }, actS({ cwds: () => (++reads === 1 ? cwdsS : moved) })); eq('close: a scratch process that left its scratch folder between the two reads stops the close before any signal', [r.closed, /no longer runs from/.test(r.why || ''), acts.length], [false, true, 0]); }
+      { const moved = new Map([...cwdsS]); moved.set(501, w1); let reads = 0; acts.length = 0; const r = await closeSession({ configRepo: null, repo, session: sid(1), selfPid: 1 }, actS({ cwds: () => (++reads === 1 ? cwdsS : moved) })); eq('close: a scratch process re-checks against its own scratch folder, not the worktree', [r.closed, /no longer runs from/.test(r.why || ''), acts.length], [false, true, 0]); }
+      { const lost = new Map([...cwdsS]); lost.delete(501); let reads = 0; acts.length = 0; const r = await closeSession({ configRepo: null, repo, session: sid(1), selfPid: 1 }, actS({ cwds: () => (++reads === 1 ? cwdsS : lost) })); eq('close: a process whose working folder cannot be read on the second read stops the close before any signal', [r.closed, /no longer runs from/.test(r.why || ''), acts.length], [false, true, 0]); }
+      fs.rmSync(sroot, { recursive: true, force: true });
+    }
+    // The default scratch root is the one Claude Code uses: realpath(/tmp)/claude-<uid> (/private/tmp/claude-501 on this Mac); COORD_SCRATCH_ROOT replaces it.
+    {
+      const saved = process.env.COORD_SCRATCH_ROOT;
+      delete process.env.COORD_SCRATCH_ROOT;
+      const dflt = scratchRoot();
+      process.env.COORD_SCRATCH_ROOT = '/x/scratch';
+      const over = scratchRoot();
+      if (saved === undefined) delete process.env.COORD_SCRATCH_ROOT; else process.env.COORD_SCRATCH_ROOT = saved;
+      const want = typeof process.getuid === 'function' ? path.join(fs.realpathSync('/tmp'), `claude-${process.getuid()}`) : null;
+      eq('scratchRoot: realpath(/tmp)/claude-<uid> by default, COORD_SCRATCH_ROOT when set', [dflt, over, process.platform === 'darwin' ? /^\/private\/tmp\/claude-\d+$/.test(dflt) : true], [want, '/x/scratch', true]);
+      eq('the real deps use that scratch root', realDeps().scratchRoot === scratchRoot, true);
+    }
 
     // Own MCP work: a ticket whose commits changed the MCP source and the hook, with the version not on npm.
     write(path.join(sub, 'src', 'a.ts'), 'export const a = 2;\n'); write(path.join(sub, 'scripts', HOOK_SCRIPT), '// hook v3\n');
